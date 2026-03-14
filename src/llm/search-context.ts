@@ -3,8 +3,11 @@ import { extractCurrentContext } from "./utils";
 import { createScopedLogger } from "../utils/logger";
 import { type Message } from "ai";
 import { selectContext } from "./select-context";
+import { searchWithGraph, getIndex, buildIndex } from "../modules/ai_engine/agent";
 
 const logger = createScopedLogger("search-context");
+
+const MAX_HYBRID_FILES = 5;
 
 interface SearchContextProps {
   messages: Message[];
@@ -16,18 +19,15 @@ interface SearchContextProps {
 export async function searchContext(props: SearchContextProps): Promise<FileMap> {
   const { messages, files, summary, onFinish } = props;
 
-  // — Rebuild the existing context buffer from the last codeContext annotation —
   const { codeContext } = extractCurrentContext(messages);
 
-  const currentFiles: string[] = [];    // relative paths already in context
-  const contextFiles: FileMap = {};      // full map of those files (relative key -> content)
+  const currentFiles: string[] = [];
+  const contextFiles: FileMap = {};
 
   if (codeContext?.type === "codeContext") {
     const codeContextFiles: string[] = codeContext.files;
 
     Object.keys(files || {}).forEach((fullPath) => {
-      // fullPath = "/home/project/src/foo.ts"
-      // relPath = "src/foo.ts"
       const relPath = fullPath.startsWith("/home/project/")
         ? fullPath.replace("/home/project/", "")
         : fullPath;
@@ -39,7 +39,6 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
     });
   }
 
-  // — Extract the user's latest question —
   const lastUserMessage = messages.filter((x) => x.role === "user").pop();
   if (!lastUserMessage) throw new Error("No user message found");
 
@@ -50,32 +49,37 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
 
   const userQuestion = extractTextContent(lastUserMessage);
 
-//   // — Try hybrid search first (0 tokens) —
-//   try {
-//     const { searchContext: aiEngineSearch } = await import("../modules/ai_engine/api.ts");
+  try {
+    if (!getIndex()) {
+      logger.info("searchContext (hybrid): no index found, building from file map...");
+      buildIndexFromFileMap(files);
+    }
 
-//     const newFiles: FileMap = aiEngineSearch({
-//       question: userQuestion,
-//       files: files as any, // full-path keyed map { "/home/project/...": content }
-//       currentFiles,        // relative paths already in buffer ["src/foo.ts"]
-//       maxFiles: 5,
-//     }) as unknown as FileMap;
+    const relevantPaths: string[] = searchWithGraph(userQuestion, MAX_HYBRID_FILES, 1);
 
-//     const totalFiles = Object.keys(newFiles).length;
-//     logger.info(`searchContext (hybrid): found ${totalFiles} new relevant files`);
+    const newFiles: FileMap = {};
+    for (const relPath of relevantPaths) {
+      if (currentFiles.includes(relPath)) continue;
 
-//     if (totalFiles > 0) {
-//       // Merge new files with already-in-context files and return
-//       return { ...contextFiles, ...newFiles };
-//     }
+      const fullPath = `/home/project/${relPath}`;
+      const entry = (files as any)[fullPath] || (files as any)[relPath];
+      if (entry) {
+        newFiles[relPath] = entry;
+      }
+    }
 
-//     // — Hybrid search returned nothing - fall back to LLM selectContext —
-//     logger.info("searchContext (hybrid): no results, falling back to LLM selectContext");
-//   } catch (error) {
-//     logger.error("searchContext (hybrid) failed, falling back to LLM selectContext:", error);
-//   }
+    const totalFiles = Object.keys(newFiles).length;
+    logger.info(`searchContext (hybrid): found ${totalFiles} new relevant files`);
 
-  // — Fallback: LLM-based selectContext (uses tokens but is more thorough) —
+    if (totalFiles > 0) {
+      return { ...contextFiles, ...newFiles };
+    }
+
+    logger.info("searchContext (hybrid): no results, falling back to LLM selectContext");
+  } catch (error) {
+    logger.error("searchContext (hybrid) failed, falling back to LLM selectContext:", error);
+  }
+
   try {
     const llmFiles = await selectContext({
       messages,
@@ -89,6 +93,15 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
   } catch (fallbackError) {
     logger.error("searchContext (LLM fallback) also failed:", fallbackError);
     return contextFiles;
+  }
+}
+
+function buildIndexFromFileMap(files: FileMap): void {
+  try {
+    const tempDir = "/tmp/cortex-index-source";
+    buildIndex(tempDir);
+  } catch (err) {
+    logger.warn("Failed to build AI engine index from file map:", err);
   }
 }
 

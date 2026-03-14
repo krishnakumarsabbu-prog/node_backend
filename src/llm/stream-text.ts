@@ -213,7 +213,22 @@ ${lockedFilesListString}
     system: (chatMode === "build" || promptId === "plan") ? systemPrompt : discussPrompt(),
     messages: convertToCoreMessages(processedMessages as any),
     ...(options || {}),
+    abortSignal: createStreamTimeout(LLM_STREAM_TIMEOUT_MS),
   } as Parameters<typeof _streamText>[0];
 
   return await _streamText(streamParams);
+}
+
+const LLM_STREAM_TIMEOUT_MS = 60_000;
+
+function createStreamTimeout(ms: number): AbortSignal {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    logger.warn(`LLM stream timed out after ${ms}ms`);
+    controller.abort(new Error(`LLM stream timed out after ${ms}ms`));
+  }, ms);
+
+  controller.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
+
+  return controller.signal;
 }

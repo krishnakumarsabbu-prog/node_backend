@@ -20,6 +20,17 @@ import { createScopedLogger } from '../utils/logger';
 
 const logger = createScopedLogger('mcp-service');
 
+const TOOL_EXECUTION_TIMEOUT_MS = 30_000;
+
+function withTimeout<T>(promise: PromiseLike<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    Promise.resolve(promise)
+      .then((val) => { clearTimeout(timer); resolve(val); })
+      .catch((err) => { clearTimeout(timer); reject(err); });
+  });
+}
+
 export const stdioServerConfigSchema = z
   .object({
     type: z.enum(['stdio']).optional(),
@@ -382,6 +393,15 @@ export class MCPService {
           toolDescription: description,
         } satisfies ToolCallAnnotation);
       }
+    } else {
+      logger.warn(`processToolCall: unknown tool "${toolName}" (id=${toolCallId})`);
+      dataStream.writeMessageAnnotation({
+        type: 'toolCall',
+        toolCallId,
+        serverName: 'unknown',
+        toolName,
+        toolDescription: `Tool "${toolName}" is not available. It may not be registered or the MCP server is down.`,
+      } satisfies ToolCallAnnotation);
     }
   }
 
@@ -417,13 +437,18 @@ export class MCPService {
             logger.debug(`calling tool "${toolName}" with args: ${JSON.stringify(toolInvocation.args)}`);
 
             try {
-              result = await toolInstance.execute(toolInvocation.args, {
-                messages: convertToCoreMessages(messages),
-                toolCallId,
-              });
+              result = await withTimeout(
+                toolInstance.execute(toolInvocation.args, {
+                  messages: convertToCoreMessages(messages),
+                  toolCallId,
+                }),
+                TOOL_EXECUTION_TIMEOUT_MS,
+                `Tool "${toolName}" timed out after ${TOOL_EXECUTION_TIMEOUT_MS / 1000}s`,
+              );
             } catch (error) {
+              const errorMessage = error instanceof Error ? error.message : String(error);
               logger.error(`error while calling tool "${toolName}":`, error);
-              result = TOOL_EXECUTION_ERROR;
+              result = `${TOOL_EXECUTION_ERROR}: ${errorMessage}. The tool "${toolName}" failed with the provided arguments. Please adjust your approach or try alternative arguments.`;
             }
           } else {
             result = TOOL_NO_EXECUTE_FUNCTION;

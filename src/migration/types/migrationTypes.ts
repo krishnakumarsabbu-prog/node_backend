@@ -1,8 +1,56 @@
 export type MigrationAction = "modify" | "delete" | "create";
 
-export type BuildTool = "maven" | "gradle" | "npm" | "unknown";
+export type BuildTool =
+  | "maven"
+  | "gradle"
+  | "npm"
+  | "yarn"
+  | "pnpm"
+  | "pip"
+  | "poetry"
+  | "cargo"
+  | "go-mod"
+  | "composer"
+  | "dotnet"
+  | "mix"
+  | "bundler"
+  | "unknown";
 
-export type Framework = "spring-mvc" | "spring-boot" | "express" | "django" | "unknown";
+export type Framework =
+  | "spring-mvc"
+  | "spring-boot"
+  | "express"
+  | "nextjs"
+  | "nuxt"
+  | "react"
+  | "vue"
+  | "angular"
+  | "svelte"
+  | "sveltekit"
+  | "astro"
+  | "remix"
+  | "nestjs"
+  | "fastify"
+  | "hono"
+  | "django"
+  | "flask"
+  | "fastapi"
+  | "rails"
+  | "laravel"
+  | "symfony"
+  | "dotnet-webapi"
+  | "dotnet-mvc"
+  | "gin"
+  | "fiber"
+  | "echo-go"
+  | "actix"
+  | "rocket"
+  | "phoenix"
+  | "flutter"
+  | "react-native"
+  | "electron"
+  | "tauri"
+  | "unknown";
 
 export interface MigrationTask {
   file: string;
