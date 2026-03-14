@@ -9,16 +9,16 @@ import type { IProviderSetting } from "../types/model";
 import type { DesignScheme } from "../types/design-scheme";
 import { createScopedLogger } from "../utils/logger";
 
-import { getFilePaths, selectContext } from "../llm/select-context";
+import { getFilePaths, searchContext } from "../llm/search-context";
 import { createSummary } from "../llm/create-summary";
 import { extractPropertiesFromMessage } from "../llm/utils";
 import { WORK_DIR } from "../utils/constants";
 
 import type { ContextAnnotation, ProgressAnnotation } from "../types/context";
 import { MCPService } from "../llm/mcpService";
-import { StreamRecoveryManager } from "../llm/stream-recovery";
 import { CONTINUE_PROMPT } from "../prompts/prompts";
 import { ChatMigrationHandler } from "./chatMigration";
+import { streamPlanResponse, StreamWriter } from "../llm/plan-processor";
 
 const logger = createScopedLogger("api.chat");
 
@@ -29,6 +29,7 @@ type ChatRequestBody = {
   contextOptimization: boolean;
   chatMode: "discuss" | "build" | "migrate";
   designScheme?: DesignScheme;
+  implementPlan: boolean;
   supabase?: {
     isConnected: boolean;
     hasSelectedProject: boolean;
@@ -49,7 +50,9 @@ function setSSEHeaders(res: Response) {
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
 }
 
 function setCORS(req: Request, res: Response) {
@@ -121,37 +124,100 @@ function summarizeFiles(files: any) {
   return { present: true, count: keys.length, sample: keys.slice(0, 25) };
 }
 
-function writeDataPart(res: Response, data: unknown) {
-  res.write(`2:${JSON.stringify(data)}\n`);
+function writeDataPart(res: Response, data: unknown): boolean {
+  try {
+    if (res.writableEnded || res.destroyed) {
+      logger.warn(`writeDataPart: Response already ended or destroyed, skipping write`);
+      return false;
+    }
+
+    const dataArray = [data];
+    const dataString = JSON.stringify(dataArray);
+    logger.info(`writeDataPart dataString ${dataString.length}`);
+
+    const maxSize = 100000;
+    if (dataString.length > maxSize) {
+      logger.warn(`writeDataPart: Data size exceeds limit (${dataString.length} > ${maxSize})`);
+      const truncatedData = [{
+        type: "warning",
+        message: "Data size exceeded limit. Some data may be truncated.",
+        originalSize: dataString.length,
+      }];
+      res.write(`2:${JSON.stringify(truncatedData)}\n`);
+      return false;
+    }
+
+    const chunk = `2:${dataString}\n`;
+    const writeResult = res.write(chunk);
+    logger.info(`writeDataPart write result: ${writeResult}, chunk length: ${chunk.length}`);
+    return writeResult;
+  } catch (error: any) {
+    logger.error("writeDataPart: Error writing data:", error);
+    if (!res.writableEnded && !res.destroyed) {
+      const errorData = [{
+        type: "error",
+        message: `Error processing data: ${error.message}`,
+      }];
+      res.write(`2:${JSON.stringify(errorData)}\n`);
+    }
+    return false;
+  }
 }
 
-function writeMessageAnnotationPart(res: Response, annotation: unknown) {
-  res.write(`8:${JSON.stringify(annotation)}\n`);
+function writeMessageAnnotationPart(res: Response, annotation: unknown): boolean {
+  try {
+    if (res.writableEnded || res.destroyed) {
+      logger.warn(`writeMessageAnnotationPart: Response already ended or destroyed, skipping write`);
+      return false;
+    }
+
+    const annotationArray = [annotation];
+    const annotationString = JSON.stringify(annotationArray);
+    logger.info(`writeMessageAnnotationPart dataString ${annotationString.length}`);
+    const writeResult = res.write(`8:${annotationString}\n`);
+    logger.info(`writeMessageAnnotationPart write result: ${writeResult}`);
+    return writeResult;
+  } catch (error: any) {
+    logger.error("writeMessageAnnotationPart: Error writing data:", error);
+    return false;
+  }
 }
 
 async function pipeWebStreamToExpress(opts: {
   requestId: string;
   res: Response;
   webStream: ReadableStream;
-  streamRecovery?: StreamRecoveryManager;
-}) {
-  const { requestId, res, webStream, streamRecovery } = opts;
+}): Promise<void> {
+  const { requestId, res, webStream } = opts;
+
+  if (res.writableEnded || res.destroyed) {
+    logger.warn(`[${requestId}] Response already ended before piping, skipping`);
+    return;
+  }
 
   const nodeStream = Readable.fromWeb(webStream as any);
 
-  return new Promise<void>((resolve, reject) => {
-    nodeStream.on("data", () => {
-      streamRecovery?.updateActivity?.();
-    });
+  let bytesWritten = 0;
+  let chunksWritten = 0;
+  nodeStream.on("data", (chunk) => {
+    bytesWritten += chunk.length;
+    chunksWritten++;
+    if (chunksWritten % 10 === 0) {
+      logger.info(`[${requestId}] Streaming progress: ${chunksWritten} chunks, ${bytesWritten} bytes`);
+    }
+  });
 
+  nodeStream.pipe(res, { end: false });
+
+  return new Promise<void>((resolve, reject) => {
+    nodeStream.on("end", () => {
+      logger.info(`[${requestId}] nodeStream ended - total: ${chunksWritten} chunks, ${bytesWritten} bytes`);
+      resolve();
+    });
     nodeStream.on("error", (err) => {
       logger.error(`[${requestId}] nodeStream error: ${err?.message || err}`, err);
       reject(err);
     });
-
-    nodeStream.on("end", () => resolve());
-
-    nodeStream.pipe(res, { end: false });
   });
 }
 
@@ -178,6 +244,8 @@ export async function chatHandler(req: Request, res: Response) {
   const requestId = generateId();
   const startedAt = Date.now();
 
+  req.setTimeout(30 * 60 * 1000);
+
   if (req.method === "OPTIONS") {
     logger.info(`[${requestId}] OPTIONS preflight`);
     res.status(204).end();
@@ -189,14 +257,6 @@ export async function chatHandler(req: Request, res: Response) {
       req.headers["user-agent"] || ""
     }"`,
   );
-
-  const streamRecovery = new StreamRecoveryManager({
-    timeout: 45000,
-    maxRetries: 2,
-    onTimeout: () => {
-      logger.warn(`[${requestId}] Stream timeout - attempting recovery`);
-    },
-  });
 
   try {
     const body = req.body as ChatRequestBody;
@@ -215,6 +275,7 @@ export async function chatHandler(req: Request, res: Response) {
       supabase,
       chatMode,
       designScheme,
+      implementPlan,
       maxLLMSteps,
       apiKeys,
       providerSettings,
@@ -234,6 +295,7 @@ export async function chatHandler(req: Request, res: Response) {
           promptId: promptId || "default",
           contextOptimization: !!contextOptimization,
           chatMode,
+          implementPlan: !!implementPlan,
           maxLLMSteps,
           supabase,
           files: summarizeFiles(files),
@@ -246,12 +308,40 @@ export async function chatHandler(req: Request, res: Response) {
 
     setSSEHeaders(res);
 
-    res.on("close", () => logger.warn(`[${requestId}] client disconnected`));
-    res.on("finish", () => logger.info(`[${requestId}] response finished elapsedMs=${Date.now() - startedAt}`));
+    let clientDisconnected = false;
+    let responseFinished = false;
+
+    res.on("close", () => {
+      clientDisconnected = true;
+      if (!responseFinished) {
+        logger.warn(`[${requestId}] client disconnected before response finished`);
+      } else {
+        logger.info(`[${requestId}] client connection closed (normal)`);
+      }
+    });
+
+    res.on("finish", () => {
+      responseFinished = true;
+      logger.info(`[${requestId}] response finished elapsedMs=${Date.now() - startedAt}`);
+    });
+
+    const shouldAbort = () => clientDisconnected || res.writableEnded || res.destroyed;
 
     const cumulativeUsage = { completionTokens: 0, promptTokens: 0, totalTokens: 0 };
     let progressCounter = 1;
 
+    const dataStreamAdapter = {
+      writeData: (data: unknown) => {
+        logger.info(`[${requestId}] Calling writeData`);
+        writeDataPart(res, data);
+      },
+      writeMessageAnnotation: (ann: unknown) => {
+        logger.info(`[${requestId}] Calling writeMessageAnnotation`);
+        writeMessageAnnotationPart(res, ann);
+      },
+    };
+
+    // --- Migration mode ---
     if (chatMode === "migrate") {
       logger.info(`[${requestId}] Migration mode: action=${migrationAction || "plan"}`);
 
@@ -296,14 +386,14 @@ export async function chatHandler(req: Request, res: Response) {
       }
     }
 
-    const dataStreamAdapter = {
-      writeData: (data: unknown) => writeDataPart(res, data),
-      writeMessageAnnotation: (ann: unknown) => writeMessageAnnotationPart(res, ann),
-    };
-
     const mcpService = MCPService.getInstance();
+    const totalMessageContent = (messages as any[]).reduce((acc, m) => acc + (m?.content || ""), "");
+    logger.info(`[${requestId}] Total message length: ${String(totalMessageContent).split(" ").length} words`);
 
+    logger.info(`[${requestId}] Processing tool invocations...`);
+    const mcpStart = Date.now();
     const processedMessages = await mcpService.processToolInvocations(messages, dataStreamAdapter as any);
+    logger.info(`[${requestId}] Tool invocations processed in ${Date.now() - mcpStart}ms`);
 
     let messageSliceId = 0;
     if (processedMessages.length > 3) messageSliceId = processedMessages.length - 3;
@@ -312,7 +402,15 @@ export async function chatHandler(req: Request, res: Response) {
     let filteredFiles: FileMap | undefined = undefined;
     let summary: string | undefined = undefined;
 
+    logger.info(`[${requestId}] filePaths.length before context selection: ${safeJson(filePaths)}`);
+
     if (filePaths.length > 0 && contextOptimization) {
+      if (shouldAbort()) {
+        logger.info(`[${requestId}] Client disconnected before context selection, aborting`);
+        return;
+      }
+
+      logger.info(`[${requestId}] Generating Chat Summary`);
       writeDataPart(res, {
         type: "progress",
         label: "summary",
@@ -325,12 +423,18 @@ export async function chatHandler(req: Request, res: Response) {
         messages: [...processedMessages],
         onFinish(resp: any) {
           if (resp?.usage) {
+            logger.info(`[${requestId}] createSummary token usage ${safeJson(resp.usage)}`);
             cumulativeUsage.completionTokens += resp.usage.completionTokens || 0;
             cumulativeUsage.promptTokens += resp.usage.promptTokens || 0;
             cumulativeUsage.totalTokens += resp.usage.totalTokens || 0;
           }
         },
       });
+
+      if (shouldAbort()) {
+        logger.info(`[${requestId}] Client disconnected during createSummary, aborting`);
+        return;
+      }
 
       writeDataPart(res, {
         type: "progress",
@@ -346,6 +450,7 @@ export async function chatHandler(req: Request, res: Response) {
         chatId: processedMessages.slice(-1)?.[0]?.id,
       } as ContextAnnotation);
 
+      logger.info(`[${requestId}] Updating Context Buffer`);
       writeDataPart(res, {
         type: "progress",
         label: "context",
@@ -354,18 +459,33 @@ export async function chatHandler(req: Request, res: Response) {
         message: "Determining Files to Read",
       } satisfies ProgressAnnotation);
 
-      filteredFiles = await selectContext({
+      filteredFiles = await searchContext({
         messages: [...processedMessages],
         files,
         summary,
         onFinish(resp: any) {
           if (resp?.usage) {
+            logger.info(`[${requestId}] selectContext fallback token usage ${safeJson(resp.usage)}`);
             cumulativeUsage.completionTokens += resp.usage.completionTokens || 0;
             cumulativeUsage.promptTokens += resp.usage.promptTokens || 0;
             cumulativeUsage.totalTokens += resp.usage.totalTokens || 0;
           }
         },
       });
+
+      if (shouldAbort()) {
+        logger.info(`[${requestId}] Client disconnected during searchContext, aborting`);
+        return;
+      }
+
+      if (filteredFiles) {
+        logger.info(`[${requestId}] files in context: ${safeJson(Object.keys(filteredFiles))}`);
+      }
+
+      writeMessageAnnotationPart(res, {
+        type: "codeContext",
+        files: Object.keys(filteredFiles || {}).map(normalizePathForUI),
+      } as ContextAnnotation);
 
       writeDataPart(res, {
         type: "progress",
@@ -376,7 +496,163 @@ export async function chatHandler(req: Request, res: Response) {
       } satisfies ProgressAnnotation);
     }
 
-    // ---- NEW: Build context batches (<=5 per batch) ----
+    // --- Plan Implementation Mode (implementPlan === true) ---
+    // PLAN.md in 'files' is read, parsed by the LLM into structured steps,
+    // then each step is streamed one-by-one.
+    if (implementPlan) {
+      if (shouldAbort()) {
+        logger.info(`[${requestId}] Client disconnected before plan execution, aborting`);
+        return;
+      }
+
+      logger.info(`[${requestId}] implementPlan=true starting PLAN.md-driven streaming`);
+
+      const planWriter: StreamWriter = {
+        writeData: (data: unknown) => writeDataPart(res, data),
+        writeAnnotation: (ann: unknown) => writeMessageAnnotationPart(res, ann),
+        isAlive: () => !shouldAbort(),
+      };
+
+      const planProgressCounter = { value: progressCounter };
+
+      const planStreamingOptions: StreamingOptions = {
+        supabaseConnection: supabase,
+        toolChoice: "auto",
+        tools: mcpService.toolsWithoutExecute,
+        maxSteps: maxLLMSteps,
+        onStepFinish: ({ toolCalls }: any) => {
+          for (const toolCall of toolCalls || []) {
+            mcpService.processToolCall(toolCall, dataStreamAdapter as any);
+          }
+        },
+      };
+
+      await streamPlanResponse({
+        res,
+        requestId,
+        messages: [...processedMessages],
+        files: (files || {}) as any,
+        streamingOptions: planStreamingOptions,
+        apiKeys,
+        providerSettings,
+        promptId: promptId || "default",
+        chatMode: chatMode as "discuss" | "build",
+        designScheme,
+        summary,
+        progressCounter: planProgressCounter,
+        writer: planWriter,
+        cumulativeUsage,
+      });
+
+      progressCounter = planProgressCounter.value;
+
+      writeMessageAnnotationPart(res, {
+        type: "usage",
+        value: {
+          completionTokens: cumulativeUsage.completionTokens,
+          promptTokens: cumulativeUsage.promptTokens,
+          totalTokens: cumulativeUsage.totalTokens,
+        },
+      });
+
+      const planDFrame = {
+        finishReason: "stop",
+        usage: {
+          promptTokens: cumulativeUsage.promptTokens,
+          completionTokens: cumulativeUsage.completionTokens,
+        },
+      };
+      res.write(`d:${JSON.stringify(planDFrame)}\n`);
+      logger.info(`[${requestId}] Emitted final d: frame`);
+
+      res.end();
+      logger.info(`[${requestId}] Plan streaming ended elapsedMs=${Date.now() - startedAt}`);
+      return;
+    }
+
+    // --- Build mode: auto-planning from user question ---
+    if (chatMode === "build") {
+      const lastUserMsg = [...processedMessages].reverse().find((m: any) => m.role === "user");
+      const userQuestion = lastUserMsg
+        ? typeof lastUserMsg.content === "string"
+          ? lastUserMsg.content
+          : Array.isArray(lastUserMsg.content)
+            ? (lastUserMsg.content as any[])
+                .filter((p: any) => p.type === "text")
+                .map((p: any) => p.text)
+                .join(" ")
+            : ""
+        : "";
+
+      if (userQuestion && !shouldAbort()) {
+        logger.info(`[${requestId}] Build mode auto-planning from question: "${userQuestion.substring(0, 80)}"`);
+
+        const planWriter: StreamWriter = {
+          writeData: (data: unknown) => writeDataPart(res, data),
+          writeAnnotation: (ann: unknown) => writeMessageAnnotationPart(res, ann),
+          isAlive: () => !shouldAbort(),
+        };
+
+        const planProgressCounter = { value: progressCounter };
+
+        const planStreamingOptions: StreamingOptions = {
+          supabaseConnection: supabase,
+          toolChoice: "auto",
+          tools: mcpService.toolsWithoutExecute,
+          maxSteps: maxLLMSteps,
+          onStepFinish: ({ toolCalls }: any) => {
+            for (const toolCall of toolCalls || []) {
+              mcpService.processToolCall(toolCall, dataStreamAdapter as any);
+            }
+          },
+        };
+
+        await streamPlanResponse({
+          res,
+          requestId,
+          messages: [...processedMessages],
+          files: (files || {}) as any,
+          userQuestion,
+          streamingOptions: planStreamingOptions,
+          apiKeys,
+          providerSettings,
+          promptId: promptId || "default",
+          chatMode: chatMode as "discuss" | "build",
+          designScheme,
+          summary,
+          progressCounter: planProgressCounter,
+          writer: planWriter,
+          cumulativeUsage,
+        });
+
+        progressCounter = planProgressCounter.value;
+
+        writeMessageAnnotationPart(res, {
+          type: "usage",
+          value: {
+            completionTokens: cumulativeUsage.completionTokens,
+            promptTokens: cumulativeUsage.promptTokens,
+            totalTokens: cumulativeUsage.totalTokens,
+          },
+        });
+
+        const buildDFrame = {
+          finishReason: "stop",
+          usage: {
+            promptTokens: cumulativeUsage.promptTokens,
+            completionTokens: cumulativeUsage.completionTokens,
+          },
+        };
+        res.write(`d:${JSON.stringify(buildDFrame)}\n`);
+        logger.info(`[${requestId}] Emitted final d: frame`);
+
+        res.end();
+        logger.info(`[${requestId}] Build-mode plan streaming ended elapsedMs=${Date.now() - startedAt}`);
+        return;
+      }
+    }
+
+    // --- Normal (discuss / fallback) processing with file batching ---
     const contextBatches: FileMap[] =
       filteredFiles && Object.keys(filteredFiles).length > MAX_CONTEXT_FILES
         ? chunkFileMap(filteredFiles, MAX_CONTEXT_FILES)
@@ -396,7 +672,6 @@ export async function chatHandler(req: Request, res: Response) {
       } satisfies ProgressAnnotation);
     }
 
-    // Write "Generating Response" progress
     writeDataPart(res, {
       type: "progress",
       label: "response",
@@ -417,15 +692,12 @@ export async function chatHandler(req: Request, res: Response) {
       },
     };
 
-    // We mutate this message array like Remix does
     const workingMessages = [...processedMessages];
 
-    // ---- NEW: run streamText per batch, sequentially, within same SSE ----
     for (let batchIndex = 0; batchIndex < contextBatches.length; batchIndex++) {
       const batchFiles = contextBatches[batchIndex];
       const batchNum = batchIndex + 1;
 
-      // Update UI about which files are in context for THIS batch
       if (batchFiles) {
         writeMessageAnnotationPart(res, {
           type: "codeContext",
@@ -433,7 +705,6 @@ export async function chatHandler(req: Request, res: Response) {
         } as ContextAnnotation);
       }
 
-      // Optional but VERY helpful: tell the model this is batch i/n
       if (batchIndex > 0) {
         workingMessages.push({
           id: generateId(),
@@ -442,12 +713,14 @@ export async function chatHandler(req: Request, res: Response) {
         } as any);
       }
 
-      // Per-batch continuation loop (finishReason === 'length')
       let switches = 0;
       let done = false;
 
       while (!done) {
-        streamRecovery.startMonitoring();
+        if (shouldAbort()) {
+          logger.info(`[${requestId}] Client disconnected, aborting streaming loop`);
+          break;
+        }
 
         let finishReason: string | undefined;
         let finalText: string | undefined;
@@ -477,7 +750,7 @@ export async function chatHandler(req: Request, res: Response) {
           providerSettings,
           promptId,
           contextOptimization,
-          contextFiles: batchFiles, // ✅ IMPORTANT: per-batch 5-file context
+          contextFiles: batchFiles,
           chatMode,
           designScheme,
           summary,
@@ -487,26 +760,38 @@ export async function chatHandler(req: Request, res: Response) {
         const response = result.toDataStreamResponse();
 
         if (!response.body) {
-          streamRecovery.stop();
           throw new Error("toDataStreamResponse() returned empty body");
         }
 
+        logger.info(`[${requestId}] About to pipe web stream to express`);
         await pipeWebStreamToExpress({
           requestId,
           res,
           webStream: response.body as any,
-          streamRecovery,
         });
 
-        streamRecovery.stop();
-
-        // Finished normally for this segment
         if (finishReason !== "length") {
+          writeMessageAnnotationPart(res, {
+            type: "usage",
+            value: {
+              completionTokens: cumulativeUsage.completionTokens,
+              promptTokens: cumulativeUsage.promptTokens,
+              totalTokens: cumulativeUsage.totalTokens,
+            },
+          });
+
+          writeDataPart(res, {
+            type: "progress",
+            label: "response",
+            status: "complete",
+            order: progressCounter++,
+            message: "Response Generated",
+          } satisfies ProgressAnnotation);
+
           done = true;
           break;
         }
 
-        // length -> continue (same as your logic)
         switches += 1;
 
         if (switches >= MAX_RESPONSE_SEGMENTS) {
@@ -529,7 +814,6 @@ export async function chatHandler(req: Request, res: Response) {
         } as any);
       }
 
-      // Per-batch progress marker (optional UI candy)
       if (totalBatches > 1) {
         writeDataPart(res, {
           type: "progress",
@@ -540,24 +824,6 @@ export async function chatHandler(req: Request, res: Response) {
         } satisfies ProgressAnnotation);
       }
     }
-
-    // Final usage + completion
-    writeMessageAnnotationPart(res, {
-      type: "usage",
-      value: {
-        completionTokens: cumulativeUsage.completionTokens,
-        promptTokens: cumulativeUsage.promptTokens,
-        totalTokens: cumulativeUsage.totalTokens,
-      },
-    });
-
-    writeDataPart(res, {
-      type: "progress",
-      label: "response",
-      status: "complete",
-      order: progressCounter++,
-      message: "Response Generated",
-    } satisfies ProgressAnnotation);
 
     res.end();
     logger.info(`[${requestId}] Streaming ended elapsedMs=${Date.now() - startedAt}`);
