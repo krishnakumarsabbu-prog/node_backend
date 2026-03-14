@@ -15,6 +15,12 @@ export type ContextAnnotation =
   | {
       type: 'migration_result';
       result: any;
+    }
+  | {
+      type: 'batchPlan';
+      files: Array<{ stepIndex: number; filePath: string; reason: string }>;
+      totalSteps: number;
+      userIntent: string;
     };
 
 export type ProgressAnnotation = {

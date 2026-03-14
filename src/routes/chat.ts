@@ -19,6 +19,8 @@ import { MCPService } from "../llm/mcpService";
 import { CONTINUE_PROMPT } from "../prompts/prompts";
 import { ChatMigrationHandler } from "./chatMigration";
 import { streamPlanResponse, StreamWriter } from "../llm/plan-processor";
+import { planBatchExecution } from "../llm/batch/batch-planner";
+import { executeBatchPlan } from "../llm/batch/batch-executor";
 
 const logger = createScopedLogger("api.chat");
 
@@ -27,7 +29,7 @@ type ChatRequestBody = {
   files: any;
   promptId?: string;
   contextOptimization: boolean;
-  chatMode: "discuss" | "build" | "migrate";
+  chatMode: "discuss" | "build" | "migrate" | "batch";
   designScheme?: DesignScheme;
   implementPlan: boolean;
   supabase?: {
@@ -652,6 +654,122 @@ export async function chatHandler(req: Request, res: Response) {
       }
     }
 
+    // --- Batch mode: plan then process one file per step ---
+    if (chatMode === "batch") {
+      const lastUserMsg = [...processedMessages].reverse().find((m: any) => m.role === "user");
+      const userQuestion = lastUserMsg
+        ? typeof lastUserMsg.content === "string"
+          ? lastUserMsg.content
+          : Array.isArray(lastUserMsg.content)
+            ? (lastUserMsg.content as any[])
+                .filter((p: any) => p.type === "text")
+                .map((p: any) => p.text)
+                .join(" ")
+            : ""
+        : "";
+
+      if (userQuestion && !shouldAbort()) {
+        logger.info(`[${requestId}] Batch mode starting for question: "${userQuestion.substring(0, 80)}"`);
+
+        writeDataPart(res, {
+          type: "progress",
+          label: "batch-plan",
+          status: "in-progress",
+          order: progressCounter++,
+          message: "Identifying files to process...",
+        } satisfies ProgressAnnotation);
+
+        const plan = await planBatchExecution(
+          userQuestion,
+          (files || {}) as any,
+          (resp: any) => {
+            if (resp?.usage) {
+              cumulativeUsage.completionTokens += resp.usage.completionTokens || 0;
+              cumulativeUsage.promptTokens += resp.usage.promptTokens || 0;
+              cumulativeUsage.totalTokens += resp.usage.totalTokens || 0;
+            }
+          },
+        );
+
+        if (shouldAbort()) {
+          logger.info(`[${requestId}] Client disconnected after batch planning, aborting`);
+          res.end();
+          return;
+        }
+
+        writeDataPart(res, {
+          type: "progress",
+          label: "batch-plan",
+          status: "complete",
+          order: progressCounter++,
+          message: `Plan ready: ${plan.totalSteps} file${plan.totalSteps !== 1 ? "s" : ""} identified`,
+        } satisfies ProgressAnnotation);
+
+        const batchWriter: StreamWriter = {
+          writeData: (data: unknown) => writeDataPart(res, data),
+          writeAnnotation: (ann: unknown) => writeMessageAnnotationPart(res, ann),
+          isAlive: () => !shouldAbort(),
+        };
+
+        const batchProgressCounter = { value: progressCounter };
+
+        const batchStreamingOptions: StreamingOptions = {
+          supabaseConnection: supabase,
+          toolChoice: "auto",
+          tools: mcpService.toolsWithoutExecute,
+          maxSteps: maxLLMSteps,
+          onStepFinish: ({ toolCalls }: any) => {
+            for (const toolCall of toolCalls || []) {
+              mcpService.processToolCall(toolCall, dataStreamAdapter as any);
+            }
+          },
+        };
+
+        await executeBatchPlan({
+          res,
+          requestId,
+          messages: [...processedMessages],
+          files: (files || {}) as any,
+          plan,
+          streamingOptions: batchStreamingOptions,
+          apiKeys,
+          providerSettings,
+          promptId: promptId || "default",
+          chatMode: "build",
+          designScheme,
+          summary,
+          progressCounter: batchProgressCounter,
+          writer: batchWriter,
+          cumulativeUsage,
+        });
+
+        progressCounter = batchProgressCounter.value;
+
+        writeMessageAnnotationPart(res, {
+          type: "usage",
+          value: {
+            completionTokens: cumulativeUsage.completionTokens,
+            promptTokens: cumulativeUsage.promptTokens,
+            totalTokens: cumulativeUsage.totalTokens,
+          },
+        });
+
+        const batchDFrame = {
+          finishReason: "stop",
+          usage: {
+            promptTokens: cumulativeUsage.promptTokens,
+            completionTokens: cumulativeUsage.completionTokens,
+          },
+        };
+        res.write(`d:${JSON.stringify(batchDFrame)}\n`);
+        logger.info(`[${requestId}] Emitted final d: frame for batch mode`);
+
+        res.end();
+        logger.info(`[${requestId}] Batch mode ended elapsedMs=${Date.now() - startedAt}`);
+        return;
+      }
+    }
+
     // --- Normal (discuss / fallback) processing with file batching ---
     const contextBatches: FileMap[] =
       filteredFiles && Object.keys(filteredFiles).length > MAX_CONTEXT_FILES
@@ -751,7 +869,7 @@ export async function chatHandler(req: Request, res: Response) {
           promptId,
           contextOptimization,
           contextFiles: batchFiles,
-          chatMode,
+          chatMode: chatMode as "discuss" | "build" | "migrate",
           designScheme,
           summary,
           messageSliceId,
