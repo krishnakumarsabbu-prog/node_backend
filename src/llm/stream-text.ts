@@ -148,8 +148,13 @@ export async function streamText(props: {
       },
     }) ?? getSystemPrompt();
 
-  if (chatMode === "build" && contextFiles && contextOptimization) {
-    const codeContext = createFilesContext(contextFiles, true);
+  const shouldInjectContext = contextFiles && (
+    (chatMode === "build" && contextOptimization) ||
+    promptId === "plan"
+  );
+
+  if (shouldInjectContext) {
+    const codeContext = createFilesContext(contextFiles!, true);
 
     systemPrompt = `${systemPrompt}
 
@@ -205,7 +210,7 @@ ${lockedFilesListString}
 
   const streamParams = {
     model: getTachyonModel(),
-    system: chatMode === "build" ? systemPrompt : discussPrompt(),
+    system: (chatMode === "build" || promptId === "plan") ? systemPrompt : discussPrompt(),
     messages: convertToCoreMessages(processedMessages as any),
     ...(options || {}),
   } as Parameters<typeof _streamText>[0];

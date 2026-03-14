@@ -346,9 +346,17 @@ export async function chatHandler(req: Request, res: Response) {
       logger.info(`[${requestId}] Migration mode: action=${migrationAction || "plan"}`);
 
       const migrationHandler = new ChatMigrationHandler(WORK_DIR, false);
+      const migrationMcpService = MCPService.getInstance();
 
       try {
         if (migrationAction === "implement" && migrationPlan) {
+          const migrationStreamingOptions = {
+            toolChoice: "auto" as const,
+            tools: migrationMcpService.toolsWithoutExecute,
+            maxSteps: maxLLMSteps,
+            supabaseConnection: supabase,
+          };
+
           progressCounter = await migrationHandler.handlePlanExecution(
             {
               files: files as FileMap,
@@ -360,7 +368,10 @@ export async function chatHandler(req: Request, res: Response) {
             writeDataPart,
             writeMessageAnnotationPart,
             res,
-            progressCounter
+            progressCounter,
+            apiKeys,
+            providerSettings,
+            migrationStreamingOptions,
           );
         } else {
           progressCounter = await migrationHandler.handlePlanGeneration(

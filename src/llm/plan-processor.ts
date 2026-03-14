@@ -19,25 +19,9 @@ export interface StreamWriter {
   isAlive: () => boolean;
 }
 
-// ---------------------------------------------------------------------------
-// Frame protocol
-// ---------------------------------------------------------------------------
-
 const FRAME_RE = /^([0-9a-z]+):(.+)\n?$/;
 
-function stripCodeFencesFromFullText(text: string): string {
-  text = text.replace(/```[a-z]*\r?\n(?=<cortexArtifact)/gi, "");
-  text = text.replace(/(?<=<\/cortexArtifact>)\r?\n```/gi, "");
-  text = text.replace(/^```[a-z]*\r?\n/i, "");
-  text = text.replace(/\r?\n```\s*$/i, "");
-  return text;
-}
-
 const logger = createScopedLogger("plan-processor");
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export interface PlanStep {
   index: number;
@@ -50,15 +34,7 @@ export interface ParsedPlan {
   rawContent: string;
 }
 
-/**
- * When the execution strategy is "files", each step maps to one specific file.
- * The step heading is the file path, details describe what to do with it.
- */
 export type ExecutionMode = "steps" | "files";
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 export function extractPlanContent(files: FileMap): string | null {
   for (const [path, entry] of Object.entries(files)) {
@@ -75,10 +51,6 @@ export function extractPlanContent(files: FileMap): string | null {
   }
   return null;
 }
-
-// ---------------------------------------------------------------------------
-// LLM: parse PLAN.md into topic-based steps
-// ---------------------------------------------------------------------------
 
 export async function parsePlanIntoSteps(
   planContent: string,
@@ -128,10 +100,6 @@ Return the structured JSON array of steps now.
   }
 }
 
-// ---------------------------------------------------------------------------
-// LLM: generate topic-based steps from a user question (≤5 files scenario)
-// ---------------------------------------------------------------------------
-
 export async function generateStepsFromQuestion(
   userQuestion: string,
   onFinish?: (resp: GenerateTextResult<Record<string, CoreTool<any, any>>, never>) => void,
@@ -141,28 +109,18 @@ export async function generateStepsFromQuestion(
   const resp = await generateText({
     model: getTachyonModel(),
     system: `
-You are a project planning assistant specializing in industry-level software development. Given a user's request, break it down into clear, actionable SOURCE CODE implementation steps only.
+You are a project planning assistant specializing in industry-level software development. Given a user's request, break it down into clear, actionable implementation steps.
 
 Return ONLY a valid JSON array — no prose, no markdown fences. Each element must have:
 "index"   : number  (1-based sequential integer)
 "heading" : string  (concise title for the step, ≤ 80 chars)
 "details" : string  (full implementation guidance, tasks, and subtasks for that step)
 
-STRICT RULES — WHAT TO INCLUDE:
-- ONLY steps that involve writing, modifying, or creating SOURCE CODE files
-- Steps must produce concrete file changes (components, services, APIs, schemas, configs, styles, etc.)
-- Steps should be ordered logically: data models and schemas first, then business logic, then UI components, then integrations
-
-STRICT RULES — WHAT TO EXCLUDE (DO NOT generate steps for these):
-- Documentation writing (README, API docs, wiki, changelogs, comments)
-- Unit tests, integration tests, end-to-end tests, test suites, test fixtures
-- Deployment scripts, CI/CD pipelines, Docker, Kubernetes, infrastructure
-- Code reviews, audits, refactoring passes
-- Any step that does not produce a source code file change
-
-Additional rules:
-- Group logically-related code changes into a single step
-- Keep "heading" short and action-oriented (e.g. "Build User Auth Service", "Create Dashboard UI")
+Rules:
+- Include ALL types of steps needed: source code, tests, configs, migrations, styles, docs — whatever the request demands
+- Steps should be ordered logically
+- Group logically-related changes into a single step
+- Keep "heading" short and action-oriented
 - "details" may be multi-line; use \\n for newlines inside the JSON string
 - Do NOT wrap output in markdown code fences
 `,
@@ -173,7 +131,7 @@ Here is the user's request:
 ${userQuestion}
 </request>
 
-Return the structured JSON array of SOURCE CODE implementation steps only. Exclude any documentation, testing, or deployment steps.
+Return the structured JSON array of implementation steps.
 `,
   });
 
@@ -190,11 +148,6 @@ Return the structured JSON array of SOURCE CODE implementation steps only. Exclu
   }
 }
 
-// ---------------------------------------------------------------------------
-// LLM: generate file-per-step plan from user question + selected files
-// (used when LLM selects >5 files — each file becomes its own step)
-// ---------------------------------------------------------------------------
-
 export async function generateFileSteps(
   userQuestion: string,
   selectedFiles: Array<{ path: string; reason: string }>,
@@ -205,10 +158,6 @@ export async function generateFileSteps(
     details: `File: ${f.path}\nTask: ${f.reason}\nUser request: ${userQuestion}`,
   }));
 }
-
-// ---------------------------------------------------------------------------
-// Internal: pipe one step stream to express response
-// ---------------------------------------------------------------------------
 
 async function pipeStreamToResponse(
   requestId: string,
@@ -264,15 +213,12 @@ async function pipeStreamToResponse(
   });
 }
 
-// ---------------------------------------------------------------------------
-// Internal: stream one step and write e: frame
-// ---------------------------------------------------------------------------
-
 async function streamStep(opts: {
   requestId: string;
   res: Response;
   stepMessages: Messages;
   filesToUse: FileMap;
+  allFiles: FileMap;
   streamingOptions: StreamingOptions;
   apiKeys: Record<string, string>;
   providerSettings: Record<string, IProviderSetting>;
@@ -282,20 +228,21 @@ async function streamStep(opts: {
   stepIndex: number;
   cumulativeUsage: { completionTokens: number; promptTokens: number; totalTokens: number };
 }): Promise<{ stepText: string; succeeded: boolean }> {
-  const { requestId, res, stepMessages, filesToUse, stepIndex, cumulativeUsage } = opts;
+  const { requestId, res, stepMessages, filesToUse, allFiles, stepIndex, cumulativeUsage } = opts;
 
   const result = await streamText({
     messages: stepMessages,
     env: undefined as any,
     options: opts.streamingOptions,
     apiKeys: opts.apiKeys,
-    files: filesToUse,
+    files: allFiles,
     providerSettings: opts.providerSettings,
     promptId: "plan",
     chatMode: opts.chatMode,
     designScheme: opts.designScheme,
     summary: opts.summary,
-    contextOptimization: false,
+    contextOptimization: true,
+    contextFiles: filesToUse,
     messageSliceId: undefined,
   });
 
@@ -331,10 +278,6 @@ async function streamStep(opts: {
 
   return { stepText: stepText || "", succeeded: true };
 }
-
-// ---------------------------------------------------------------------------
-// Internal: build per-step messages for topic-based steps
-// ---------------------------------------------------------------------------
 
 function buildTopicStepMessages(
   messages: Messages,
@@ -417,10 +360,6 @@ function buildTopicStepMessages(
   return stepMessages;
 }
 
-// ---------------------------------------------------------------------------
-// Internal: build per-step messages for file-per-step execution
-// ---------------------------------------------------------------------------
-
 function buildFileStepMessages(
   messages: Messages,
   steps: PlanStep[],
@@ -487,10 +426,6 @@ function buildFileStepMessages(
   return stepMessages;
 }
 
-// ---------------------------------------------------------------------------
-// Public options type
-// ---------------------------------------------------------------------------
-
 export interface StreamPlanOptions {
   res: Response;
   requestId: string;
@@ -513,21 +448,12 @@ export interface StreamPlanOptions {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Main entry-point
-// ---------------------------------------------------------------------------
-
 /**
- * Unified plan execution engine.
- *
- * Decision tree:
- *  - If PLAN.md present (implementPlan=true): parse it into topic steps → execute
- *  - If build mode with user question:
- *      1. Ask LLM to select files from the project
- *      2. If selected files > FILE_PER_STEP_THRESHOLD: one file = one step ("files" mode)
- *      3. Otherwise: generate topic-based steps and use file-index for context per step ("steps" mode)
+ * How many files the LLM must select before switching to file-per-step mode.
+ * Set to 1 so that ANY non-trivial request with file selection uses file-per-step,
+ * giving users full per-file progress visibility.
  */
-const FILE_PER_STEP_THRESHOLD = 5;
+const FILE_PER_STEP_THRESHOLD = 1;
 
 export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void> {
   const {
@@ -570,14 +496,11 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     }
   };
 
-  // ── 1. Determine execution mode ──────────────────────────────────────────
-
   let executionMode: ExecutionMode = "steps";
   let steps: PlanStep[] = [];
   let selectedFileList: Array<{ path: string; reason: string }> = [];
 
   if (usePlanMd) {
-    // PLAN.md present → always topic-based steps
     logger.info(`[${requestId}] PLAN.md found (${planContent!.length} chars) — parsing into steps`);
 
     writer.writeData({
@@ -603,7 +526,6 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
     executionMode = "steps";
   } else {
-    // Build mode: first ask LLM which files need to change
     logger.info(`[${requestId}] Build mode — selecting files for: "${userQuestion!.substring(0, 80)}"`);
 
     writer.writeData({
@@ -611,7 +533,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       label: "plan-parse",
       status: "in-progress",
       order: progressCounter.value++,
-      message: "Identifying files to modify...",
+      message: "Analysing project and identifying files to modify...",
     } satisfies ProgressAnnotation);
 
     try {
@@ -625,14 +547,16 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     logger.info(`[${requestId}] File selector returned ${selectedFileList.length} files`);
 
     if (selectedFileList.length > FILE_PER_STEP_THRESHOLD) {
-      // Many files → one file per step
       executionMode = "files";
       steps = await generateFileSteps(userQuestion!, selectedFileList);
       logger.info(`[${requestId}] Execution mode: files (${steps.length} file steps)`);
+    } else if (selectedFileList.length === 1) {
+      executionMode = "files";
+      steps = await generateFileSteps(userQuestion!, selectedFileList);
+      logger.info(`[${requestId}] Execution mode: files (single file)`);
     } else {
-      // Few or no files → topic-based steps (LLM decides grouping)
       executionMode = "steps";
-      logger.info(`[${requestId}] Execution mode: steps (${selectedFileList.length} files → topic grouping)`);
+      logger.info(`[${requestId}] Execution mode: steps (no files selected — topic grouping)`);
 
       try {
         steps = await generateStepsFromQuestion(userQuestion!, onUsage);
@@ -656,8 +580,8 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     order: progressCounter.value++,
     message:
       executionMode === "files"
-        ? `${steps.length} file${steps.length !== 1 ? "s" : ""} queued — processing one per step`
-        : `Plan ready: ${steps.length} step${steps.length !== 1 ? "s" : ""}`,
+        ? `Plan ready: ${steps.length} file${steps.length !== 1 ? "s" : ""} to process`
+        : `Plan ready: ${steps.length} implementation step${steps.length !== 1 ? "s" : ""}`,
   } satisfies ProgressAnnotation);
 
   writer.writeAnnotation({
@@ -667,13 +591,9 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     executionMode,
   });
 
-  // ── 2. Emit shared messageId header ──────────────────────────────────────
-
   const sharedMessageId = generateId();
   res.write(`f:${JSON.stringify({ messageId: sharedMessageId })}\n`);
   logger.info(`[${requestId}] Emitted shared messageId: ${sharedMessageId}`);
-
-  // ── 3. Execute steps ──────────────────────────────────────────────────────
 
   let succeededSteps = 0;
   let failedSteps = 0;
@@ -691,23 +611,17 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       label: `plan-step${step.index}`,
       status: "in-progress",
       order: progressCounter.value++,
-      message:
-        executionMode === "files"
-          ? `Step ${step.index}/${steps.length}: ${step.heading}`
-          : `Step ${step.index}/${steps.length}: ${step.heading}`,
+      message: `Step ${step.index}/${steps.length}: ${step.heading}`,
     } satisfies ProgressAnnotation);
 
-    // Build messages for this step
     const stepMessages =
       executionMode === "files"
         ? buildFileStepMessages(messages, steps, step, userQuestion!, files)
         : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null);
 
-    // Select files to inject into context
     let filesToUse: FileMap = files;
 
     if (executionMode === "files") {
-      // Inject only the specific file being processed
       const specificFile = files[step.heading];
       if (specificFile) {
         filesToUse = { [step.heading]: specificFile };
@@ -715,7 +629,6 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         filesToUse = {};
       }
     } else {
-      // Topic-based: use graph search for relevant files
       try {
         const query = `${step.heading} ${step.details}`;
         const relevantPaths: string[] = searchWithGraph(query, 5, 1);
@@ -737,7 +650,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     }
 
     logger.info(
-      `[${requestId}] Step ${step.index} using ${Object.keys(filesToUse).length}/${Object.keys(files).length} files`,
+      `[${requestId}] Step ${step.index} context: ${Object.keys(filesToUse).length} focused files, ${Object.keys(files).length} total files available`,
     );
 
     try {
@@ -746,6 +659,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         res,
         stepMessages,
         filesToUse,
+        allFiles: files,
         streamingOptions,
         apiKeys,
         providerSettings,
@@ -785,8 +699,6 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       continue;
     }
   }
-
-  // ── 4. Done ───────────────────────────────────────────────────────────────
 
   logger.info(
     `[${requestId}] All ${steps.length} steps complete. succeeded=${succeededSteps} failed=${failedSteps} totalTokens=${cumulativeUsage.totalTokens}`,

@@ -21,6 +21,12 @@ export type ContextAnnotation =
       files: Array<{ stepIndex: number; filePath: string; reason: string }>;
       totalSteps: number;
       userIntent: string;
+    }
+  | {
+      type: 'planSteps';
+      steps: Array<{ index: number; heading: string }>;
+      totalSteps: number;
+      executionMode: 'files' | 'steps';
     };
 
 export type ProgressAnnotation = {

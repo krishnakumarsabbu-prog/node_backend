@@ -18,6 +18,9 @@ function getFilePaths(files: FileMap): string[] {
  *
  * Returns a BatchPlan. The caller decides whether to execute file-per-step
  * (when files.length > threshold) or fall back to topic-based steps.
+ *
+ * IMPORTANT: No exclusions on test files, docs, or any file type — the LLM
+ * should decide what is needed based purely on the user request.
  */
 export async function selectFilesForBuild(
   userQuestion: string,
@@ -41,14 +44,17 @@ Identify EXACTLY which files need to be created or modified to fulfill the reque
 Return ONLY a valid JSON array — no prose, no markdown fences, no explanation.
 Each element must have:
 "path"   : string  (exact file path from the provided list, or a new file path following project conventions)
-"reason" : string  (one sentence: what specifically needs to change in this file)
+"reason" : string  (one sentence: what specifically needs to change or be created in this file)
 
 Rules:
-- Only include files that DIRECTLY need to be created or modified
-- Do NOT include config files, lock files, test files, or unrelated files
+- Include ALL files that need to be touched — including test files, config files, new files
+- For requests about test generation: include a new test file for EVERY source file listed
+- For requests about themes/styling: include every file that contains styles or theme configuration
+- For migration requests: include every file that needs to be transformed
 - For new files, follow the naming and directory conventions already in the project
-- Preserve exact paths as given
+- Preserve exact paths as given for existing files
 - Do NOT wrap output in markdown code fences
+- Be comprehensive — it is better to include more files than to miss one
 `,
     prompt: `
 User request: "${userQuestion}"
