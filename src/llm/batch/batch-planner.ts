@@ -12,14 +12,21 @@ function getFilePaths(files: FileMap): string[] {
     .map(([path]) => path);
 }
 
-export async function planBatchExecution(
+/**
+ * Ask the LLM to select which files in the project need to be touched
+ * to fulfill a user request.
+ *
+ * Returns a BatchPlan. The caller decides whether to execute file-per-step
+ * (when files.length > threshold) or fall back to topic-based steps.
+ */
+export async function selectFilesForBuild(
   userQuestion: string,
   files: FileMap,
   onFinish?: (resp: GenerateTextResult<Record<string, CoreTool<any, any>>, never>) => void,
 ): Promise<BatchPlan> {
   const allPaths = getFilePaths(files);
 
-  logger.info(`Planning batch execution for ${allPaths.length} available files`);
+  logger.info(`Selecting files from ${allPaths.length} candidates for: "${userQuestion.substring(0, 80)}"`);
 
   if (allPaths.length === 0) {
     return { files: [], totalSteps: 0, userIntent: userQuestion };
@@ -28,20 +35,19 @@ export async function planBatchExecution(
   const resp = await generateText({
     model: getTachyonModel(),
     system: `
-You are a code analysis assistant. The user wants to perform a task across multiple files in their project.
-Your job is to identify EXACTLY which files need to be modified or generated to fulfill the user's request.
+You are a code analysis assistant. The user wants to perform a task across their project.
+Identify EXACTLY which files need to be created or modified to fulfill the request.
 
 Return ONLY a valid JSON array — no prose, no markdown fences, no explanation.
 Each element must have:
-"path"   : string  (exact file path from the provided list, or a new file path if needed)
-"reason" : string  (one sentence: why this file needs to be touched for the user's request)
+"path"   : string  (exact file path from the provided list, or a new file path following project conventions)
+"reason" : string  (one sentence: what specifically needs to change in this file)
 
 Rules:
-- Only include files that DIRECTLY need to be created or modified for the task
-- Do NOT include config files, lock files, or unrelated files
-- If the user asks for "all files" of a certain type (e.g. "all components"), include all matching files
-- Preserve exact paths as given in the file list
-- For new files that don't exist yet, use a sensible path following existing conventions
+- Only include files that DIRECTLY need to be created or modified
+- Do NOT include config files, lock files, test files, or unrelated files
+- For new files, follow the naming and directory conventions already in the project
+- Preserve exact paths as given
 - Do NOT wrap output in markdown code fences
 `,
     prompt: `
@@ -50,7 +56,7 @@ User request: "${userQuestion}"
 Available project files:
 ${allPaths.join("\n")}
 
-Return the JSON array of files that need to be processed for this request.
+Return the JSON array of files that need to be created or modified.
 `,
   });
 
@@ -61,12 +67,10 @@ Return the JSON array of files that need to be processed for this request.
   try {
     const cleaned = resp.text.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "");
     batchFiles = JSON.parse(cleaned) as BatchFile[];
-    logger.info(`Planner identified ${batchFiles.length} files to process`);
+    logger.info(`File selector identified ${batchFiles.length} files`);
   } catch (err: any) {
-    logger.error("Failed to parse batch plan response, falling back to all source files", err);
-    batchFiles = allPaths
-      .filter((p) => !p.includes("node_modules") && !p.includes(".git"))
-      .map((p) => ({ path: p, reason: "Identified by fallback (LLM parse failed)" }));
+    logger.error("Failed to parse file selection response", err);
+    batchFiles = [];
   }
 
   return {
