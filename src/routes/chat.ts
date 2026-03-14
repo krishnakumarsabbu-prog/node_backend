@@ -18,10 +18,7 @@ import type { ContextAnnotation, ProgressAnnotation } from "../types/context";
 import { MCPService } from "../llm/mcpService";
 import { StreamRecoveryManager } from "../llm/stream-recovery";
 import { CONTINUE_PROMPT } from "../prompts/prompts";
-import { analyzeProjectForMigration } from "../llm/migration/migrationAnalyzer";
-import { generateMigrationPlan } from "../llm/migration/migrationPlanner";
-import { executeMigrationPlan } from "../llm/migration/migrationExecutor";
-import type { MigrationPlan } from "../llm/migration/migrationTypes";
+import { ChatMigrationHandler } from "./chatMigration";
 
 const logger = createScopedLogger("api.chat");
 
@@ -258,86 +255,45 @@ export async function chatHandler(req: Request, res: Response) {
     if (chatMode === "migrate") {
       logger.info(`[${requestId}] Migration mode: action=${migrationAction || "plan"}`);
 
-      if (migrationAction === "implement" && migrationPlan) {
-        writeDataPart(res, {
-          type: "progress",
-          label: "migration",
-          status: "in-progress",
-          order: progressCounter++,
-          message: "Executing migration tasks",
-        } satisfies ProgressAnnotation);
+      const migrationHandler = new ChatMigrationHandler(WORK_DIR, false);
 
-        const result = await executeMigrationPlan(migrationPlan as MigrationPlan, files as FileMap);
-
-        writeDataPart(res, {
-          type: "progress",
-          label: "migration",
-          status: "complete",
-          order: progressCounter++,
-          message: "Migration completed",
-        } satisfies ProgressAnnotation);
-
-        writeMessageAnnotationPart(res, {
-          type: "migration_result",
-          result: {
-            filesModified: result.filesModified,
-            filesCreated: result.filesCreated,
-            filesDeleted: result.filesDeleted,
-            modifiedFiles: result.modifiedFiles,
-            createdFiles: result.createdFiles,
-            deletedFiles: result.deletedFiles,
-          },
-        } as ContextAnnotation);
+      try {
+        if (migrationAction === "implement" && migrationPlan) {
+          progressCounter = await migrationHandler.handlePlanExecution(
+            {
+              files: files as FileMap,
+              messages,
+              workDir: WORK_DIR,
+              migrationAction,
+              migrationPlan,
+            },
+            writeDataPart,
+            writeMessageAnnotationPart,
+            res,
+            progressCounter
+          );
+        } else {
+          progressCounter = await migrationHandler.handlePlanGeneration(
+            {
+              files: files as FileMap,
+              messages,
+              workDir: WORK_DIR,
+            },
+            writeDataPart,
+            writeMessageAnnotationPart,
+            res,
+            progressCounter
+          );
+        }
 
         res.end();
-        logger.info(`[${requestId}] Migration execution complete elapsedMs=${Date.now() - startedAt}`);
+        logger.info(`[${requestId}] Migration complete elapsedMs=${Date.now() - startedAt}`);
+        return;
+      } catch (error) {
+        logger.error(`[${requestId}] Migration failed: ${(error as Error).message}`);
+        res.end();
         return;
       }
-
-      writeDataPart(res, {
-        type: "progress",
-        label: "migration",
-        status: "in-progress",
-        order: progressCounter++,
-        message: "Analyzing project",
-      } satisfies ProgressAnnotation);
-
-      const analysis = await analyzeProjectForMigration(files as FileMap);
-
-      writeDataPart(res, {
-        type: "progress",
-        label: "migration",
-        status: "complete",
-        order: progressCounter++,
-        message: "Project analysis complete",
-      } satisfies ProgressAnnotation);
-
-      writeDataPart(res, {
-        type: "progress",
-        label: "migration",
-        status: "in-progress",
-        order: progressCounter++,
-        message: "Generating migration plan",
-      } satisfies ProgressAnnotation);
-
-      const plan = await generateMigrationPlan(files as FileMap, messages, analysis);
-
-      writeDataPart(res, {
-        type: "progress",
-        label: "migration",
-        status: "complete",
-        order: progressCounter++,
-        message: "Migration plan generated",
-      } satisfies ProgressAnnotation);
-
-      writeMessageAnnotationPart(res, {
-        type: "migration_plan",
-        plan,
-      } as ContextAnnotation);
-
-      res.end();
-      logger.info(`[${requestId}] Migration planning complete elapsedMs=${Date.now() - startedAt}`);
-      return;
     }
 
     const dataStreamAdapter = {

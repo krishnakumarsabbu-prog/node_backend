@@ -13,7 +13,8 @@
     "ai": "4.3.16",
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "ignore": "^6.0.2"
+    "ignore": "^6.0.2",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
