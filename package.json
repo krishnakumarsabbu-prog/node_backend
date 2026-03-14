@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx src/server.ts"
+    "dev": "tsx src/server.ts",
+    "build": "tsc --noEmit"
   },
   "dependencies": {
     "@ai-sdk/openai": "^1.1.0",

@@ -7,6 +7,14 @@ export type ContextAnnotation =
       type: 'chatSummary';
       summary: string;
       chatId: string;
+    }
+  | {
+      type: 'migration_plan';
+      plan: any;
+    }
+  | {
+      type: 'migration_result';
+      result: any;
     };
 
 export type ProgressAnnotation = {

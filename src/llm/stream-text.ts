@@ -97,7 +97,7 @@ export async function streamText(props: {
   summary?: string;
   messageSliceId?: number;
 
-  chatMode?: "discuss" | "build";
+  chatMode?: "discuss" | "build" | "migrate";
   designScheme?: DesignScheme;
 
   // Keeping these for compatibility with existing callers,
