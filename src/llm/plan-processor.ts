@@ -200,23 +200,34 @@ export async function generateStepsFromQuestion(
   const resp = await generateText({
     model: getTachyonModel(),
     system: `
-You are a project planning assistant specializing in industry-level software development. Given a user's request, break it down into clear, actionable implementation steps, focusing on business logic, system architecture, and technical requirements.
+You are a project planning assistant specializing in industry-level software development. Given a user's request, break it down into clear, actionable SOURCE CODE implementation steps only.
 
 Return ONLY a valid JSON array — no prose, no markdown fences. Each element must have:
 "index"   : number  (1-based sequential integer)
 "heading" : string  (concise title for the step, ≤ 80 chars)
 "details" : string  (full implementation guidance, tasks, and subtasks for that step)
 
-Rules:
-- Identify all work needed to fulfill the user's request, emphasizing business value and architectural considerations.
-- Group logically-related tasks into a single step.
-- Keep "heading" short and descriptive, reflecting the step's strategic importance.
-- "details" may be multi-line; use \\n for newlines inside the JSON string to separate tasks within a step.
-- Steps should be ordered logically (architecture and data modeling first, then business logic, UI, integrations, and finally, deployment and maintenance).
-- Focus on generating steps that reflect industry best practices for scalability, security, and maintainability.
-- For React projects, emphasize professional page design, component architecture, and full implementation of business functionalities within the UI. Consider user experience (UX) principles in UI-related steps.
-- Where applicable, include considerations for data modeling, API design, security implications, performance optimization, and scalability within the step details.
-- Do NOT wrap output in markdown code fences.
+STRICT RULES — WHAT TO INCLUDE:
+- ONLY steps that involve writing, modifying, or creating SOURCE CODE files
+- Steps must produce concrete file changes (components, services, APIs, schemas, configs, styles, etc.)
+- Steps should be ordered logically: data models and schemas first, then business logic, then UI components, then integrations
+
+STRICT RULES — WHAT TO EXCLUDE (DO NOT generate steps for these):
+- Documentation writing (README, API docs, wiki, changelogs, comments)
+- Unit tests, integration tests, end-to-end tests, test suites, test fixtures
+- Deployment scripts, CI/CD pipelines, Docker, Kubernetes, infrastructure
+- Code reviews, audits, refactoring passes
+- Performance profiling or benchmarking sessions
+- Any step that does not produce a source code file change
+
+Additional rules:
+- Group logically-related code changes into a single step
+- Keep "heading" short and action-oriented (e.g. "Build User Auth Service", "Create Dashboard UI")
+- "details" may be multi-line; use \\n for newlines inside the JSON string
+- For React/frontend projects: emphasize component architecture, page layouts, state management, and API integration
+- For backend projects: emphasize data models, service layer, API endpoints, middleware
+- Include database schema changes and migration files as code steps
+- Do NOT wrap output in markdown code fences
 `,
     prompt: `
 Here is the user's request:
@@ -225,7 +236,7 @@ Here is the user's request:
 ${userQuestion}
 </request>
 
-Return the structured JSON array of implementation steps now. Focus on high-level design and business logic implementation.
+Return the structured JSON array of SOURCE CODE implementation steps only. Exclude any documentation, testing, or deployment steps.
 `,
   });
 
