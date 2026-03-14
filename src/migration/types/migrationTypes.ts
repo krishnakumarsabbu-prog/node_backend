@@ -84,9 +84,11 @@ export interface RepairResult {
 
 export interface MigrationContext {
   files: Record<string, any>;
-  analysis: ProjectAnalysis;
+  analysis?: ProjectAnalysis;
   userRequest: string;
   workDir: string;
+  migrationAction?: "plan" | "implement";
+  migrationPlan?: MigrationPlan;
 }
 
 export interface LLMResponse<T> {

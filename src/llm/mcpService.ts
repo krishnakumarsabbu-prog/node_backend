@@ -189,7 +189,11 @@ export class MCPService {
     logger.debug(`Creating SSE client for ${serverName} with URL: ${config.url}`);
 
     const client = await experimental_createMCPClient({
-      transport: config,
+      transport: {
+        type: "sse" as const,
+        url: config.url,
+        headers: config.headers,
+      },
     });
 
     return Object.assign(client, { serverName });
@@ -200,7 +204,14 @@ export class MCPService {
       `Creating STDIO client for '${serverName}' with command: '${config.command}' ${config.args?.join(' ') || ''}`,
     );
 
-    const client = await experimental_createMCPClient({ transport: new Experimental_StdioMCPTransport(config) });
+    const client = await experimental_createMCPClient({
+      transport: new Experimental_StdioMCPTransport({
+        command: config.command,
+        args: config.args,
+        cwd: config.cwd,
+        env: config.env,
+      }),
+    });
 
     return Object.assign(client, { serverName });
   }

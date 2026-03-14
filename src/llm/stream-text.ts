@@ -81,7 +81,7 @@ export interface StreamingOptions extends Omit<Parameters<typeof _streamText>[0]
 const logger = createScopedLogger("stream-text");
 
 function sanitizeText(text: string): string {
-  let sanitized = text.replace(/<div class=\\"__cortexThought__\\">.*?<\/div>/s, "");
+  let sanitized = text.replace(/<div class="__cortexThought__">.*?<\/div>/s, "");
   sanitized = sanitized.replace(/<think>.*?<\/think>/s, "");
   sanitized = sanitized.replace(/<cortexAction type="file" filePath="package-lock\.json">[\s\S]*?<\/cortexAction>/g, "");
   return sanitized.trim();
@@ -100,8 +100,6 @@ export async function streamText(props: {
   chatMode?: "discuss" | "build" | "migrate";
   designScheme?: DesignScheme;
 
-  // Keeping these for compatibility with existing callers,
-  // but Tachyon version does not use them:
   apiKeys?: Record<string, string>;
   providerSettings?: any;
   promptId?: string;
@@ -119,7 +117,6 @@ export async function streamText(props: {
     promptId,
   } = props;
 
-  // Sanitize messages
   let processedMessages = messages.map((message: any) => {
     const newMessage = { ...message };
 
@@ -129,7 +126,6 @@ export async function streamText(props: {
       newMessage.content = sanitizeText(message.content);
     }
 
-    // Sanitize all text parts in parts array, if present
     if (Array.isArray(message.parts)) {
       newMessage.parts = message.parts.map((part: any) =>
         part.type === "text" ? { ...part, text: sanitizeText(part.text) } : part,
@@ -139,7 +135,6 @@ export async function streamText(props: {
     return newMessage;
   });
 
-  // Build system prompt
   let systemPrompt =
     PromptLibrary.getPropmtFromLibrary(promptId || "default", {
       cwd: WORK_DIR,
@@ -153,7 +148,6 @@ export async function streamText(props: {
       },
     }) ?? getSystemPrompt();
 
-  // Build mode: inject context buffer + optional summary
   if (chatMode === "build" && contextFiles && contextOptimization) {
     const codeContext = createFilesContext(contextFiles, true);
 
@@ -178,18 +172,15 @@ ${summary}
 ---
 `;
 
-      // If messageSliceId provided, slice messages so model focuses on latest
       if (props.messageSliceId) {
         processedMessages = processedMessages.slice(props.messageSliceId);
       } else {
-        // fallback: keep only the last message
         const lastMessage = processedMessages.pop();
         processedMessages = lastMessage ? [lastMessage] : [];
       }
     }
   }
 
-  // Locked files enforcement
   const effectiveLockedFilePaths = new Set<string>();
   if (files) {
     for (const [filePath, fileDetails] of Object.entries(files)) {
@@ -212,14 +203,10 @@ ${lockedFilesListString}
 
   logger.info(`Sending llm call to Tachyon (single provider + single model)`);
 
-  // NOTE: Token params are intentionally simple for Tachyon.
-  // If you want a hard limit, set maxTokens here or pass via options.
   const streamParams = {
     model: getTachyonModel(),
     system: chatMode === "build" ? systemPrompt : discussPrompt(),
     messages: convertToCoreMessages(processedMessages as any),
-
-    // Pass through any extra streaming options the caller provided
     ...(options || {}),
   } as Parameters<typeof _streamText>[0];
 
