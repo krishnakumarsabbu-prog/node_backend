@@ -1,93 +1,141 @@
 import { createScopedLogger } from "../utils/logger";
 
+const logger = createScopedLogger("stream-recovery");
 
-const logger = createScopedLogger('stream-recovery');
+export type StreamHealthState = "healthy" | "degraded" | "stalled" | "dead";
 
-export interface StreamRecoveryOptions {
+export interface StreamGuardOptions {
+  activityTimeoutMs?: number;
+  heartbeatIntervalMs?: number;
   maxRetries?: number;
-  timeout?: number;
-  onTimeout?: () => void;
-  onRecovery?: () => void;
+  onDegraded?: () => void;
+  onStalled?: () => void;
+  onDead?: () => void;
 }
 
-export class StreamRecoveryManager {
-  private _retryCount = 0;
-  private _timeoutHandle: NodeJS.Timeout | null = null;
-  private _lastActivity: number = Date.now();
-  private _isActive = true;
+export interface StreamGuardMetrics {
+  state: StreamHealthState;
+  retries: number;
+  bytesReceived: number;
+  chunksReceived: number;
+  elapsedMs: number;
+  lastActivityMs: number;
+}
 
-  constructor(private _options: StreamRecoveryOptions = {}) {
-    this._options = {
-      maxRetries: 3,
-      timeout: 30000, // 30 seconds default
-      ..._options,
-    };
+const DEFAULTS: Required<Omit<StreamGuardOptions, "onDegraded" | "onStalled" | "onDead">> = {
+  activityTimeoutMs: 30_000,
+  heartbeatIntervalMs: 5_000,
+  maxRetries: 3,
+};
+
+export class StreamGuard {
+  private _state: StreamHealthState = "healthy";
+  private _lastActivity = Date.now();
+  private _startedAt = Date.now();
+  private _bytesReceived = 0;
+  private _chunksReceived = 0;
+  private _retries = 0;
+  private _stopped = false;
+  private _heartbeatTimer: NodeJS.Timeout | null = null;
+  private _opts: Required<Omit<StreamGuardOptions, "onDegraded" | "onStalled" | "onDead">> & Pick<StreamGuardOptions, "onDegraded" | "onStalled" | "onDead">;
+
+  constructor(opts: StreamGuardOptions = {}) {
+    this._opts = { ...DEFAULTS, ...opts };
   }
 
-  startMonitoring() {
-    this._resetTimeout();
+  start(): void {
+    if (this._stopped) return;
+    this._startHeartbeat();
+    logger.debug("StreamGuard started");
   }
 
-  updateActivity() {
+  stop(): void {
+    this._stopped = true;
+    this._clearHeartbeat();
+    if (this._state !== "dead") {
+      this._transition("healthy");
+    }
+    logger.debug("StreamGuard stopped");
+  }
+
+  recordActivity(bytes = 0): void {
     this._lastActivity = Date.now();
-    this._resetTimeout();
-  }
+    this._bytesReceived += bytes;
+    this._chunksReceived++;
 
-  private _resetTimeout() {
-    if (this._timeoutHandle) {
-      clearTimeout(this._timeoutHandle);
-    }
-
-    if (!this._isActive) {
-      return;
-    }
-
-    this._timeoutHandle = setTimeout(() => {
-      if (this._isActive) {
-        logger.warn('Stream timeout detected');
-        this._handleTimeout();
-      }
-    }, this._options.timeout);
-  }
-
-  private _handleTimeout() {
-    if (this._retryCount >= (this._options.maxRetries || 3)) {
-      logger.error('Max retries reached for stream recovery');
-      this.stop();
-
-      return;
-    }
-
-    this._retryCount++;
-    logger.info(`Attempting stream recovery (attempt ${this._retryCount})`);
-
-    if (this._options.onTimeout) {
-      this._options.onTimeout();
-    }
-
-    // Reset monitoring after recovery attempt
-    this._resetTimeout();
-
-    if (this._options.onRecovery) {
-      this._options.onRecovery();
+    if (this._state === "degraded" || this._state === "stalled") {
+      logger.info("StreamGuard: activity resumed, transitioning back to healthy");
+      this._transition("healthy");
     }
   }
 
-  stop() {
-    this._isActive = false;
-
-    if (this._timeoutHandle) {
-      clearTimeout(this._timeoutHandle);
-      this._timeoutHandle = null;
-    }
+  get canRetry(): boolean {
+    return this._retries < this._opts.maxRetries && !this._stopped;
   }
 
-  getStatus() {
+  consumeRetry(): number {
+    this._retries++;
+    const backoff = Math.min(10_000, 500 * 2 ** (this._retries - 1));
+    logger.info(`StreamGuard: retry ${this._retries}/${this._opts.maxRetries}, backoff=${backoff}ms`);
+    return backoff;
+  }
+
+  get state(): StreamHealthState {
+    return this._state;
+  }
+
+  metrics(): StreamGuardMetrics {
     return {
-      isActive: this._isActive,
-      retryCount: this._retryCount,
-      lastActivity: this._lastActivity,
-      timeSinceLastActivity: Date.now() - this._lastActivity,
+      state: this._state,
+      retries: this._retries,
+      bytesReceived: this._bytesReceived,
+      chunksReceived: this._chunksReceived,
+      elapsedMs: Date.now() - this._startedAt,
+      lastActivityMs: Date.now() - this._lastActivity,
     };
+  }
+
+  private _startHeartbeat(): void {
+    this._heartbeatTimer = setInterval(() => this._tick(), this._opts.heartbeatIntervalMs);
+  }
+
+  private _clearHeartbeat(): void {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+  }
+
+  private _tick(): void {
+    if (this._stopped) return;
+
+    const silenceMs = Date.now() - this._lastActivity;
+    const { activityTimeoutMs } = this._opts;
+    const degradedThresholdMs = activityTimeoutMs * 0.5;
+
+    if (silenceMs >= activityTimeoutMs) {
+      if (this._state !== "dead") {
+        if (this.canRetry) {
+          this._transition("stalled");
+          this._opts.onStalled?.();
+        } else {
+          this._transition("dead");
+          this._clearHeartbeat();
+          this._opts.onDead?.();
+        }
+      }
+    } else if (silenceMs >= degradedThresholdMs) {
+      if (this._state === "healthy") {
+        this._transition("degraded");
+        this._opts.onDegraded?.();
+      }
+    }
+  }
+
+  private _transition(next: StreamHealthState): void {
+    if (this._state !== next) {
+      logger.info(`StreamGuard: ${this._state} -> ${next}`);
+      this._state = next;
+    }
   }
 }

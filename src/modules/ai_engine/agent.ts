@@ -3,29 +3,28 @@ import { RepositoryIndex, SearchResult } from './types/index.js'
 import { indexRepository } from './indexer/indexer.js'
 import { searchFiles } from './retrieval/searcher.js'
 import { expandGraphFromSeeds } from './graph/graphBuilder.js'
+import { createScopedLogger } from '../../utils/logger'
+
+const logger = createScopedLogger('ai-engine')
 
 let currentIndex: RepositoryIndex | null = null
 
 export function buildIndex(repositoryPath: string): RepositoryIndex {
-  console.log(`\n=== Indexing Repository: ${repositoryPath} ===\n`)
+  logger.info(`Indexing repository: ${repositoryPath}`)
 
   const startTime = Date.now()
   currentIndex = indexRepository(repositoryPath)
   const duration = Date.now() - startTime
 
-  console.log('\n=== Index Complete ===')
-  console.log(`Total Files: ${currentIndex.statistics.totalFiles}`)
-  console.log(`Total Lines: ${currentIndex.statistics.totalLines}`)
-  console.log(`Total Symbols: ${currentIndex.statistics.symbolCount}`)
-  console.log(`Graph Edges: ${currentIndex.graph.edges.length}`)
-  console.log(`Duration: ${duration}ms`)
+  const { totalFiles, totalLines, symbolCount, languageDistribution } = currentIndex.statistics
+  const edges = currentIndex.graph.edges.length
 
-  console.log('\nLanguage Distribution:')
-  const sortedLangs = Object.entries(currentIndex.statistics.languageDistribution)
-    .sort((a, b) => b[1] - a[1])
-  sortedLangs.forEach(([lang, count]) => {
-    console.log(`  ${lang}: ${count} files`)
-  })
+  logger.info(`Index complete: ${totalFiles} files, ${totalLines} lines, ${symbolCount} symbols, ${edges} edges in ${duration}ms`)
+
+  const sortedLangs = Object.entries(languageDistribution).sort((a, b) => b[1] - a[1])
+  for (const [lang, count] of sortedLangs) {
+    logger.debug(`  ${lang}: ${count} files`)
+  }
 
   return currentIndex
 }
@@ -35,16 +34,16 @@ export function saveIndex(outputPath: string = 'repository_index.json'): void {
     throw new Error('No index available. Call buildIndex() first.')
   }
 
-  console.log(`\nSaving index to ${outputPath}...`)
+  logger.info(`Saving index to ${outputPath}`)
   fs.writeFileSync(outputPath, JSON.stringify(currentIndex, null, 2))
-  console.log('Index saved successfully.')
+  logger.info('Index saved')
 }
 
 export function loadIndex(inputPath: string = 'repository_index.json'): RepositoryIndex {
-  console.log(`Loading index from ${inputPath}...`)
+  logger.info(`Loading index from ${inputPath}`)
   const data = fs.readFileSync(inputPath, 'utf-8')
   currentIndex = JSON.parse(data)
-  console.log('Index loaded successfully.')
+  logger.info('Index loaded')
   return currentIndex!
 }
 
@@ -53,20 +52,10 @@ export function search(query: string, topK: number = 10): SearchResult[] {
     throw new Error('No index available. Call buildIndex() or loadIndex() first.')
   }
 
-  console.log(`\n=== Searching for: "${query}" ===\n`)
-
   const results = searchFiles(query, currentIndex.files)
   const topResults = results.slice(0, topK)
 
-  console.log(`Found ${results.length} matching files. Showing top ${topResults.length}:\n`)
-
-  topResults.forEach((result, index) => {
-    console.log(`${index + 1}. ${result.file.path} (score: ${result.score})`)
-    console.log(`   Language: ${result.file.language}`)
-    console.log(`   Symbols: ${result.file.symbols.length}`)
-    console.log(`   Reasons: ${result.matchReasons.slice(0, 3).join(', ')}`)
-    console.log()
-  })
+  logger.info(`Search "${query.substring(0, 60)}": ${results.length} total, returning top ${topResults.length}`)
 
   return topResults
 }
@@ -84,10 +73,7 @@ export function searchWithGraph(query: string, topK: number = 5, graphDepth: num
   }
 
   const expandedFiles = expandGraphFromSeeds(seeds, currentIndex.graph, graphDepth)
-
-  console.log(`\n=== Graph Expansion ===`)
-  console.log(`Seeds: ${seeds.length}`)
-  console.log(`Expanded to: ${expandedFiles.length} files\n`)
+  logger.debug(`Graph expansion: ${seeds.length} seeds -> ${expandedFiles.length} files`)
 
   return expandedFiles
 }

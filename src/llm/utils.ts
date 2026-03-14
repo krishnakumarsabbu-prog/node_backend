@@ -1,8 +1,10 @@
 import { type Message } from 'ai';
-import { DEFAULT_MODEL, MODEL_REGEX, PROVIDER_REGEX } from '../utils/constants';
+import { DEFAULT_MODEL, MODEL_REGEX, PROVIDER_REGEX, WORK_DIR } from '../utils/constants';
 import { IGNORE_PATTERNS, type FileMap } from './constants';
 import ignore from 'ignore';
 import { ContextAnnotation } from '../types/context';
+
+const _ig = ignore().add(IGNORE_PATTERNS);
 
 export function extractPropertiesFromMessage(message: Omit<Message, 'id'>): {
   model: string;
@@ -55,32 +57,24 @@ export function simplifyCortexActions(input: string): string {
 }
 
 export function createFilesContext(files: FileMap, useRelativePath?: boolean) {
-  const ig = ignore().add(IGNORE_PATTERNS);
   let filePaths = Object.keys(files);
   filePaths = filePaths.filter((x) => {
-    const relPath = x.replace('/home/project/', '');
-    return !ig.ignores(relPath);
+    const relPath = x.replace(`${WORK_DIR}/`, '');
+    return !_ig.ignores(relPath);
   });
 
   const fileContexts = filePaths
-    .filter((x) => files[x] && files[x].type == 'file')
+    .filter((x) => files[x] && files[x].type === 'file')
     .map((path) => {
       const dirent = files[path];
 
-      if (!dirent || dirent.type == 'folder') {
+      if (!dirent || dirent.type === 'folder') {
         return '';
       }
 
-      const codeWithLinesNumbers = dirent.content
-        .split('\n')
-        // .map((v, i) => `${i + 1}|${v}`)
-        .join('\n');
+      const codeWithLinesNumbers = dirent.content.split('\n').join('\n');
 
-      let filePath = path;
-
-      if (useRelativePath) {
-        filePath = path.replace('/home/project/', '');
-      }
+      const filePath = useRelativePath ? path.replace(`${WORK_DIR}/`, '') : path;
 
       return `<cortexAction type="file" filePath="${filePath}">${codeWithLinesNumbers}</cortexAction>`;
     });
@@ -89,39 +83,25 @@ export function createFilesContext(files: FileMap, useRelativePath?: boolean) {
 }
 
 export function extractCurrentContext(messages: Message[]) {
-  const lastAssistantMessage = messages.filter((x) => x.role == 'assistant').slice(-1)[0];
-
-  if (!lastAssistantMessage) {
-    return { summary: undefined, codeContext: undefined };
-  }
-
   let summary: ContextAnnotation | undefined;
   let codeContext: ContextAnnotation | undefined;
 
-  if (!lastAssistantMessage.annotations?.length) {
-    return { summary: undefined, codeContext: undefined };
-  }
+  const assistantMessages = messages.filter((x) => x.role === 'assistant');
 
-  for (let i = 0; i < lastAssistantMessage.annotations.length; i++) {
-    const annotation = lastAssistantMessage.annotations[i];
+  for (let mi = assistantMessages.length - 1; mi >= 0; mi--) {
+    const msg = assistantMessages[mi];
+    if (!msg.annotations?.length) continue;
 
-    if (!annotation || typeof annotation !== 'object') {
-      continue;
+    for (const annotation of msg.annotations) {
+      if (!annotation || typeof annotation !== 'object') continue;
+      const ann = annotation as any;
+      if (!ann.type) continue;
+
+      if (!codeContext && ann.type === 'codeContext') codeContext = ann;
+      if (!summary && ann.type === 'chatSummary') summary = ann;
     }
 
-    if (!(annotation as any).type) {
-      continue;
-    }
-
-    const annotationObject = annotation as any;
-
-    if (annotationObject.type === 'codeContext') {
-      codeContext = annotationObject;
-      break;
-    } else if (annotationObject.type === 'chatSummary') {
-      summary = annotationObject;
-      break;
-    }
+    if (summary && codeContext) break;
   }
 
   return { summary, codeContext };

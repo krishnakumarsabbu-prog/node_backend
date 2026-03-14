@@ -377,6 +377,17 @@ export class MCPService {
     return toolName in this._tools;
   }
 
+  getServerHealth(): Record<string, { status: string; toolCount: number }> {
+    const health: Record<string, { status: string; toolCount: number }> = {};
+    for (const [name, server] of Object.entries(this._mcpToolsPerServer)) {
+      health[name] = {
+        status: server.status,
+        toolCount: server.status === 'available' ? Object.keys((server as any).tools || {}).length : 0,
+      };
+    }
+    return health;
+  }
+
   processToolCall(toolCall: ToolCall, dataStream: DataStreamWriter): void {
     const { toolCallId, toolName } = toolCall;
 

@@ -8,6 +8,8 @@ import type { ProgressAnnotation, ContextAnnotation } from "../types/context";
 import { MCPService } from "../llm/mcpService";
 import { CONTINUE_PROMPT } from "../prompts/prompts";
 import { extractPropertiesFromMessage } from "../llm/utils";
+import { StreamGuard } from "../llm/stream-recovery";
+import { AgentRecoveryController } from "../llm/agent-recovery";
 
 import {
   logger,
@@ -20,12 +22,16 @@ import {
   type ChatContext,
 } from "./chat-shared";
 
+const STREAM_ACTIVITY_TIMEOUT_MS = 30_000;
+const STREAM_HEARTBEAT_INTERVAL_MS = 5_000;
+
 async function pipeWebStreamToExpress(opts: {
   requestId: string;
   res: Response;
   webStream: ReadableStream;
+  guard: StreamGuard;
 }): Promise<void> {
-  const { requestId, res, webStream } = opts;
+  const { requestId, res, webStream, guard } = opts;
 
   if (res.writableEnded || res.destroyed) {
     logger.warn(`[${requestId}] Response already ended before piping, skipping`);
@@ -36,11 +42,15 @@ async function pipeWebStreamToExpress(opts: {
 
   let bytesWritten = 0;
   let chunksWritten = 0;
+
   nodeStream.on("data", (chunk) => {
-    bytesWritten += chunk.length;
+    const len = chunk.length || 0;
+    bytesWritten += len;
     chunksWritten++;
+    guard.recordActivity(len);
+
     if (chunksWritten % 10 === 0) {
-      logger.info(`[${requestId}] Streaming progress: ${chunksWritten} chunks, ${bytesWritten} bytes`);
+      logger.info(`[${requestId}] Streaming: ${chunksWritten} chunks, ${bytesWritten} bytes`);
     }
   });
 
@@ -48,11 +58,11 @@ async function pipeWebStreamToExpress(opts: {
 
   return new Promise<void>((resolve, reject) => {
     nodeStream.on("end", () => {
-      logger.info(`[${requestId}] nodeStream ended - total: ${chunksWritten} chunks, ${bytesWritten} bytes`);
+      logger.info(`[${requestId}] Stream ended: ${chunksWritten} chunks, ${bytesWritten} bytes`);
       resolve();
     });
     nodeStream.on("error", (err) => {
-      logger.error(`[${requestId}] nodeStream error: ${err?.message || err}`, err);
+      logger.error(`[${requestId}] Stream error: ${err?.message || err}`, err);
       reject(err);
     });
   });
@@ -78,6 +88,7 @@ export async function handleDiscuss(
   const { files, promptId, contextOptimization, chatMode, designScheme, supabase, maxLLMSteps, apiKeys, providerSettings } = body;
 
   const mcpService = MCPService.getInstance();
+  const recovery = new AgentRecoveryController({ repeatToolThreshold: 3, noProgressThreshold: 3, timeoutThreshold: 2 });
 
   const contextBatches: FileMap[] =
     filteredFiles && Object.keys(filteredFiles).length > MAX_CONTEXT_FILES
@@ -105,18 +116,6 @@ export async function handleDiscuss(
     order: progressCounter++,
     message: "Generating Response",
   } satisfies ProgressAnnotation);
-
-  const optionsBase: StreamingOptions = {
-    supabaseConnection: supabase,
-    toolChoice: "auto",
-    tools: mcpService.toolsWithoutExecute,
-    maxSteps: maxLLMSteps,
-    onStepFinish: ({ toolCalls }: any) => {
-      for (const toolCall of toolCalls || []) {
-        mcpService.processToolCall(toolCall, dataStreamAdapter as any);
-      }
-    },
-  };
 
   const workingMessages = [...processedMessages];
 
@@ -150,9 +149,58 @@ export async function handleDiscuss(
 
       let finishReason: string | undefined;
       let finalText: string | undefined;
+      let stepToolCalls: any[] = [];
+      let stepToolResultsCount = 0;
+
+      const guard = new StreamGuard({
+        activityTimeoutMs: STREAM_ACTIVITY_TIMEOUT_MS,
+        heartbeatIntervalMs: STREAM_HEARTBEAT_INTERVAL_MS,
+        onDegraded: () => logger.warn(`[${requestId}] Stream degraded — no activity for 15s`),
+        onStalled: () => logger.warn(`[${requestId}] Stream stalled — no activity for 30s`),
+        onDead: () => logger.error(`[${requestId}] Stream dead — max retries exhausted`),
+      });
+
+      guard.start();
 
       const options: StreamingOptions = {
-        ...optionsBase,
+        supabaseConnection: supabase,
+        toolChoice: "auto",
+        tools: mcpService.toolsWithoutExecute,
+        maxSteps: maxLLMSteps,
+        onStepFinish: ({ toolCalls, toolResults }: any) => {
+          stepToolCalls = toolCalls || [];
+          stepToolResultsCount = (toolResults || []).length;
+
+          for (const toolCall of stepToolCalls) {
+            mcpService.processToolCall(toolCall, dataStreamAdapter as any);
+          }
+
+          const signal = recovery.analyzeStep(stepToolCalls, stepToolResultsCount, finalText?.length);
+
+          if (signal) {
+            logger.warn(`[${requestId}] Recovery signal: ${signal.reason} (${signal.escalation}) — ${signal.message}`);
+
+            writeDataPart(res, {
+              type: "progress",
+              label: "recovery",
+              status: "in-progress",
+              order: progressCounter++,
+              message: signal.message,
+            } satisfies ProgressAnnotation);
+
+            if (signal.escalation === "finalize") {
+              logger.warn(`[${requestId}] Escalation=finalize, forcing done`);
+              finishReason = "stop";
+              done = true;
+            } else if (signal.injectedPrompt && signal.escalation === "redirect") {
+              workingMessages.push({
+                id: generateId(),
+                role: "user",
+                content: signal.injectedPrompt,
+              } as any);
+            }
+          }
+        },
         onFinish: async ({ text, finishReason: fr, usage }: any) => {
           finishReason = fr;
           finalText = text;
@@ -165,36 +213,74 @@ export async function handleDiscuss(
         },
       };
 
-      logger.info(`[${requestId}] Calling streamText() batch=${batchNum}/${totalBatches} segment=${switches + 1}`);
+      logger.info(`[${requestId}] streamText() batch=${batchNum}/${totalBatches} segment=${switches + 1}`);
 
-      const result = await streamText({
-        messages: [...workingMessages],
-        env: undefined as any,
-        options,
-        apiKeys,
-        files: files as FileMap,
-        providerSettings,
-        promptId,
-        contextOptimization,
-        contextFiles: batchFiles,
-        chatMode,
-        designScheme,
-        summary,
-        messageSliceId,
-      });
+      try {
+        const result = await streamText({
+          messages: [...workingMessages],
+          env: undefined as any,
+          options,
+          apiKeys,
+          files: files as FileMap,
+          providerSettings,
+          promptId,
+          contextOptimization,
+          contextFiles: batchFiles,
+          chatMode,
+          designScheme,
+          summary,
+          messageSliceId,
+        });
 
-      const response = result.toDataStreamResponse();
+        const response = result.toDataStreamResponse();
 
-      if (!response.body) {
-        throw new Error("toDataStreamResponse() returned empty body");
+        if (!response.body) {
+          throw new Error("toDataStreamResponse() returned empty body");
+        }
+
+        await pipeWebStreamToExpress({ requestId, res, webStream: response.body as any, guard });
+
+        guard.stop();
+
+        const m = guard.metrics();
+        logger.info(`[${requestId}] Segment done: ${safeJson(m)}`);
+      } catch (err: any) {
+        guard.stop();
+
+        const isTimeout = err?.name === "AbortError" || err?.message?.includes("timeout") || err?.message?.includes("timed out");
+
+        if (isTimeout && guard.canRetry) {
+          const signal = recovery.registerTimeout();
+          const backoff = guard.consumeRetry();
+
+          logger.warn(`[${requestId}] Stream timeout, retry in ${backoff}ms (${signal.escalation})`);
+
+          writeDataPart(res, {
+            type: "progress",
+            label: "recovery",
+            status: "in-progress",
+            order: progressCounter++,
+            message: `Stream timed out, retrying... (attempt ${guard.metrics().retries})`,
+          } satisfies ProgressAnnotation);
+
+          await new Promise((r) => setTimeout(r, backoff));
+
+          if (signal.injectedPrompt && signal.escalation !== "nudge") {
+            workingMessages.push({
+              id: generateId(),
+              role: "user",
+              content: signal.injectedPrompt,
+            } as any);
+          }
+
+          continue;
+        }
+
+        logger.error(`[${requestId}] Unrecoverable stream error: ${err?.message}`, err);
+        throw err;
       }
 
-      logger.info(`[${requestId}] About to pipe web stream to express`);
-      await pipeWebStreamToExpress({
-        requestId,
-        res,
-        webStream: response.body as any,
-      });
+      if (done) break;
 
       if (finishReason !== "length") {
         writeMessageAnnotationPart(res, {
@@ -226,7 +312,7 @@ export async function handleDiscuss(
 
       const switchesLeft = MAX_RESPONSE_SEGMENTS - switches;
       logger.info(
-        `[${requestId}] Reached max token limit (${MAX_TOKENS}). Continuing... (${switchesLeft} switches left)`,
+        `[${requestId}] Max tokens reached (${MAX_TOKENS}). Continuing... (${switchesLeft} switches left)`,
       );
 
       const lastUserMessage = workingMessages.filter((x: any) => x.role === "user").slice(-1)[0];
@@ -254,5 +340,5 @@ export async function handleDiscuss(
   ctx.progressCounter = progressCounter;
 
   res.end();
-  logger.info(`[${requestId}] Streaming ended elapsedMs=${Date.now() - startedAt}`);
+  logger.info(`[${requestId}] Discuss streaming ended elapsedMs=${Date.now() - startedAt}`);
 }

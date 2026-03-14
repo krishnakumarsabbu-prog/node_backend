@@ -213,6 +213,9 @@ async function pipeStreamToResponse(
   });
 }
 
+const MAX_STEP_RETRIES = 2;
+const STEP_RETRY_BASE_DELAY_MS = 1_000;
+
 async function streamStep(opts: {
   requestId: string;
   res: Response;
@@ -230,53 +233,82 @@ async function streamStep(opts: {
 }): Promise<{ stepText: string; succeeded: boolean }> {
   const { requestId, res, stepMessages, filesToUse, allFiles, stepIndex, cumulativeUsage } = opts;
 
-  const result = await streamText({
-    messages: stepMessages,
-    env: undefined as any,
-    options: opts.streamingOptions,
-    apiKeys: opts.apiKeys,
-    files: allFiles,
-    providerSettings: opts.providerSettings,
-    promptId: "plan",
-    chatMode: opts.chatMode,
-    designScheme: opts.designScheme,
-    summary: opts.summary,
-    contextOptimization: true,
-    contextFiles: filesToUse,
-    messageSliceId: undefined,
-  });
+  for (let attempt = 0; attempt <= MAX_STEP_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const delay = STEP_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+      logger.info(`[${requestId}] Step ${stepIndex} retry ${attempt}/${MAX_STEP_RETRIES}, backoff=${delay}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
 
-  const response = result.toDataStreamResponse();
+    try {
+      const result = await streamText({
+        messages: stepMessages,
+        env: undefined as any,
+        options: opts.streamingOptions,
+        apiKeys: opts.apiKeys,
+        files: allFiles,
+        providerSettings: opts.providerSettings,
+        promptId: "plan",
+        chatMode: opts.chatMode,
+        designScheme: opts.designScheme,
+        summary: opts.summary,
+        contextOptimization: true,
+        contextFiles: filesToUse,
+        messageSliceId: undefined,
+      });
 
-  const [stepText] = await Promise.all([
-    result.text,
-    response.body
-      ? pipeStreamToResponse(requestId, res, response.body, stepIndex)
-      : Promise.resolve(),
-  ]);
+      const response = result.toDataStreamResponse();
 
-  const usage = await result.usage;
-  if (usage) {
-    cumulativeUsage.completionTokens += usage.completionTokens || 0;
-    cumulativeUsage.promptTokens += usage.promptTokens || 0;
-    cumulativeUsage.totalTokens += usage.totalTokens || 0;
+      const [stepText] = await Promise.all([
+        result.text,
+        response.body
+          ? pipeStreamToResponse(requestId, res, response.body, stepIndex)
+          : Promise.resolve(),
+      ]);
+
+      const usage = await result.usage;
+      if (usage) {
+        cumulativeUsage.completionTokens += usage.completionTokens || 0;
+        cumulativeUsage.promptTokens += usage.promptTokens || 0;
+        cumulativeUsage.totalTokens += usage.totalTokens || 0;
+      }
+
+      logger.info(
+        `[${requestId}] Step ${stepIndex} finished: tokens=${usage?.totalTokens || 0}${attempt > 0 ? ` (attempt ${attempt + 1})` : ""}`,
+      );
+
+      if (!res.writableEnded && !res.destroyed) {
+        res.write(
+          `e:${JSON.stringify({
+            finishReason: "stop",
+            usage: {
+              promptTokens: usage?.promptTokens ?? 0,
+              completionTokens: usage?.completionTokens ?? 0,
+            },
+          })}\n`,
+        );
+      }
+
+      return { stepText: stepText || "", succeeded: true };
+    } catch (err: any) {
+      const isRetryable =
+        err?.name === "AbortError" ||
+        err?.message?.includes("timed out") ||
+        err?.message?.includes("timeout") ||
+        err?.message?.includes("ECONNRESET") ||
+        err?.message?.includes("socket hang up");
+
+      if (!isRetryable || attempt >= MAX_STEP_RETRIES) {
+        logger.error(`[${requestId}] Step ${stepIndex} failed (attempt ${attempt + 1}): ${err?.message}`);
+        if (!isRetryable) throw err;
+        break;
+      }
+
+      logger.warn(`[${requestId}] Step ${stepIndex} attempt ${attempt + 1} failed (retryable): ${err?.message}`);
+    }
   }
 
-  logger.info(`[${requestId}] Step ${stepIndex} finished: tokens=${usage?.totalTokens || 0}`);
-
-  if (!res.writableEnded && !res.destroyed) {
-    res.write(
-      `e:${JSON.stringify({
-        finishReason: "stop",
-        usage: {
-          promptTokens: usage?.promptTokens ?? 0,
-          completionTokens: usage?.completionTokens ?? 0,
-        },
-      })}\n`,
-    );
-  }
-
-  return { stepText: stepText || "", succeeded: true };
+  return { stepText: "", succeeded: false };
 }
 
 function buildTopicStepMessages(
