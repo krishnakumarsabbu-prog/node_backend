@@ -458,6 +458,19 @@ function buildFileStepMessages(
   return stepMessages;
 }
 
+function extractGeneratedFiles(stepText: string, currentFiles: FileMap): FileMap {
+  const updated: FileMap = {};
+  const fileBlockRe = /<cortexAction[^>]*type="file"[^>]*filePath="([^"]+)"[^>]*>([\s\S]*?)<\/cortexAction>/g;
+  let match: RegExpExecArray | null;
+  while ((match = fileBlockRe.exec(stepText)) !== null) {
+    const rawPath = match[1];
+    const content = match[2];
+    const fullPath = rawPath.startsWith('/') ? rawPath : `/home/project/${rawPath}`;
+    updated[fullPath] = { type: 'file', content, isBinary: false } as any;
+  }
+  return updated;
+}
+
 export interface StreamPlanOptions {
   res: Response;
   requestId: string;
@@ -630,6 +643,8 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
   let succeededSteps = 0;
   let failedSteps = 0;
 
+  const accumulatedFiles: FileMap = { ...files };
+
   for (const step of steps) {
     if (!writer.isAlive()) {
       logger.warn(`[${requestId}] Client disconnected before step ${step.index}, aborting`);
@@ -648,13 +663,13 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
     const stepMessages =
       executionMode === "files"
-        ? buildFileStepMessages(messages, steps, step, userQuestion!, files)
+        ? buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles)
         : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null);
 
-    let filesToUse: FileMap = files;
+    let filesToUse: FileMap = accumulatedFiles;
 
     if (executionMode === "files") {
-      const specificFile = files[step.heading];
+      const specificFile = accumulatedFiles[step.heading];
       if (specificFile) {
         filesToUse = { [step.heading]: specificFile };
       } else {
@@ -668,8 +683,8 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
           const stepFiles: FileMap = {};
           for (const relPath of relevantPaths) {
             const fullPath = `/home/project/${relPath}`;
-            if (Object.prototype.hasOwnProperty.call(files, fullPath)) {
-              stepFiles[fullPath] = files[fullPath];
+            if (Object.prototype.hasOwnProperty.call(accumulatedFiles, fullPath)) {
+              stepFiles[fullPath] = accumulatedFiles[fullPath];
             }
           }
           if (Object.keys(stepFiles).length > 0) {
@@ -682,16 +697,16 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     }
 
     logger.info(
-      `[${requestId}] Step ${step.index} context: ${Object.keys(filesToUse).length} focused files, ${Object.keys(files).length} total files available`,
+      `[${requestId}] Step ${step.index} context: ${Object.keys(filesToUse).length} focused files, ${Object.keys(accumulatedFiles).length} total files available`,
     );
 
     try {
-      await streamStep({
+      const { stepText } = await streamStep({
         requestId,
         res,
         stepMessages,
         filesToUse,
-        allFiles: files,
+        allFiles: accumulatedFiles,
         streamingOptions,
         apiKeys,
         providerSettings,
@@ -701,6 +716,13 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         stepIndex: step.index,
         cumulativeUsage,
       });
+
+      const generatedFiles = extractGeneratedFiles(stepText, accumulatedFiles);
+      const generatedCount = Object.keys(generatedFiles).length;
+      if (generatedCount > 0) {
+        Object.assign(accumulatedFiles, generatedFiles);
+        logger.info(`[${requestId}] Step ${step.index} produced ${generatedCount} file(s), accumulated state updated`);
+      }
 
       if (!writer.isAlive()) {
         logger.warn(`[${requestId}] Client disconnected during step ${step.index}, aborting`);

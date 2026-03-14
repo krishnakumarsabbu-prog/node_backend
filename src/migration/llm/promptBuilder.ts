@@ -24,11 +24,49 @@ ${fileList}
 Return a structured analysis.`;
   }
 
+  private static sampleFileList(fileList: string[], maxFiles: number): { sample: string[]; truncated: boolean; totalCount: number } {
+    if (fileList.length <= maxFiles) {
+      return { sample: fileList, truncated: false, totalCount: fileList.length };
+    }
+
+    const configPatterns = /\.(xml|gradle|json|yaml|yml|toml|properties|env)$|^(pom\.xml|build\.gradle|package\.json|settings\.gradle|Cargo\.toml|requirements\.txt|Gemfile|composer\.json)$/i;
+    const entryPatterns = /\/(main|app|index|application|server|bootstrap)\./i;
+    const testPatterns = /\.(test|spec)\.|\/test\/|\/tests\//i;
+
+    const priority: string[] = [];
+    const normal: string[] = [];
+    const tests: string[] = [];
+
+    for (const f of fileList) {
+      const name = f.split('/').pop() || f;
+      if (configPatterns.test(name) || configPatterns.test(f)) priority.push(f);
+      else if (entryPatterns.test(f)) priority.push(f);
+      else if (testPatterns.test(f)) tests.push(f);
+      else normal.push(f);
+    }
+
+    const reserved = Math.min(priority.length, Math.floor(maxFiles * 0.3));
+    const remaining = maxFiles - reserved;
+    const sample = [
+      ...priority.slice(0, reserved),
+      ...normal.slice(0, remaining),
+    ].slice(0, maxFiles);
+
+    return { sample, truncated: true, totalCount: fileList.length };
+  }
+
   static buildPlanningPrompt(
     analysis: ProjectAnalysis,
     userRequest: string,
     fileList: string[]
   ): string {
+    const MAX_FILES_IN_PROMPT = 200;
+    const { sample, truncated, totalCount } = PromptBuilder.sampleFileList(fileList, MAX_FILES_IN_PROMPT);
+
+    const fileSection = truncated
+      ? `${sample.join("\n")}\n\n[Note: Showing ${sample.length} representative files out of ${totalCount} total. Config files, entry points, and source files are prioritized. Apply migration patterns consistently to all similar files not listed.]`
+      : sample.join("\n");
+
     return `You are a senior software architect generating a migration plan.
 
 PROJECT ANALYSIS:
@@ -37,13 +75,13 @@ Build Tool: ${analysis.buildTool}
 Controllers: ${analysis.controllers.length}
 Services: ${analysis.services.length}
 Config Files: ${analysis.configFiles.length}
+Total Files: ${totalCount}
 
 USER REQUEST:
 ${userRequest}
 
 AVAILABLE FILES:
-${fileList.slice(0, 50).join("\n")}
-${fileList.length > 50 ? `... and ${fileList.length - 50} more files` : ""}
+${fileSection}
 
 CRITICAL RULES:
 1. DO NOT include full file code

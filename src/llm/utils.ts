@@ -56,15 +56,25 @@ export function simplifyCortexActions(input: string): string {
   });
 }
 
+function isSafeFilePath(filePath: string): boolean {
+  if (filePath.includes('..')) return false;
+  const dangerousPrefixes = ['/etc/', '/root/', '/proc/', '/sys/', '/dev/', '/boot/'];
+  for (const prefix of dangerousPrefixes) {
+    if (filePath.startsWith(prefix)) return false;
+  }
+  return true;
+}
+
 export function createFilesContext(files: FileMap, useRelativePath?: boolean) {
   let filePaths = Object.keys(files);
   filePaths = filePaths.filter((x) => {
+    if (!isSafeFilePath(x)) return false;
     const relPath = x.replace(`${WORK_DIR}/`, '');
     return !_ig.ignores(relPath);
   });
 
   const fileContexts = filePaths
-    .filter((x) => files[x] && files[x].type === 'file')
+    .filter((x) => files[x] && files[x].type === 'file' && !(files[x] as any).isBinary)
     .map((path) => {
       const dirent = files[path];
 

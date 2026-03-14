@@ -55,12 +55,44 @@ export class MigrationRunner {
     logger.info("MigrationRunner initialized");
   }
 
+  private snapshotFiles(files: FileMap): Map<string, string | null> {
+    const snapshot = new Map<string, string | null>();
+    for (const [path, file] of Object.entries(files)) {
+      if (file && file.type === 'file') {
+        snapshot.set(path, (file as any).content ?? null);
+      }
+    }
+    return snapshot;
+  }
+
+  private restoreSnapshot(files: FileMap, snapshot: Map<string, string | null>): void {
+    for (const [path, content] of snapshot.entries()) {
+      if (content === null) {
+        delete files[path];
+      } else if (files[path]) {
+        (files[path] as any).content = content;
+      } else {
+        files[path] = { type: 'file', content, isBinary: false } as any;
+      }
+    }
+    logger.info(`Rollback complete: restored ${snapshot.size} file(s) to pre-migration state`);
+  }
+
   async executeMigration(context: MigrationContext): Promise<MigrationResult> {
     logger.info("Starting migration execution");
+
+    const preSnapshot = this.snapshotFiles(context.files);
 
     try {
       const analysis = await this.analyzerAgent.analyze(context.files);
       logger.info("Project analysis complete");
+
+      if (analysis.framework === "unknown") {
+        logger.warn("Unknown framework detected — migration quality may be reduced");
+      }
+      if (analysis.buildTool === "unknown") {
+        logger.warn("Unknown build tool detected — build verification will be skipped");
+      }
 
       const plan = await this.plannerAgent.generatePlan(
         context.files,
@@ -72,7 +104,19 @@ export class MigrationRunner {
       const result = await this.executor.execute(plan, context.files);
       logger.info("Migration execution complete");
 
+      if (analysis.framework === "unknown") {
+        result.frameworkWarning = "Framework could not be detected. Migration plan is based on generic patterns — review all generated files carefully.";
+      }
+      if (analysis.buildTool === "unknown") {
+        result.frameworkWarning = (result.frameworkWarning ? result.frameworkWarning + " " : "") + "Build tool not detected — build verification was skipped.";
+      }
+
       if (!this.config.enableVerification || !result.success) {
+        if (!result.success) {
+          logger.warn("Migration execution failed, rolling back changes");
+          this.restoreSnapshot(context.files, preSnapshot);
+          result.rolledBack = true;
+        }
         return result;
       }
 
@@ -90,7 +134,10 @@ export class MigrationRunner {
       logger.warn(`Build validation failed with ${validation.errors.length} errors`);
 
       if (!this.config.enableAutoRepair) {
+        logger.warn("Auto-repair disabled, rolling back migration");
+        this.restoreSnapshot(context.files, preSnapshot);
         result.success = false;
+        result.rolledBack = true;
         result.errors.push(...validation.errors.map((e) => e.message));
         return result;
       }
@@ -102,9 +149,17 @@ export class MigrationRunner {
         analysis.buildTool
       );
 
+      if (!repairedResult.success) {
+        logger.warn("All repair attempts exhausted, rolling back migration");
+        this.restoreSnapshot(context.files, preSnapshot);
+        repairedResult.rolledBack = true;
+      }
+
       return repairedResult;
     } catch (error) {
       logger.error(`Migration failed: ${(error as Error).message}`);
+      logger.warn("Rolling back migration due to error");
+      this.restoreSnapshot(context.files, preSnapshot);
       throw error;
     }
   }

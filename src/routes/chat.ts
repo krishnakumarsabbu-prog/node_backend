@@ -14,12 +14,31 @@ import { handleDiscuss } from "./chat-discuss";
 import { handleBuild } from "./chat-build";
 import { handleMigrate } from "./chat-migrate";
 
+const inFlightRequests = new Map<string, { startedAt: number; abort: () => void }>();
+
+function getDedupeKey(body: any): string | null {
+  if (!body?.messages?.length) return null;
+  const last = body.messages[body.messages.length - 1];
+  const content = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content);
+  return `${body.chatMode || 'discuss'}::${content?.slice(0, 200)}`;
+}
+
 export async function chatHandler(req: Request, res: Response) {
   const ctx = await buildChatContext(req, res);
   if (!ctx) return;
 
-  const { requestId, body } = ctx;
+  const { requestId, body, abortController } = ctx;
   const { messages, files, chatMode, implementPlan } = body;
+
+  const dedupeKey = getDedupeKey(body);
+  if (dedupeKey) {
+    const existing = inFlightRequests.get(dedupeKey);
+    if (existing && Date.now() - existing.startedAt < 3000) {
+      logger.warn(`[${requestId}] Duplicate request detected (key: ${dedupeKey.slice(0, 60)}...), aborting previous`);
+      existing.abort();
+    }
+    inFlightRequests.set(dedupeKey, { startedAt: Date.now(), abort: () => abortController.abort() });
+  }
 
   try {
     if (chatMode === "migrate") {
@@ -69,5 +88,9 @@ export async function chatHandler(req: Request, res: Response) {
       message: error?.message || "Internal server error",
       requestId,
     });
+  } finally {
+    if (dedupeKey && inFlightRequests.get(dedupeKey)?.startedAt === ctx.startedAt) {
+      inFlightRequests.delete(dedupeKey);
+    }
   }
 }

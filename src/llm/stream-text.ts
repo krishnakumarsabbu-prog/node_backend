@@ -104,6 +104,7 @@ export async function streamText(props: {
   providerSettings?: any;
   promptId?: string;
   env?: any;
+  clientAbortSignal?: AbortSignal;
 }) {
   const {
     messages,
@@ -115,6 +116,7 @@ export async function streamText(props: {
     chatMode,
     designScheme,
     promptId,
+    clientAbortSignal,
   } = props;
 
   let processedMessages = messages.map((message: any) => {
@@ -154,7 +156,19 @@ export async function streamText(props: {
   );
 
   if (shouldInjectContext) {
-    const codeContext = createFilesContext(contextFiles!, true);
+    const { totalChars, oversizedFiles } = estimateContextSize(contextFiles!);
+    let effectiveContextFiles = contextFiles!;
+
+    if (oversizedFiles.length > 0) {
+      logger.warn(`Large files detected in context: ${oversizedFiles.join(', ')}`);
+    }
+
+    if (totalChars > MAX_CONTEXT_CHARS) {
+      logger.warn(`Context too large (${Math.round(totalChars / 1000)}k chars > ${Math.round(MAX_CONTEXT_CHARS / 1000)}k limit), truncating`);
+      effectiveContextFiles = truncateContextFiles(contextFiles!, MAX_CONTEXT_CHARS);
+    }
+
+    const codeContext = createFilesContext(effectiveContextFiles, true);
 
     systemPrompt = `${systemPrompt}
 
@@ -208,18 +222,59 @@ ${lockedFilesListString}
 
   logger.info(`Sending llm call to Tachyon (single provider + single model)`);
 
+  const timeoutSignal = createStreamTimeout(LLM_STREAM_TIMEOUT_MS);
+  const abortSignal = clientAbortSignal
+    ? AbortSignal.any([timeoutSignal, clientAbortSignal])
+    : timeoutSignal;
+
   const streamParams = {
     model: getTachyonModel(),
     system: (chatMode === "build" || promptId === "plan") ? systemPrompt : discussPrompt(),
     messages: convertToCoreMessages(processedMessages as any),
     ...(options || {}),
-    abortSignal: createStreamTimeout(LLM_STREAM_TIMEOUT_MS),
+    abortSignal,
   } as Parameters<typeof _streamText>[0];
 
   return await _streamText(streamParams);
 }
 
 const LLM_STREAM_TIMEOUT_MS = 60_000;
+const MAX_CONTEXT_CHARS = 400_000;
+const MAX_SINGLE_FILE_CHARS = 100_000;
+
+function estimateContextSize(contextFiles: FileMap): { totalChars: number; oversizedFiles: string[] } {
+  let totalChars = 0;
+  const oversizedFiles: string[] = [];
+  for (const [path, file] of Object.entries(contextFiles)) {
+    if (file && file.type === 'file' && !(file as any).isBinary && typeof (file as any).content === 'string') {
+      const chars = (file as any).content.length;
+      if (chars > MAX_SINGLE_FILE_CHARS) {
+        oversizedFiles.push(`${path} (${Math.round(chars / 1000)}k chars)`);
+      }
+      totalChars += chars;
+    }
+  }
+  return { totalChars, oversizedFiles };
+}
+
+function truncateContextFiles(contextFiles: FileMap, budget: number): FileMap {
+  const result: FileMap = {};
+  let remaining = budget;
+  for (const [path, file] of Object.entries(contextFiles)) {
+    if (!file || file.type !== 'file' || (file as any).isBinary) continue;
+    const content: string = (file as any).content || '';
+    if (content.length <= remaining) {
+      result[path] = file;
+      remaining -= content.length;
+    } else if (remaining > 2000) {
+      const truncated = content.slice(0, remaining - 500) + '\n\n[... file truncated: too large for context window ...]';
+      result[path] = { ...file, content: truncated } as any;
+      remaining = 0;
+    }
+    if (remaining <= 0) break;
+  }
+  return result;
+}
 
 function createStreamTimeout(ms: number): AbortSignal {
   const controller = new AbortController();

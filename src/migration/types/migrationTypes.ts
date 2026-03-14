@@ -99,6 +99,8 @@ export interface MigrationResult {
   operations: FileOperation[];
   success: boolean;
   errors: string[];
+  rolledBack?: boolean;
+  frameworkWarning?: string;
 }
 
 export interface BuildValidationResult {

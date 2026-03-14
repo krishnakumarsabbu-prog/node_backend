@@ -191,6 +191,7 @@ export interface ChatContext {
   startedAt: number;
   body: ChatRequestBody;
   shouldAbort: () => boolean;
+  abortController: AbortController;
   cumulativeUsage: { completionTokens: number; promptTokens: number; totalTokens: number };
   progressCounter: number;
   dataStreamAdapter: {
@@ -233,6 +234,19 @@ export async function buildChatContext(req: Request, res: Response): Promise<Cha
     return null;
   }
 
+  const lastUserMessage = (body.messages as any[]).filter((m) => m?.role === 'user').slice(-1)[0];
+  const lastContent = typeof lastUserMessage?.content === 'string'
+    ? lastUserMessage.content
+    : Array.isArray(lastUserMessage?.content)
+      ? lastUserMessage.content.map((p: any) => p?.text || '').join('')
+      : '';
+
+  if (!lastContent.trim()) {
+    logger.warn(`[${requestId}] Empty user message rejected`);
+    res.status(400).json({ error: true, message: "Message content cannot be empty", requestId });
+    return null;
+  }
+
   logger.info(
     `[${requestId}] Body summary: ${safeJson(
       redact({
@@ -255,10 +269,13 @@ export async function buildChatContext(req: Request, res: Response): Promise<Cha
   let clientDisconnected = false;
   let responseFinished = false;
 
+  const abortController = new AbortController();
+
   res.on("close", () => {
     clientDisconnected = true;
     if (!responseFinished) {
       logger.warn(`[${requestId}] client disconnected before response finished`);
+      abortController.abort();
     } else {
       logger.info(`[${requestId}] client connection closed (normal)`);
     }
@@ -289,6 +306,7 @@ export async function buildChatContext(req: Request, res: Response): Promise<Cha
     startedAt,
     body,
     shouldAbort,
+    abortController,
     cumulativeUsage,
     progressCounter: 1,
     dataStreamAdapter,

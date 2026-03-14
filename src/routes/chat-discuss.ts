@@ -90,22 +90,31 @@ export async function handleDiscuss(
   const mcpService = MCPService.getInstance();
   const recovery = new AgentRecoveryController({ repeatToolThreshold: 3, noProgressThreshold: 3, timeoutThreshold: 2 });
 
+  const OPTIMAL_BATCH_SIZE = 10;
+  const MAX_RECOMMENDED_FILES = 50;
+
   const contextBatches: FileMap[] =
     filteredFiles && Object.keys(filteredFiles).length > MAX_CONTEXT_FILES
-      ? chunkFileMap(filteredFiles, MAX_CONTEXT_FILES)
+      ? chunkFileMap(filteredFiles, OPTIMAL_BATCH_SIZE)
       : filteredFiles
         ? [filteredFiles]
         : [undefined as any];
 
   const totalBatches = contextBatches.filter(Boolean).length || 1;
+  const filteredFileCount = filteredFiles ? Object.keys(filteredFiles).length : 0;
 
-  if (filteredFiles && Object.keys(filteredFiles).length > MAX_CONTEXT_FILES) {
+  if (filteredFiles && filteredFileCount > MAX_CONTEXT_FILES) {
+    const estimatedMinutes = Math.ceil((totalBatches * 10) / 60);
+    const tooLargeWarning = filteredFileCount > MAX_RECOMMENDED_FILES
+      ? ` This may take ~${estimatedMinutes} minute${estimatedMinutes !== 1 ? 's' : ''}. Consider narrowing your request to specific files or modules for faster results.`
+      : '';
+
     writeDataPart(res, {
       type: "progress",
       label: "context",
       status: "in-progress",
       order: progressCounter++,
-      message: `Too many files selected (${Object.keys(filteredFiles).length}). Processing in ${totalBatches} batches of ${MAX_CONTEXT_FILES}.`,
+      message: `Processing ${filteredFileCount} files in ${totalBatches} batches of ${OPTIMAL_BATCH_SIZE}.${tooLargeWarning}`,
     } satisfies ProgressAnnotation);
   }
 
@@ -120,6 +129,11 @@ export async function handleDiscuss(
   const workingMessages = [...processedMessages];
 
   for (let batchIndex = 0; batchIndex < contextBatches.length; batchIndex++) {
+    if (shouldAbort()) {
+      logger.info(`[${requestId}] Client disconnected, aborting batch loop at batch ${batchIndex + 1}/${contextBatches.length}`);
+      break;
+    }
+
     const batchFiles = contextBatches[batchIndex];
     const batchNum = batchIndex + 1;
 
