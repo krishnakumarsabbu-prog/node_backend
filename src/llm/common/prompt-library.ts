@@ -2,6 +2,7 @@ import { getSystemPrompt } from './prompts/prompts';
 import optimized from './prompts/optimized';
 import { getFineTunedPrompt } from './prompts/new-prompt';
 import { DesignScheme } from '../../types/design-scheme';
+import { getPlanPrompt } from './prompts/plan-prompt';
 
 export interface PromptOptions {
   cwd: string;
@@ -41,6 +42,11 @@ export class PromptLibrary {
       label: 'Optimized Prompt (experimental)',
       description: 'An Experimental version of the prompt for lower token usage',
       get: (options) => optimized(options),
+    },
+    plan: {
+      label: 'Plan Implementation Prompt',
+      description: 'Plan for plan mode - generates. only code files, no shell commands',
+      get: (options) => getPlanPrompt(options.cwd, options.supabase, options.designScheme),
     },
   };
   static getList() {
