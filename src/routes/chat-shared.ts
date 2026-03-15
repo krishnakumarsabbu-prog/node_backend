@@ -31,7 +31,7 @@ export type ChatRequestBody = {
   migrationPlan?: any;
 };
 
-export const MAX_CONTEXT_FILES = 5;
+export const MAX_CONTEXT_FILES = 100;
 
 export function setSSEHeaders(res: Response) {
   res.status(200);

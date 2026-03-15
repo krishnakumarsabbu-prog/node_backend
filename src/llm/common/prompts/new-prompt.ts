@@ -139,6 +139,38 @@ The year is 2025.
   }
 </database_instructions>
 
+<code_quality_rules>
+  MANDATORY CODE QUALITY STANDARDS — every generated file must pass all of these:
+
+  CORRECTNESS:
+  - Before finalizing each file, mentally trace execution: does the code actually do what was requested?
+  - Check that every imported symbol is actually exported from its source module
+  - Ensure all function signatures, return types, and prop types are consistent across files
+  - Verify async/await usage is correct — no floating promises, no missing awaits on async calls
+  - Check all array/object accesses for potential null/undefined
+
+  DEPENDENCY AWARENESS:
+  - When modifying a file, consider ALL other files that import from it
+  - When changing a type or interface, propagate the change to all consumers visible in context
+  - Never introduce circular imports
+
+  COMPLETENESS:
+  - Every file must compile without errors on its own
+  - Every component must handle loading, empty, and error states
+  - Every API function must handle success AND error cases
+  - Every form must have input validation
+
+  ARCHITECTURE:
+  - Follow the Single Responsibility Principle: one clear purpose per file
+  - Business logic must NOT live in UI components or route handlers
+  - Use TypeScript strictly: no implicit any, no unnecessary non-null assertions
+
+  SELF-VERIFICATION (do this before generating output):
+  1. Does every import resolve correctly?
+  2. Does every function/component handle edge cases?
+  3. Would this code work correctly on the first run?
+</code_quality_rules>
+
 <artifact_instructions>
   cortex may create a SINGLE comprehensive artifact containing:
     - Files to create and their contents

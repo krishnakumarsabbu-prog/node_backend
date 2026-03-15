@@ -10,7 +10,8 @@ import { searchWithGraph, getIndex, buildIndex } from "../modules/ai_engine/agen
 
 const logger = createScopedLogger("search-context");
 
-const MAX_HYBRID_FILES = 5;
+const MAX_HYBRID_FILES = 100;
+const GRAPH_EXPANSION_DEPTH = 2;
 const INDEX_TEMP_DIR = "/tmp/cortex-index-source";
 
 interface SearchContextProps {
@@ -68,6 +69,28 @@ async function materializeFileMapToDisk(files: FileMap): Promise<void> {
   return materializePromise;
 }
 
+function buildQueryVariants(userQuestion: string): string[] {
+  const base = userQuestion.trim();
+  const variants: string[] = [base];
+
+  const tokens = base.split(/\W+/).filter((t) => t.length > 3);
+  if (tokens.length > 3) {
+    variants.push(tokens.slice(0, Math.ceil(tokens.length / 2)).join(" "));
+    variants.push(tokens.slice(Math.floor(tokens.length / 2)).join(" "));
+  }
+
+  const actionWords = ["implement", "create", "update", "fix", "refactor", "add", "remove", "modify", "build"];
+  const withoutActions = base
+    .split(" ")
+    .filter((w) => !actionWords.includes(w.toLowerCase()))
+    .join(" ");
+  if (withoutActions !== base && withoutActions.trim().length > 5) {
+    variants.push(withoutActions);
+  }
+
+  return [...new Set(variants)];
+}
+
 export async function searchContext(props: SearchContextProps): Promise<FileMap> {
   const { messages, files, summary, onFinish } = props;
 
@@ -111,12 +134,27 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
       buildIndex(INDEX_TEMP_DIR);
     }
 
-    const relevantPaths: string[] = searchWithGraph(userQuestion, MAX_HYBRID_FILES, 1);
+    const queryVariants = buildQueryVariants(userQuestion);
+    const seenPaths = new Set<string>(currentFiles);
+    const relevantPaths: string[] = [];
+
+    for (const variant of queryVariants) {
+      const batchSize = Math.ceil(MAX_HYBRID_FILES / queryVariants.length);
+      const found = searchWithGraph(variant, batchSize, GRAPH_EXPANSION_DEPTH);
+      for (const p of found) {
+        if (!seenPaths.has(p)) {
+          seenPaths.add(p);
+          relevantPaths.push(p);
+        }
+        if (relevantPaths.length >= MAX_HYBRID_FILES) break;
+      }
+      if (relevantPaths.length >= MAX_HYBRID_FILES) break;
+    }
+
+    logger.info(`searchContext (hybrid multi-pass): found ${relevantPaths.length} unique relevant paths across ${queryVariants.length} query variants`);
 
     const newFiles: FileMap = {};
     for (const relPath of relevantPaths) {
-      if (currentFiles.includes(relPath)) continue;
-
       const fullPath = `${WORK_DIR}/${relPath}`;
       const entry = (files as any)[fullPath] || (files as any)[relPath];
       if (entry) {
@@ -125,7 +163,6 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
     }
 
     const totalFiles = Object.keys(newFiles).length;
-    logger.info(`searchContext (hybrid): found ${totalFiles} new relevant files`);
 
     if (totalFiles > 0) {
       return { ...contextFiles, ...newFiles };

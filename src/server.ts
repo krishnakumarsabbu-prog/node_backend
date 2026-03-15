@@ -6,8 +6,8 @@ import { enhancerHandler } from './routes/enhancer';
 import { llmCallHandler } from './routes/llmcall';
 import { templateHandler } from './routes/template';
 import { createScopedLogger } from './utils/logger';
-import { MCPService } from './llm/mcpService';
 import { chatRateLimit, llmCallRateLimit, enhancerRateLimit } from './utils/rateLimiter';
+import { createConcurrencyQueue } from './utils/concurrencyQueue';
 
 const logger = createScopedLogger('server');
 
@@ -24,14 +24,64 @@ app.use((_req, res, next) => {
   next();
 });
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
+const chatQueue = createConcurrencyQueue({
+  maxConcurrent: 8,
+  maxQueueSize: 32,
+  queueTimeoutMs: 30_000,
 });
 
-app.post('/api/chat', chatRateLimit, chatHandler);
+const serverStartTime = Date.now();
+
+app.get('/health', (_req, res) => {
+  const mem = process.memoryUsage();
+  const uptimeSeconds = Math.floor((Date.now() - serverStartTime) / 1000);
+  const queueStats = chatQueue.getStats();
+
+  res.json({
+    status: 'ok',
+    uptime: uptimeSeconds,
+    memory: {
+      heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+      heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
+      rssM: Math.round(mem.rss / 1024 / 1024),
+    },
+    concurrency: queueStats,
+    version: process.env.npm_package_version || '1.0.0',
+    nodeVersion: process.version,
+  });
+});
+
+app.get('/health/live', (_req, res) => {
+  res.status(200).json({ alive: true });
+});
+
+app.get('/health/ready', (_req, res) => {
+  const mem = process.memoryUsage();
+  const heapUsedMb = mem.heapUsed / 1024 / 1024;
+
+  if (heapUsedMb > 1800) {
+    res.status(503).json({ ready: false, reason: 'memory pressure', heapUsedMb: Math.round(heapUsedMb) });
+    return;
+  }
+
+  res.status(200).json({ ready: true });
+});
+
+app.post('/api/chat', chatRateLimit, chatQueue.middleware, chatHandler);
 app.post('/api/enhancer', enhancerRateLimit, enhancerHandler);
 app.post('/api/llmcall', llmCallRateLimit, llmCallHandler);
 app.post('/api/template', templateHandler);
+
+app.use((_req, res) => {
+  res.status(404).json({ error: true, message: 'Not found' });
+});
+
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  logger.error('Unhandled error:', err);
+  if (!res.headersSent) {
+    res.status(500).json({ error: true, message: 'Internal server error' });
+  }
+});
 
 const PORT = Number(process.env.PORT) || 8999;
 
@@ -55,10 +105,19 @@ function gracefulShutdown(signal: string) {
   });
 
   setTimeout(() => {
-    logger.warn('Graceful shutdown timed out after 15s, forcing exit');
+    logger.warn('Graceful shutdown timed out after 30s, forcing exit');
     process.exit(1);
-  }, 15_000).unref();
+  }, 30_000).unref();
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception:', err);
+  gracefulShutdown('uncaughtException');
+});
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled rejection:', reason);
+});

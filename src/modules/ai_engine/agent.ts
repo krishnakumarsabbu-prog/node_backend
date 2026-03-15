@@ -1,7 +1,7 @@
 import fs from 'fs'
 import { RepositoryIndex, SearchResult } from './types/index.js'
 import { indexRepository } from './indexer/indexer.js'
-import { searchFiles } from './retrieval/searcher.js'
+import { searchFiles, reRankResults } from './retrieval/searcher.js'
 import { expandGraphFromSeeds } from './graph/graphBuilder.js'
 import { createScopedLogger } from '../../utils/logger'
 
@@ -108,14 +108,15 @@ export function searchWithGraph(query: string, topK: number = 5, graphDepth: num
   }
 
   const searchResults = searchFiles(query, currentIndex.files)
-  const seeds = searchResults.slice(0, topK).map(r => r.file.path)
+  const reRanked = reRankResults(searchResults, query)
+  const seeds = reRanked.slice(0, topK).map(r => r.file.path)
 
   if (seeds.length === 0) {
     return []
   }
 
   const expandedFiles = expandGraphFromSeeds(seeds, currentIndex.graph, graphDepth)
-  logger.debug(`Graph expansion: ${seeds.length} seeds -> ${expandedFiles.length} files`)
+  logger.debug(`Graph expansion: ${seeds.length} seeds -> ${expandedFiles.length} files (depth=${graphDepth})`)
 
   return expandedFiles
 }

@@ -507,6 +507,12 @@ export interface StreamPlanOptions {
  */
 const FILE_PER_STEP_THRESHOLD = 1;
 
+/**
+ * For large refactors (100+ files), how many file steps to execute in parallel.
+ * Keeps per-step concurrency manageable while maximising throughput.
+ */
+const PARALLEL_STEP_CONCURRENCY = 4;
+
 export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void> {
   const {
     res,
@@ -650,14 +656,12 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
   let succeededSteps = 0;
   let failedSteps = 0;
+  let circuitBroken = false;
 
   const accumulatedFiles: FileMap = { ...files };
 
-  for (const step of steps) {
-    if (!writer.isAlive()) {
-      logger.warn(`[${requestId}] Client disconnected before step ${step.index}, aborting`);
-      return;
-    }
+  const executeStep = async (step: PlanStep): Promise<void> => {
+    if (!writer.isAlive() || circuitBroken) return;
 
     logger.info(`[${requestId}] Step ${step.index}/${steps.length}: "${step.heading}" [${executionMode}]`);
 
@@ -686,7 +690,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     } else {
       try {
         const query = `${step.heading} ${step.details}`;
-        const relevantPaths: string[] = searchWithGraph(query, 5, 1);
+        const relevantPaths: string[] = searchWithGraph(query, 20, 2);
         if (relevantPaths.length > 0) {
           const stepFiles: FileMap = {};
           for (const relPath of relevantPaths) {
@@ -736,7 +740,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
           order: progressCounter.value++,
           message: `Step ${step.index} failed after all retries. Continuing with remaining steps...`,
         } satisfies ProgressAnnotation);
-        continue;
+        return;
       }
 
       const generatedFiles = extractGeneratedFiles(stepText, accumulatedFiles);
@@ -785,11 +789,28 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
             order: progressCounter.value++,
             message: `Plan aborted: ${failedSteps} of ${totalAttempted} steps failed. This may indicate an issue with the model or request. Please try again.`,
           } satisfies ProgressAnnotation);
-          break;
+          circuitBroken = true;
         }
       }
+    }
+  };
 
-      continue;
+  const useParallel = executionMode === "files" && steps.length > 10;
+  const concurrency = useParallel ? PARALLEL_STEP_CONCURRENCY : 1;
+
+  if (concurrency > 1) {
+    logger.info(`[${requestId}] Large refactor detected (${steps.length} files) — running with concurrency=${concurrency}`);
+
+    for (let i = 0; i < steps.length; i += concurrency) {
+      if (!writer.isAlive() || circuitBroken) break;
+
+      const chunk = steps.slice(i, i + concurrency);
+      await Promise.all(chunk.map((step) => executeStep(step)));
+    }
+  } else {
+    for (const step of steps) {
+      if (!writer.isAlive() || circuitBroken) break;
+      await executeStep(step);
     }
   }
 

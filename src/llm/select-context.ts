@@ -13,6 +13,9 @@ import { getTachyonModel } from "../modules/llm/providers/tachyon";
 const ig = ignore().add(IGNORE_PATTERNS);
 const logger = createScopedLogger("select-context");
 
+const MAX_CONTEXT_FILES = 100;
+const BATCH_SIZE = 40;
+
 export async function selectContext(props: {
   messages: Message[];
   files: FileMap;
@@ -21,7 +24,6 @@ export async function selectContext(props: {
 }) {
   const { messages, files, summary, onFinish } = props;
 
-  // Clean up messages (remove cortex thoughts + simplify actions)
   const processedMessages = messages.map((message) => {
     if (message.role === "assistant") {
       let content = message.content as any;
@@ -40,10 +42,8 @@ export async function selectContext(props: {
 
   const { codeContext } = extractCurrentContext(processedMessages);
 
-  // All file paths (filtered by ignore)
   let filePaths = getFilePaths(files || {});
 
-  // Build "current context buffer" text from codeContext annotation
   let context = "";
   const currentFiles: string[] = [];
   const contextFiles: FileMap = {};
@@ -59,7 +59,6 @@ export async function selectContext(props: {
       }
 
       if (codeContextFiles.includes(relativePath)) {
-        // IMPORTANT: in original code, contextFiles uses relativePath as key
         contextFiles[relativePath] = (files as any)[path];
         currentFiles.push(relativePath);
       }
@@ -78,16 +77,32 @@ export async function selectContext(props: {
   const lastUserMessage = processedMessages.filter((x) => x.role === "user").pop();
   if (!lastUserMessage) throw new Error("No user message found");
 
-  // Ask Tachyon to choose context changes (include/exclude)
-  const resp = await generateText({
-    model: getTachyonModel(),
+  const userQuestion = extractTextContent(lastUserMessage);
 
-    system: `
+  const newPaths = filePaths.filter((p) => {
+    const rel = p.startsWith("/home/project/") ? p.replace("/home/project/", "") : p;
+    return !currentFiles.includes(rel);
+  });
+
+  const prioritized = prioritizePaths(newPaths, userQuestion);
+  const batches = chunkArray(prioritized, BATCH_SIZE);
+
+  const allIncluded: string[] = [];
+  const allExcluded: string[] = [];
+
+  for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
+    const batch = batches[batchIdx];
+    const remaining = MAX_CONTEXT_FILES - allIncluded.length;
+    if (remaining <= 0) break;
+
+    const resp = await generateText({
+      model: getTachyonModel(),
+      system: `
 You are a software engineer. You are working on a project. You have access to the following files:
 
 AVAILABLE FILES PATHS
 ---
-${filePaths.map((path) => `- ${path}`).join("\n")}
+${batch.map((path) => `- ${path}`).join("\n")}
 ---
 
 You have following code loaded in the context buffer that you can refer to:
@@ -116,66 +131,63 @@ RULES:
 * Do not include any file not in AVAILABLE FILES PATHS.
 * Do not include any file already in the context buffer.
 * If no changes are needed, return empty updateContextBuffer.
-    `,
+* You may include up to ${remaining} files in this batch.
+      `,
 
-    prompt: `
+      prompt: `
 ${summaryText}
 
-Users Question: ${extractTextContent(lastUserMessage)}
+Users Question: ${userQuestion}
 
 Update the context buffer with the files that are relevant to the task.
 
 CRITICAL RULES:
 * Only include relevant files.
-* Context buffer is expensive: include only absolutely necessary files.
-* Only 5 files can be placed in the context buffer at a time.
+* You may include up to ${remaining} files from this batch.
 * If buffer is full, exclude files that are not needed and include relevant ones.
 * If no changes are needed, return empty updateContextBuffer.
-    `,
-  });
+      `,
+    });
 
-  if (onFinish) onFinish(resp);
+    if (batchIdx === batches.length - 1 && onFinish) onFinish(resp);
 
-  const response = resp.text || "";
-  const updateContextBuffer = response.match(/<updateContextBuffer>([\s\S]*?)<\/updateContextBuffer>/);
+    const response = resp.text || "";
+    const updateContextBuffer = response.match(/<updateContextBuffer>([\s\S]*?)<\/updateContextBuffer>/);
 
-  if (!updateContextBuffer) {
-    logger.error("selectContext invalid response:", response);
-    throw new Error("Invalid response. Please follow the response format");
+    if (!updateContextBuffer) {
+      logger.warn(`selectContext batch ${batchIdx} invalid response, skipping`);
+      continue;
+    }
+
+    const includeFiles =
+      updateContextBuffer[1]
+        .match(/<includeFile path="(.*?)"/gm)
+        ?.map((x) => x.replace('<includeFile path="', "").replace('"', "")) || [];
+
+    const excludeFiles =
+      updateContextBuffer[1]
+        .match(/<excludeFile path="(.*?)"/gm)
+        ?.map((x) => x.replace('<excludeFile path="', "").replace('"', "")) || [];
+
+    allIncluded.push(...includeFiles);
+    allExcluded.push(...excludeFiles);
   }
 
-  const includeFiles =
-    updateContextBuffer[1]
-      .match(/<includeFile path="(.*?)"/gm)
-      ?.map((x) => x.replace('<includeFile path="', "").replace('"', "")) || [];
+  excludeFiles(allExcluded, contextFiles);
 
-  const excludeFiles =
-    updateContextBuffer[1]
-      .match(/<excludeFile path="(.*?)"/gm)
-      ?.map((x) => x.replace('<excludeFile path="', "").replace('"', "")) || [];
-
-  // Apply exclusions to current contextFiles
-  excludeFiles.forEach((path) => {
-    delete (contextFiles as any)[path];
-  });
-
-  // Now build filteredFiles from included files (relative paths)
   const filteredFiles: FileMap = {};
 
-  includeFiles.forEach((path) => {
-    // Normalize to full path for lookup in `files`
+  allIncluded.forEach((path) => {
     const fullPath = path.startsWith("/home/project/") ? path : `/home/project/${path}`;
 
-    if (!filePaths.includes(fullPath)) {
+    if (!filePaths.includes(fullPath) && !filePaths.includes(path)) {
       logger.error(`File ${path} is not in AVAILABLE FILES PATHS`);
       return;
     }
 
-    // If already in context, skip
     if (currentFiles.includes(path)) return;
 
-    // Store relative path as key (same as original)
-    filteredFiles[path] = (files as any)[fullPath];
+    filteredFiles[path] = (files as any)[fullPath] || (files as any)[path];
   });
 
   const totalFiles = Object.keys(filteredFiles).length;
@@ -186,6 +198,50 @@ CRITICAL RULES:
   }
 
   return filteredFiles;
+}
+
+function excludeFiles(paths: string[], contextFiles: FileMap) {
+  for (const path of paths) {
+    delete (contextFiles as any)[path];
+  }
+}
+
+function prioritizePaths(paths: string[], query: string): string[] {
+  const queryLower = query.toLowerCase();
+  const queryTokens = queryLower.split(/\W+/).filter((t) => t.length > 2);
+
+  const scored = paths.map((p) => {
+    const relPath = p.startsWith("/home/project/") ? p.replace("/home/project/", "") : p;
+    const parts = relPath.toLowerCase().split(/[/._-]/);
+    let score = 0;
+
+    for (const token of queryTokens) {
+      if (parts.some((part) => part.includes(token))) score += 30;
+    }
+
+    const ext = relPath.split(".").pop() || "";
+    const highValueExts = new Set(["ts", "tsx", "js", "jsx", "py", "go", "rs", "java", "cs", "vue", "svelte"]);
+    if (highValueExts.has(ext)) score += 10;
+
+    const lowValuePatterns = [/test\./i, /spec\./i, /\.d\.ts$/, /node_modules/, /\.min\./, /lock\.json$/];
+    if (lowValuePatterns.some((r) => r.test(relPath))) score -= 20;
+
+    if (/index\.(ts|tsx|js|jsx)$/.test(relPath)) score += 15;
+    if (/\/(components|pages|routes|api|services|hooks|utils|lib)\//i.test(relPath)) score += 10;
+
+    return { path: p, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map((s) => s.path);
+}
+
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
 }
 
 export function getFilePaths(files: FileMap) {
