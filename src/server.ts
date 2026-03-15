@@ -4,7 +4,7 @@ import cors from 'cors';
 import { chatHandler } from './routes/chat';
 import { enhancerHandler } from './routes/enhancer';
 import { llmCallHandler } from './routes/llmcall';
-import { templateHandler } from './routes/template';
+import { templateHandler, templateInitHandler, templateIndexStatusHandler, templateSessionDeleteHandler } from './routes/template';
 import { createScopedLogger } from './utils/logger';
 import { chatRateLimit, llmCallRateLimit, enhancerRateLimit } from './utils/rateLimiter';
 import { createConcurrencyQueue } from './utils/concurrencyQueue';
@@ -71,6 +71,9 @@ app.post('/api/chat', chatRateLimit, chatQueue.middleware, chatHandler);
 app.post('/api/enhancer', enhancerRateLimit, enhancerHandler);
 app.post('/api/llmcall', llmCallRateLimit, llmCallHandler);
 app.post('/api/template', templateHandler);
+app.post('/api/template/init', templateInitHandler);
+app.get('/api/template/status', templateIndexStatusHandler);
+app.delete('/api/template/session', templateSessionDeleteHandler);
 
 app.use((_req, res) => {
   res.status(404).json({ error: true, message: 'Not found' });
