@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
-import { detectTemplate, getTemplateScaffold } from "../llm/template-detector.js";
+import { detectTemplate, getTemplateScaffold, listTemplates } from "../llm/template-detector.js";
+import { invalidateDiskTemplateCache } from "../llm/disk-template-loader.js";
 import { writeScaffoldToDisk, getSessionPath } from "../modules/ai_engine/session/scaffoldWriter.js";
 import { buildIndexForSession, getSessionIndex } from "../modules/ai_engine/agent.js";
 import { invalidateSession } from "../modules/ai_engine/session/sessionStore.js";
@@ -149,4 +150,29 @@ export function templateSessionDeleteHandler(req: Request, res: Response) {
 
   invalidateSession(sessionId);
   res.json({ success: true, sessionId });
+}
+
+export function templateListHandler(req: Request, res: Response) {
+  setCorsHeaders(req, res);
+
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+
+  const templates = listTemplates();
+  res.json({ success: true, templates });
+}
+
+export function templateCacheInvalidateHandler(req: Request, res: Response) {
+  setCorsHeaders(req, res);
+
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+
+  invalidateDiskTemplateCache();
+  logger.info("Disk template cache invalidated via API");
+  res.json({ success: true, message: "Disk template cache cleared" });
 }

@@ -4,7 +4,7 @@ import cors from 'cors';
 import { chatHandler } from './routes/chat';
 import { enhancerHandler } from './routes/enhancer';
 import { llmCallHandler } from './routes/llmcall';
-import { templateHandler, templateInitHandler, templateIndexStatusHandler, templateSessionDeleteHandler } from './routes/template';
+import { templateHandler, templateInitHandler, templateIndexStatusHandler, templateSessionDeleteHandler, templateListHandler, templateCacheInvalidateHandler } from './routes/template';
 import { indexBuildHandler, indexStatusHandler, indexSearchHandler, indexInvalidateHandler } from './routes/index-route';
 import { createScopedLogger } from './utils/logger';
 import { chatRateLimit, llmCallRateLimit, enhancerRateLimit } from './utils/rateLimiter';
@@ -75,6 +75,8 @@ app.post('/api/template', templateHandler);
 app.post('/api/template/init', templateInitHandler);
 app.get('/api/template/status', templateIndexStatusHandler);
 app.delete('/api/template/session', templateSessionDeleteHandler);
+app.get('/api/template/list', templateListHandler);
+app.post('/api/template/cache/invalidate', templateCacheInvalidateHandler);
 
 app.post('/api/index', indexBuildHandler);
 app.get('/api/index/status', indexStatusHandler);
