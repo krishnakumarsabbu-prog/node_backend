@@ -6,7 +6,7 @@ import { createScopedLogger } from "../utils/logger";
 import { WORK_DIR } from "../utils/constants";
 import { type Message } from "ai";
 import { selectContext } from "./select-context";
-import { searchWithGraph, getIndex, buildIndex, patchIndex, type PatchEntry } from "../modules/ai_engine/agent";
+import { searchWithGraph, searchWithEmbedding, getIndex, buildIndex, patchIndex, type PatchEntry } from "../modules/ai_engine/agent";
 
 const logger = createScopedLogger("search-context");
 
@@ -192,38 +192,43 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
       }
     }
 
-    logger.info(`searchContext (hybrid multi-pass): found ${relevantPaths.length} unique relevant paths across ${queryVariants.length} query variants`);
+    logger.info(`searchContext (BM25 multi-pass): found ${relevantPaths.length} unique relevant paths across ${queryVariants.length} query variants`);
 
-    const newFiles: FileMap = {};
-    for (const indexRelPath of relevantPaths) {
-      const candidates = [
-        `${WORK_DIR}/${indexRelPath}`,
-        indexRelPath,
-        `/${indexRelPath}`,
-      ];
+    if (relevantPaths.length > 0) {
+      const newFiles = resolvePathsToFileMap(relevantPaths, files);
+      if (Object.keys(newFiles).length > 0) {
+        logger.info(`searchContext: Tier 1 (BM25) succeeded with ${Object.keys(newFiles).length} files`);
+        return { ...contextFiles, ...newFiles };
+      }
+    }
 
-      let found = false;
-      for (const candidate of candidates) {
-        const entry = (files as any)[candidate];
-        if (entry) {
-          newFiles[indexRelPath] = entry;
-          found = true;
-          break;
+    logger.info("searchContext (BM25): no results, falling back to Tier 2 (TF-IDF embedding)");
+
+    const embeddingPaths: string[] = [];
+    for (const variant of queryVariants) {
+      if (embeddingPaths.length >= MAX_HYBRID_FILES) break;
+      const batchSize = Math.ceil(MAX_HYBRID_FILES / queryVariants.length);
+      const found = searchWithEmbedding(variant, batchSize, GRAPH_EXPANSION_DEPTH);
+      for (const p of found) {
+        if (!seenPaths.has(p)) {
+          seenPaths.add(p);
+          embeddingPaths.push(p);
+          if (embeddingPaths.length >= MAX_HYBRID_FILES) break;
         }
       }
+    }
 
-      if (!found) {
-        logger.debug(`searchContext: no FileMap entry for index path "${indexRelPath}"`);
+    logger.info(`searchContext (TF-IDF embedding): found ${embeddingPaths.length} paths`);
+
+    if (embeddingPaths.length > 0) {
+      const embeddingFiles = resolvePathsToFileMap(embeddingPaths, files);
+      if (Object.keys(embeddingFiles).length > 0) {
+        logger.info(`searchContext: Tier 2 (TF-IDF embedding) succeeded with ${Object.keys(embeddingFiles).length} files`);
+        return { ...contextFiles, ...embeddingFiles };
       }
     }
 
-    const totalFiles = Object.keys(newFiles).length;
-
-    if (totalFiles > 0) {
-      return { ...contextFiles, ...newFiles };
-    }
-
-    logger.info("searchContext (hybrid): no results, falling back to LLM selectContext");
+    logger.info("searchContext (TF-IDF embedding): no results, falling back to Tier 3 (LLM)");
   } catch (error) {
     logger.error("searchContext (hybrid) failed, falling back to LLM selectContext:", error);
   }
@@ -242,6 +247,26 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
     logger.error("searchContext (LLM fallback) also failed:", fallbackError);
     return contextFiles;
   }
+}
+
+function resolvePathsToFileMap(paths: string[], files: FileMap): FileMap {
+  const result: FileMap = {};
+  for (const indexRelPath of paths) {
+    const candidates = [
+      `${WORK_DIR}/${indexRelPath}`,
+      indexRelPath,
+      `/${indexRelPath}`,
+    ];
+
+    for (const candidate of candidates) {
+      const entry = (files as any)[candidate];
+      if (entry) {
+        result[indexRelPath] = entry;
+        break;
+      }
+    }
+  }
+  return result;
 }
 
 export function getFilePaths(files: FileMap) {

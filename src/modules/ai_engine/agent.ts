@@ -8,12 +8,14 @@ import { extractImports } from './languages/importDetector.js'
 import { extractSymbols } from './languages/symbolExtractor.js'
 import { detectLanguage } from './languages/detector.js'
 import { createScopedLogger } from '../../utils/logger'
+import { buildTfIdfIndex, searchByEmbedding, expandQueryTokens, type TfIdfIndex } from './retrieval/tfidf-embedder.js'
 
 const logger = createScopedLogger('ai-engine')
 
 let currentIndex: RepositoryIndex | null = null
 let indexBuildPromise: Promise<RepositoryIndex> | null = null
 let indexedPath: string | null = null
+let tfidfIndex: TfIdfIndex | null = null
 
 function canonicalizePath(p: string): string {
   try {
@@ -53,6 +55,8 @@ export async function buildIndexAsync(repositoryPath: string): Promise<Repositor
 
       currentIndex = index
       indexedPath = canonical
+      tfidfIndex = buildTfIdfIndex(index.files)
+      logger.info(`TF-IDF index built: vocab size ${tfidfIndex.vocab.size}`)
       return index
     } finally {
       indexBuildPromise = null
@@ -88,6 +92,8 @@ export function buildIndex(repositoryPath: string): RepositoryIndex {
 
   currentIndex = index
   indexedPath = canonical
+  tfidfIndex = buildTfIdfIndex(index.files)
+  logger.info(`TF-IDF index built: vocab size ${tfidfIndex.vocab.size}`)
   return index
 }
 
@@ -144,6 +150,31 @@ export function search(query: string, topK: number = 10): SearchResult[] {
   return topResults
 }
 
+export function searchWithEmbedding(query: string, topK: number = 20, graphDepth: number = 1): string[] {
+  if (!currentIndex || !tfidfIndex) {
+    logger.warn('searchWithEmbedding called with no index — returning empty results')
+    return []
+  }
+
+  const expandedTokens = expandQueryTokens(query)
+  const expandedQuery = expandedTokens.join(' ')
+
+  const results = searchByEmbedding(expandedQuery, currentIndex.files, tfidfIndex, topK)
+  if (results.length === 0) {
+    logger.debug(`searchWithEmbedding: no results for query "${query.substring(0, 60)}"`)
+    return []
+  }
+
+  const reRanked = reRankResults(results, query)
+  const seeds = reRanked.slice(0, Math.min(5, reRanked.length)).map(r => normalizeFilePath(r.file.path))
+
+  const expandedFiles = expandGraphFromSeeds(seeds, currentIndex.graph, graphDepth)
+  logger.debug(`Embedding graph expansion: ${seeds.length} seeds -> ${expandedFiles.length} files (depth=${graphDepth})`)
+
+  const validPaths = new Set(currentIndex.files.map(f => normalizeFilePath(f.path)))
+  return expandedFiles.filter(p => validPaths.has(p))
+}
+
 export function searchWithGraph(query: string, topK: number = 5, graphDepth: number = 1): string[] {
   if (!currentIndex) {
     logger.warn('searchWithGraph called with no index — returning empty results')
@@ -180,6 +211,7 @@ export function invalidateIndex(): void {
   currentIndex = null
   indexedPath = null
   indexBuildPromise = null
+  tfidfIndex = null
   logger.info('Index invalidated')
 }
 
@@ -255,6 +287,8 @@ export function patchIndex(changes: PatchEntry[]): void {
       symbolCount,
     },
   }
+
+  tfidfIndex = buildTfIdfIndex(mergedFiles)
 
   const duration = Date.now() - startTime
   logger.info(
