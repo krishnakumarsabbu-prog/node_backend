@@ -1,9 +1,12 @@
 import fs from 'fs'
 import path from 'path'
-import { RepositoryIndex, SearchResult } from './types/index.js'
+import { FileNode, RepositoryIndex, SearchResult } from './types/index.js'
 import { indexRepository } from './indexer/indexer.js'
 import { searchFiles, reRankResults } from './retrieval/searcher.js'
-import { expandGraphFromSeeds, normalizeFilePath } from './graph/graphBuilder.js'
+import { buildDependencyGraph, expandGraphFromSeeds, normalizeFilePath } from './graph/graphBuilder.js'
+import { extractImports } from './languages/importDetector.js'
+import { extractSymbols } from './languages/symbolExtractor.js'
+import { detectLanguage } from './languages/detector.js'
 import { createScopedLogger } from '../../utils/logger'
 
 const logger = createScopedLogger('ai-engine')
@@ -178,4 +181,83 @@ export function invalidateIndex(): void {
   indexedPath = null
   indexBuildPromise = null
   logger.info('Index invalidated')
+}
+
+export interface PatchEntry {
+  path: string
+  content: string
+}
+
+export function patchIndex(changes: PatchEntry[]): void {
+  if (!currentIndex || changes.length === 0) return
+
+  const startTime = Date.now()
+
+  const changedNormPaths = new Set(
+    changes.map(c => normalizeFilePath(c.path))
+  )
+
+  const survivingFiles = currentIndex.files.filter(
+    f => !changedNormPaths.has(normalizeFilePath(f.path))
+  )
+
+  const newNodes: FileNode[] = changes
+    .filter(c => c.content !== null && c.content !== undefined)
+    .map(c => {
+      const normPath = normalizeFilePath(c.path)
+      const name = normPath.split('/').pop() ?? normPath
+      const ext = name.includes('.') ? '.' + name.split('.').pop()!.toLowerCase() : ''
+      const language = detectLanguage(name, c.content)
+
+      let imports: string[] = []
+      let symbols: ReturnType<typeof extractSymbols> = []
+
+      try { imports = extractImports(c.content, language) } catch { imports = [] }
+      try { symbols = extractSymbols(c.content, language) } catch { symbols = [] }
+
+      return {
+        path: normPath,
+        name,
+        extension: ext,
+        language,
+        content: c.content,
+        size: Buffer.byteLength(c.content, 'utf8'),
+        imports,
+        symbols,
+      } satisfies FileNode
+    })
+
+  const mergedFiles = [...survivingFiles, ...newNodes]
+
+  let graph
+  try {
+    graph = buildDependencyGraph(mergedFiles)
+  } catch {
+    graph = currentIndex.graph
+  }
+
+  const languageDistribution: Record<string, number> = {}
+  let totalLines = 0
+  let symbolCount = 0
+  for (const f of mergedFiles) {
+    languageDistribution[f.language] = (languageDistribution[f.language] || 0) + 1
+    totalLines += (f.content.match(/\n/g)?.length ?? 0) + 1
+    symbolCount += (f.symbols || []).length
+  }
+
+  currentIndex = {
+    files: mergedFiles,
+    graph,
+    statistics: {
+      totalFiles: mergedFiles.length,
+      totalLines,
+      languageDistribution,
+      symbolCount,
+    },
+  }
+
+  const duration = Date.now() - startTime
+  logger.info(
+    `patchIndex: applied ${changes.length} change(s), index now has ${mergedFiles.length} files, ${graph.edges.length} edges (${duration}ms)`
+  )
 }

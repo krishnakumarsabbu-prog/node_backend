@@ -10,7 +10,7 @@ import type { FileMap } from "./constants";
 import type { IProviderSetting } from "../types/model";
 import type { DesignScheme } from "../types/design-scheme";
 import type { ProgressAnnotation } from "../types/context";
-import { searchWithGraph } from "../modules/ai_engine/agent";
+import { searchWithGraph, patchIndex, type PatchEntry } from "../modules/ai_engine/agent";
 import { selectFilesForBuild } from "./batch/batch-planner";
 
 const TEST_INTENT_PATTERNS = [
@@ -816,6 +816,21 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       if (generatedCount > 0) {
         Object.assign(accumulatedFiles, generatedFiles);
         logger.info(`[${requestId}] Step ${step.index} produced ${generatedCount} file(s), accumulated state updated`);
+
+        const patches: PatchEntry[] = [];
+        for (const [filePath, entry] of Object.entries(generatedFiles)) {
+          if (entry && entry.type === 'file' && !entry.isBinary && typeof entry.content === 'string') {
+            patches.push({ path: filePath, content: entry.content });
+          }
+        }
+        if (patches.length > 0) {
+          try {
+            patchIndex(patches);
+            logger.info(`[${requestId}] Step ${step.index} index patched with ${patches.length} file(s)`);
+          } catch (patchErr: any) {
+            logger.warn(`[${requestId}] Step ${step.index} index patch failed (non-fatal): ${patchErr?.message}`);
+          }
+        }
       }
 
       if (!writer.isAlive()) {

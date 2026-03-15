@@ -6,7 +6,7 @@ import { createScopedLogger } from "../utils/logger";
 import { WORK_DIR } from "../utils/constants";
 import { type Message } from "ai";
 import { selectContext } from "./select-context";
-import { searchWithGraph, getIndex, buildIndex } from "../modules/ai_engine/agent";
+import { searchWithGraph, getIndex, buildIndex, patchIndex, type PatchEntry } from "../modules/ai_engine/agent";
 
 const logger = createScopedLogger("search-context");
 
@@ -22,6 +22,7 @@ interface SearchContextProps {
 }
 
 let materializePromise: Promise<void> | null = null;
+const knownFileContents = new Map<string, string>();
 
 function toRelPath(filePath: string): string {
   const prefix = WORK_DIR.endsWith("/") ? WORK_DIR : WORK_DIR + "/";
@@ -145,9 +146,32 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
       await materializeFileMapToDisk(files);
       try {
         buildIndex(INDEX_TEMP_DIR);
+        for (const [filePath, entry] of Object.entries(files)) {
+          if (entry && entry.type === 'file' && !entry.isBinary) {
+            knownFileContents.set(filePath, (entry as any).content ?? '');
+          }
+        }
       } catch (buildErr) {
         logger.error("searchContext: index build failed:", buildErr);
         throw buildErr;
+      }
+    } else {
+      const changedPatches: PatchEntry[] = [];
+      for (const [filePath, entry] of Object.entries(files)) {
+        if (!entry || entry.type !== 'file' || (entry as any).isBinary) continue;
+        const content: string = (entry as any).content ?? '';
+        if (knownFileContents.get(filePath) !== content) {
+          knownFileContents.set(filePath, content);
+          changedPatches.push({ path: filePath, content });
+        }
+      }
+      if (changedPatches.length > 0) {
+        try {
+          patchIndex(changedPatches);
+          logger.info(`searchContext: patched index with ${changedPatches.length} changed file(s)`);
+        } catch (patchErr: any) {
+          logger.warn(`searchContext: index patch failed (non-fatal): ${patchErr?.message}`);
+        }
       }
     }
 
