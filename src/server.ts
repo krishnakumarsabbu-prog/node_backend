@@ -5,6 +5,7 @@ import { chatHandler } from './routes/chat';
 import { enhancerHandler } from './routes/enhancer';
 import { llmCallHandler } from './routes/llmcall';
 import { templateHandler, templateInitHandler, templateIndexStatusHandler, templateSessionDeleteHandler } from './routes/template';
+import { indexBuildHandler, indexStatusHandler, indexSearchHandler, indexInvalidateHandler } from './routes/index-route';
 import { createScopedLogger } from './utils/logger';
 import { chatRateLimit, llmCallRateLimit, enhancerRateLimit } from './utils/rateLimiter';
 import { createConcurrencyQueue } from './utils/concurrencyQueue';
@@ -74,6 +75,11 @@ app.post('/api/template', templateHandler);
 app.post('/api/template/init', templateInitHandler);
 app.get('/api/template/status', templateIndexStatusHandler);
 app.delete('/api/template/session', templateSessionDeleteHandler);
+
+app.post('/api/index', indexBuildHandler);
+app.get('/api/index/status', indexStatusHandler);
+app.post('/api/index/search', indexSearchHandler);
+app.delete('/api/index', indexInvalidateHandler);
 
 app.use((_req, res) => {
   res.status(404).json({ error: true, message: 'Not found' });
