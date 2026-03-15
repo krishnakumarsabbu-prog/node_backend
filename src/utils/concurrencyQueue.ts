@@ -86,7 +86,6 @@ export function createConcurrencyQueue(opts: QueueOptions) {
     function proceed() {
       clearTimeout(timer);
       if (timedOut) {
-        release();
         return;
       }
       res.on('finish', release);
