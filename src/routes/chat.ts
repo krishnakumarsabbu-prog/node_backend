@@ -14,7 +14,7 @@ import { handleDiscuss } from "./chat-discuss";
 import { handleBuild } from "./chat-build";
 import { handleMigrate } from "./chat-migrate";
 
-const inFlightRequests = new Map<string, { startedAt: number; abort: () => void }>();
+const inFlightRequests = new Map<string, { requestId: string; abort: () => void }>();
 
 function getDedupeKey(body: any): string | null {
   if (!body?.messages?.length) return null;
@@ -33,11 +33,11 @@ export async function chatHandler(req: Request, res: Response) {
   const dedupeKey = getDedupeKey(body);
   if (dedupeKey) {
     const existing = inFlightRequests.get(dedupeKey);
-    if (existing && Date.now() - existing.startedAt < 3000) {
-      logger.warn(`[${requestId}] Duplicate request detected (key: ${dedupeKey.slice(0, 60)}...), aborting previous`);
+    if (existing) {
+      logger.warn(`[${requestId}] Duplicate request detected (key: ${dedupeKey.slice(0, 60)}...), aborting previous [${existing.requestId}]`);
       existing.abort();
     }
-    inFlightRequests.set(dedupeKey, { startedAt: Date.now(), abort: () => abortController.abort() });
+    inFlightRequests.set(dedupeKey, { requestId, abort: () => abortController.abort() });
   }
 
   try {
@@ -89,7 +89,7 @@ export async function chatHandler(req: Request, res: Response) {
       requestId,
     });
   } finally {
-    if (dedupeKey && inFlightRequests.get(dedupeKey)?.startedAt === ctx.startedAt) {
+    if (dedupeKey && inFlightRequests.get(dedupeKey)?.requestId === requestId) {
       inFlightRequests.delete(dedupeKey);
     }
   }

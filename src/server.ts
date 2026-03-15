@@ -7,6 +7,7 @@ import { llmCallHandler } from './routes/llmcall';
 import { templateHandler } from './routes/template';
 import { createScopedLogger } from './utils/logger';
 import { MCPService } from './llm/mcpService';
+import { chatRateLimit, llmCallRateLimit, enhancerRateLimit } from './utils/rateLimiter';
 
 const logger = createScopedLogger('server');
 
@@ -24,18 +25,12 @@ app.use((_req, res, next) => {
 });
 
 app.get('/health', (_req, res) => {
-  const mcpHealth = MCPService.getInstance().getServerHealth();
-  res.json({
-    status: 'ok',
-    uptime: Math.round(process.uptime()),
-    memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
-    mcpServers: mcpHealth,
-  });
+  res.json({ status: 'ok' });
 });
 
-app.post('/api/chat', chatHandler);
-app.post('/api/enhancer', enhancerHandler);
-app.post('/api/llmcall', llmCallHandler);
+app.post('/api/chat', chatRateLimit, chatHandler);
+app.post('/api/enhancer', enhancerRateLimit, enhancerHandler);
+app.post('/api/llmcall', llmCallRateLimit, llmCallHandler);
 app.post('/api/template', templateHandler);
 
 const PORT = Number(process.env.PORT) || 8999;

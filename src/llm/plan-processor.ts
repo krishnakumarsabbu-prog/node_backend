@@ -230,6 +230,7 @@ async function streamStep(opts: {
   summary?: string;
   stepIndex: number;
   cumulativeUsage: { completionTokens: number; promptTokens: number; totalTokens: number };
+  clientAbortSignal?: AbortSignal;
 }): Promise<{ stepText: string; succeeded: boolean }> {
   const { requestId, res, stepMessages, filesToUse, allFiles, stepIndex, cumulativeUsage } = opts;
 
@@ -241,6 +242,10 @@ async function streamStep(opts: {
     }
 
     try {
+      if (opts.clientAbortSignal?.aborted) {
+        return { stepText: "", succeeded: false };
+      }
+
       const result = await streamText({
         messages: stepMessages,
         env: undefined as any,
@@ -255,6 +260,7 @@ async function streamStep(opts: {
         contextOptimization: true,
         contextFiles: filesToUse,
         messageSliceId: undefined,
+        clientAbortSignal: opts.clientAbortSignal,
       });
 
       const response = result.toDataStreamResponse();
@@ -486,6 +492,7 @@ export interface StreamPlanOptions {
   progressCounter: { value: number };
   writer: StreamWriter;
   summary?: string;
+  clientAbortSignal?: AbortSignal;
   cumulativeUsage: {
     completionTokens: number;
     promptTokens: number;
@@ -516,6 +523,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     progressCounter,
     writer,
     cumulativeUsage,
+    clientAbortSignal,
   } = opts;
 
   const planContent = extractPlanContent(files);
@@ -701,7 +709,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     );
 
     try {
-      const { stepText } = await streamStep({
+      const { stepText, succeeded } = await streamStep({
         requestId,
         res,
         stepMessages,
@@ -715,7 +723,21 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         summary,
         stepIndex: step.index,
         cumulativeUsage,
+        clientAbortSignal,
       });
+
+      if (!succeeded) {
+        logger.warn(`[${requestId}] Step ${step.index} reported failure (all retries exhausted), skipping file extraction`);
+        failedSteps++;
+        writer.writeData({
+          type: "progress",
+          label: "plan-step-error",
+          status: "complete",
+          order: progressCounter.value++,
+          message: `Step ${step.index} failed after all retries. Continuing with remaining steps...`,
+        } satisfies ProgressAnnotation);
+        continue;
+      }
 
       const generatedFiles = extractGeneratedFiles(stepText, accumulatedFiles);
       const generatedCount = Object.keys(generatedFiles).length;
@@ -750,6 +772,23 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       } satisfies ProgressAnnotation);
 
       failedSteps++;
+
+      const totalAttempted = succeededSteps + failedSteps;
+      if (totalAttempted >= 3) {
+        const failureRate = failedSteps / totalAttempted;
+        if (failureRate >= 0.6) {
+          logger.error(`[${requestId}] Circuit breaker triggered: ${failedSteps}/${totalAttempted} steps failed (${Math.round(failureRate * 100)}%). Aborting plan.`);
+          writer.writeData({
+            type: "progress",
+            label: "plan-error",
+            status: "complete",
+            order: progressCounter.value++,
+            message: `Plan aborted: ${failedSteps} of ${totalAttempted} steps failed. This may indicate an issue with the model or request. Please try again.`,
+          } satisfies ProgressAnnotation);
+          break;
+        }
+      }
+
       continue;
     }
   }

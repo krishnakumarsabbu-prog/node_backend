@@ -25,6 +25,7 @@ export async function handleBuild(
     startedAt,
     body,
     shouldAbort,
+    abortController,
     cumulativeUsage,
     dataStreamAdapter,
   } = ctx;
@@ -103,6 +104,7 @@ export async function handleBuild(
     progressCounter: planProgressCounter,
     writer: planWriter,
     cumulativeUsage,
+    clientAbortSignal: abortController.signal,
   });
 
   progressCounter = planProgressCounter.value;

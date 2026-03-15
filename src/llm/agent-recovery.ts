@@ -34,12 +34,21 @@ const defaultOptions: Required<AgentRecoveryControllerOptions> = {
   maxBackoffMs: 4_000,
 };
 
-function stableArgs(input: unknown): string {
-  if (!input || typeof input !== "object") return String(input ?? "");
-  if (Array.isArray(input)) return `[${input.map(stableArgs).join(",")}]`;
+function stableArgs(input: unknown, depth = 0, seen = new WeakSet()): string {
+  if (depth > 6) return '"[deep]"';
+  if (!input || typeof input !== "object") {
+    const s = String(input ?? "");
+    return s.length > 200 ? s.slice(0, 200) + "…" : s;
+  }
+  if (seen.has(input as object)) return '"[circular]"';
+  seen.add(input as object);
+  if (Array.isArray(input)) {
+    const items = input.slice(0, 20).map((v) => stableArgs(v, depth + 1, seen));
+    return `[${items.join(",")}]`;
+  }
   const record = input as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
-  return `{${keys.map((k) => `${k}:${stableArgs(record[k])}`).join(",")}}`;
+  const keys = Object.keys(record).sort().slice(0, 20);
+  return `{${keys.map((k) => `${k}:${stableArgs(record[k], depth + 1, seen)}`).join(",")}}`;
 }
 
 function buildToolSignature(toolCalls: ToolCallLike[]): string {

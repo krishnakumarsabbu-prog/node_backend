@@ -14,10 +14,31 @@ export type ProjectMemoryEntry = {
 type MemoryStore = Map<string, ProjectMemoryEntry>;
 
 const GLOBAL_MEMORY_KEY = "__cortex_project_memory_v1";
+const MAX_ENTRIES = 500;
+const TTL_MS = 2 * 60 * 60 * 1000;
+
+function isExpired(entry: ProjectMemoryEntry): boolean {
+  return Date.now() - new Date(entry.updatedAt).getTime() > TTL_MS;
+}
+
+function evictIfNeeded(store: MemoryStore): void {
+  for (const [key, entry] of store.entries()) {
+    if (isExpired(entry)) store.delete(key);
+  }
+
+  if (store.size > MAX_ENTRIES) {
+    const sorted = [...store.entries()].sort(
+      (a, b) => new Date(a[1].updatedAt).getTime() - new Date(b[1].updatedAt).getTime()
+    );
+    const toRemove = sorted.slice(0, store.size - MAX_ENTRIES);
+    for (const [key] of toRemove) store.delete(key);
+  }
+}
 
 /**
  * Store memory in-process (per Node worker/process).
  * NOTE: This is NOT shared across multiple Node instances/containers.
+ * Entries expire after 2 hours; max 500 entries enforced.
  */
 function getStore(): MemoryStore {
   const g = globalThis as typeof globalThis & {
@@ -132,6 +153,7 @@ export function upsertProjectMemory(input: {
     updatedAt,
   };
 
+  evictIfNeeded(store);
   store.set(input.projectKey, entry);
   return entry;
 }

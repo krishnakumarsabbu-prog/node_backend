@@ -63,7 +63,7 @@ export class PromptLibrary {
     const prompt = this.library[promptId];
 
     if (!prompt) {
-      throw 'Prompt Now Found';
+      throw new Error(`Prompt Not Found: "${promptId}"`);
     }
 
     return this.library[promptId]?.get(options);

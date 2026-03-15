@@ -13,7 +13,7 @@ export const TOOL_EXECUTION_APPROVAL = {
 } as const;
 export const TOOL_NO_EXECUTE_FUNCTION = 'Error: No execute function found on tool';
 export const TOOL_EXECUTION_DENIED = 'Error: User denied access to tool execution';
-export const TOOL_EXECUTION_ERROR = 'Error: An error occured while calling tool';
+export const TOOL_EXECUTION_ERROR = 'Error: An error occurred while calling tool';
 
 // starter Templates
 

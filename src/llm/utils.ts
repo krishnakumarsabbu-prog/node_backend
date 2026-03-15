@@ -1,4 +1,5 @@
 import { type Message } from 'ai';
+import path from 'node:path';
 import { DEFAULT_MODEL, MODEL_REGEX, PROVIDER_REGEX, WORK_DIR } from '../utils/constants';
 import { IGNORE_PATTERNS, type FileMap } from './constants';
 import ignore from 'ignore';
@@ -57,11 +58,24 @@ export function simplifyCortexActions(input: string): string {
 }
 
 function isSafeFilePath(filePath: string): boolean {
-  if (filePath.includes('..')) return false;
-  const dangerousPrefixes = ['/etc/', '/root/', '/proc/', '/sys/', '/dev/', '/boot/'];
+  if (!filePath || typeof filePath !== 'string') return false;
+
+  const SAFE_ROOTS = [WORK_DIR, '/tmp/cortex-index-source'];
+
+  const normalized = path.normalize(filePath);
+
+  if (normalized.includes('..')) return false;
+
+  const resolved = path.isAbsolute(normalized) ? normalized : path.resolve('/', normalized);
+
+  const inSafeRoot = SAFE_ROOTS.some((root) => resolved.startsWith(root + '/') || resolved === root);
+  if (inSafeRoot) return true;
+
+  const dangerousPrefixes = ['/etc/', '/root/', '/proc/', '/sys/', '/dev/', '/boot/', '/usr/'];
   for (const prefix of dangerousPrefixes) {
-    if (filePath.startsWith(prefix)) return false;
+    if (resolved.startsWith(prefix)) return false;
   }
+
   return true;
 }
 

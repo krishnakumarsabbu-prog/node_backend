@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { type FileMap } from "./constants";
 import { extractCurrentContext } from "./utils";
@@ -20,38 +20,52 @@ interface SearchContextProps {
   onFinish?: (resp: any) => void;
 }
 
-function materializeFileMapToDisk(files: FileMap): void {
-  try {
-    fs.rmSync(INDEX_TEMP_DIR, { recursive: true, force: true });
-    fs.mkdirSync(INDEX_TEMP_DIR, { recursive: true });
+let materializePromise: Promise<void> | null = null;
 
-    let written = 0;
-    for (const [filePath, entry] of Object.entries(files)) {
-      if (!entry || entry.type !== "file" || entry.isBinary) continue;
-
-      const relPath = filePath.startsWith(WORK_DIR + "/")
-        ? filePath.replace(WORK_DIR + "/", "")
-        : filePath.startsWith("/")
-          ? filePath.slice(1)
-          : filePath;
-
-      const dest = path.join(INDEX_TEMP_DIR, relPath);
-      const dir = path.dirname(dest);
-
-      try {
-        fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(dest, entry.content || "", "utf-8");
-        written++;
-      } catch {
-        // skip files that fail to write
-      }
-    }
-
-    logger.info(`materializeFileMapToDisk: wrote ${written} files to ${INDEX_TEMP_DIR}`);
-  } catch (err) {
-    logger.error("materializeFileMapToDisk failed:", err);
-    throw err;
+async function materializeFileMapToDisk(files: FileMap): Promise<void> {
+  if (materializePromise) {
+    return materializePromise;
   }
+
+  materializePromise = (async () => {
+    try {
+      await fs.rm(INDEX_TEMP_DIR, { recursive: true, force: true });
+      await fs.mkdir(INDEX_TEMP_DIR, { recursive: true });
+
+      const writeOps: Promise<void>[] = [];
+      let queued = 0;
+
+      for (const [filePath, entry] of Object.entries(files)) {
+        if (!entry || entry.type !== "file" || entry.isBinary) continue;
+
+        const relPath = filePath.startsWith(WORK_DIR + "/")
+          ? filePath.replace(WORK_DIR + "/", "")
+          : filePath.startsWith("/")
+            ? filePath.slice(1)
+            : filePath;
+
+        const dest = path.join(INDEX_TEMP_DIR, relPath);
+        const dir = path.dirname(dest);
+
+        writeOps.push(
+          fs.mkdir(dir, { recursive: true })
+            .then(() => fs.writeFile(dest, entry.content || "", "utf-8"))
+            .catch(() => {})
+        );
+        queued++;
+      }
+
+      await Promise.allSettled(writeOps);
+      logger.info(`materializeFileMapToDisk: queued ${queued} files to ${INDEX_TEMP_DIR}`);
+    } catch (err) {
+      logger.error("materializeFileMapToDisk failed:", err);
+      throw err;
+    } finally {
+      materializePromise = null;
+    }
+  })();
+
+  return materializePromise;
 }
 
 export async function searchContext(props: SearchContextProps): Promise<FileMap> {
@@ -93,7 +107,7 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
   try {
     if (!getIndex()) {
       logger.info("searchContext: no index, materializing file map to disk then building index...");
-      materializeFileMapToDisk(files);
+      await materializeFileMapToDisk(files);
       buildIndex(INDEX_TEMP_DIR);
     }
 
