@@ -155,9 +155,13 @@ export async function handleDiscuss(
     let switches = 0;
     let done = false;
 
+    let activeGuard: import("../llm/stream-recovery").StreamGuard | null = null;
+
     while (!done) {
       if (shouldAbort()) {
         logger.info(`[${requestId}] Client disconnected, aborting streaming loop`);
+        activeGuard?.stop();
+        activeGuard = null;
         break;
       }
 
@@ -174,6 +178,7 @@ export async function handleDiscuss(
         onDead: () => logger.error(`[${requestId}] Stream dead — max retries exhausted`),
       });
 
+      activeGuard = guard;
       guard.start();
 
       const options: StreamingOptions = {
@@ -255,11 +260,13 @@ export async function handleDiscuss(
         await pipeWebStreamToExpress({ requestId, res, webStream: response.body as any, guard });
 
         guard.stop();
+        activeGuard = null;
 
         const m = guard.metrics();
         logger.info(`[${requestId}] Segment done: ${safeJson(m)}`);
       } catch (err: any) {
         guard.stop();
+        activeGuard = null;
 
         const isTimeout = err?.name === "AbortError" || err?.message?.includes("timeout") || err?.message?.includes("timed out");
 

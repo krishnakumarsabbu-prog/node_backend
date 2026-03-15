@@ -229,17 +229,20 @@ export class MCPService {
 
   private _registerTools(serverName: string, tools: ToolSet) {
     for (const [toolName, tool] of Object.entries(tools)) {
+      let registeredName = toolName;
+
       if (this._tools[toolName]) {
         const existingServerName = this._toolNamesToServerNames.get(toolName);
 
         if (existingServerName && existingServerName !== serverName) {
-          logger.warn(`Tool conflict: "${toolName}" from "${serverName}" overrides tool from "${existingServerName}"`);
+          registeredName = `${serverName}__${toolName}`;
+          logger.warn(`Tool conflict: "${toolName}" from "${serverName}" conflicts with "${existingServerName}" — registering as "${registeredName}"`);
         }
       }
 
-      this._tools[toolName] = tool;
-      this._toolsWithoutExecute[toolName] = { ...tool, execute: undefined };
-      this._toolNamesToServerNames.set(toolName, serverName);
+      this._tools[registeredName] = tool;
+      this._toolsWithoutExecute[registeredName] = { ...tool, execute: undefined };
+      this._toolNamesToServerNames.set(registeredName, serverName);
     }
   }
 

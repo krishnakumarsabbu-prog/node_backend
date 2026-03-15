@@ -146,6 +146,7 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
       await materializeFileMapToDisk(files);
       try {
         buildIndex(INDEX_TEMP_DIR);
+        knownFileContents.clear();
         for (const [filePath, entry] of Object.entries(files)) {
           if (entry && entry.type === 'file' && !entry.isBinary) {
             knownFileContents.set(filePath, (entry as any).content ?? '');

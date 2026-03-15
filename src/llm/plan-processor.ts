@@ -521,6 +521,14 @@ function buildFileStepMessages(
   return stepMessages;
 }
 
+function sanitizeGeneratedPath(rawPath: string): string | null {
+  const normalized = rawPath.replace(/\\/g, '/').replace(/\/+/g, '/');
+  if (normalized.includes('..') || normalized.includes('\0')) return null;
+  const base = normalized.startsWith('/') ? normalized : `/home/project/${normalized}`;
+  if (!base.startsWith('/home/project/')) return null;
+  return base;
+}
+
 function extractGeneratedFiles(stepText: string, currentFiles: FileMap): FileMap {
   const updated: FileMap = {};
   const fileBlockRe = /<cortexAction[^>]*type="file"[^>]*filePath="([^"]+)"[^>]*>([\s\S]*?)<\/cortexAction>/g;
@@ -528,7 +536,11 @@ function extractGeneratedFiles(stepText: string, currentFiles: FileMap): FileMap
   while ((match = fileBlockRe.exec(stepText)) !== null) {
     const rawPath = match[1];
     const content = match[2];
-    const fullPath = rawPath.startsWith('/') ? rawPath : `/home/project/${rawPath}`;
+    const fullPath = sanitizeGeneratedPath(rawPath);
+    if (!fullPath) {
+      logger.warn(`extractGeneratedFiles: skipping suspicious path "${rawPath}"`);
+      continue;
+    }
     updated[fullPath] = { type: 'file', content, isBinary: false } as any;
   }
   return updated;
@@ -569,11 +581,6 @@ const GRAPH_SEARCH_DEPTH = 3;
  */
 const FILE_PER_STEP_THRESHOLD = 1;
 
-/**
- * For large refactors (100+ files), how many file steps to execute in parallel.
- * Keeps per-step concurrency manageable while maximising throughput.
- */
-const PARALLEL_STEP_CONCURRENCY = 4;
 
 export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void> {
   const {
@@ -729,6 +736,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
   const executeStep = async (step: PlanStep): Promise<void> => {
     if (!writer.isAlive() || circuitBroken) return;
+    if (clientAbortSignal?.aborted) return;
 
     logger.info(`[${requestId}] Step ${step.index}/${steps.length}: "${step.heading}" [${executionMode}]`);
 
@@ -878,23 +886,9 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     }
   };
 
-  const useParallel = executionMode === "files" && steps.length > 10;
-  const concurrency = useParallel ? PARALLEL_STEP_CONCURRENCY : 1;
-
-  if (concurrency > 1) {
-    logger.info(`[${requestId}] Large refactor detected (${steps.length} files) — running with concurrency=${concurrency}`);
-
-    for (let i = 0; i < steps.length; i += concurrency) {
-      if (!writer.isAlive() || circuitBroken) break;
-
-      const chunk = steps.slice(i, i + concurrency);
-      await Promise.all(chunk.map((step) => executeStep(step)));
-    }
-  } else {
-    for (const step of steps) {
-      if (!writer.isAlive() || circuitBroken) break;
-      await executeStep(step);
-    }
+  for (const step of steps) {
+    if (!writer.isAlive() || circuitBroken) break;
+    await executeStep(step);
   }
 
   logger.info(

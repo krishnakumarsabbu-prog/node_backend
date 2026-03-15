@@ -49,8 +49,10 @@ export function createConcurrencyQueue(opts: QueueOptions) {
   const middleware = (req: Request, res: Response, next: NextFunction) => {
     if (active < maxConcurrent) {
       active++;
-      res.on('finish', release);
-      res.on('close', release);
+      let released = false;
+      const safeRelease = () => { if (!released) { released = true; release(); } };
+      res.on('finish', safeRelease);
+      res.on('close', safeRelease);
       return next();
     }
 
@@ -88,8 +90,10 @@ export function createConcurrencyQueue(opts: QueueOptions) {
       if (timedOut) {
         return;
       }
-      res.on('finish', release);
-      res.on('close', release);
+      let released = false;
+      const safeRelease = () => { if (!released) { released = true; release(); } };
+      res.on('finish', safeRelease);
+      res.on('close', safeRelease);
       next();
     }
 

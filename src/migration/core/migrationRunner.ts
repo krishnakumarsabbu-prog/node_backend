@@ -66,6 +66,12 @@ export class MigrationRunner {
   }
 
   private restoreSnapshot(files: FileMap, snapshot: Map<string, string | null>): void {
+    for (const path of Object.keys(files)) {
+      if (!snapshot.has(path)) {
+        delete files[path];
+      }
+    }
+
     for (const [path, content] of snapshot.entries()) {
       if (content === null) {
         delete files[path];
