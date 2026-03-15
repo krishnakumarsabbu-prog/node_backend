@@ -25,6 +25,14 @@ let indexBuildPromise: Promise<RepositoryIndex> | null = null
 let indexedPath: string | null = null
 let tfidfIndex: TfIdfIndex | null = null
 
+let patchMutex: Promise<void> = Promise.resolve()
+
+function withPatchLock(fn: () => void): Promise<void> {
+  const next = patchMutex.then(() => fn())
+  patchMutex = next.catch(() => {})
+  return next
+}
+
 function canonicalizePath(p: string): string {
   try {
     return path.resolve(p)
@@ -357,78 +365,82 @@ export function patchIndexForSession(sessionId: string, changes: PatchEntry[]): 
 
 export { getSessionIndex, invalidateSession, listSessions }
 
-export function patchIndex(changes: PatchEntry[]): void {
-  if (!currentIndex || changes.length === 0) return
+export function patchIndex(changes: PatchEntry[]): Promise<void> {
+  if (!currentIndex || changes.length === 0) return Promise.resolve()
 
-  const startTime = Date.now()
+  return withPatchLock(() => {
+    if (!currentIndex) return
 
-  const changedNormPaths = new Set(
-    changes.map(c => normalizeFilePath(c.path))
-  )
+    const startTime = Date.now()
 
-  const survivingFiles = currentIndex.files.filter(
-    f => !changedNormPaths.has(normalizeFilePath(f.path))
-  )
+    const changedNormPaths = new Set(
+      changes.map(c => normalizeFilePath(c.path))
+    )
 
-  const newNodes: FileNode[] = changes
-    .filter(c => c.content !== null && c.content !== undefined)
-    .map(c => {
-      const normPath = normalizeFilePath(c.path)
-      const name = normPath.split('/').pop() ?? normPath
-      const ext = name.includes('.') ? '.' + name.split('.').pop()!.toLowerCase() : ''
-      const language = detectLanguage(name, c.content)
+    const survivingFiles = currentIndex.files.filter(
+      f => !changedNormPaths.has(normalizeFilePath(f.path))
+    )
 
-      let imports: string[] = []
-      let symbols: ReturnType<typeof extractSymbols> = []
+    const newNodes: FileNode[] = changes
+      .filter(c => c.content !== null && c.content !== undefined)
+      .map(c => {
+        const normPath = normalizeFilePath(c.path)
+        const name = normPath.split('/').pop() ?? normPath
+        const ext = name.includes('.') ? '.' + name.split('.').pop()!.toLowerCase() : ''
+        const language = detectLanguage(name, c.content)
 
-      try { imports = extractImports(c.content, language) } catch { imports = [] }
-      try { symbols = extractSymbols(c.content, language) } catch { symbols = [] }
+        let imports: string[] = []
+        let symbols: ReturnType<typeof extractSymbols> = []
 
-      return {
-        path: normPath,
-        name,
-        extension: ext,
-        language,
-        content: c.content,
-        size: Buffer.byteLength(c.content, 'utf8'),
-        imports,
-        symbols,
-      } satisfies FileNode
-    })
+        try { imports = extractImports(c.content, language) } catch { imports = [] }
+        try { symbols = extractSymbols(c.content, language) } catch { symbols = [] }
 
-  const mergedFiles = [...survivingFiles, ...newNodes]
+        return {
+          path: normPath,
+          name,
+          extension: ext,
+          language,
+          content: c.content,
+          size: Buffer.byteLength(c.content, 'utf8'),
+          imports,
+          symbols,
+        } satisfies FileNode
+      })
 
-  let graph
-  try {
-    graph = buildDependencyGraph(mergedFiles)
-  } catch {
-    graph = currentIndex.graph
-  }
+    const mergedFiles = [...survivingFiles, ...newNodes]
 
-  const languageDistribution: Record<string, number> = {}
-  let totalLines = 0
-  let symbolCount = 0
-  for (const f of mergedFiles) {
-    languageDistribution[f.language] = (languageDistribution[f.language] || 0) + 1
-    totalLines += (f.content.match(/\n/g)?.length ?? 0) + 1
-    symbolCount += (f.symbols || []).length
-  }
+    let graph
+    try {
+      graph = buildDependencyGraph(mergedFiles)
+    } catch {
+      graph = currentIndex.graph
+    }
 
-  currentIndex = {
-    files: mergedFiles,
-    graph,
-    statistics: {
-      totalFiles: mergedFiles.length,
-      totalLines,
-      languageDistribution,
-      symbolCount,
-    },
-  }
+    const languageDistribution: Record<string, number> = {}
+    let totalLines = 0
+    let symbolCount = 0
+    for (const f of mergedFiles) {
+      languageDistribution[f.language] = (languageDistribution[f.language] || 0) + 1
+      totalLines += (f.content.match(/\n/g)?.length ?? 0) + 1
+      symbolCount += (f.symbols || []).length
+    }
 
-  tfidfIndex = buildTfIdfIndex(mergedFiles)
+    currentIndex = {
+      files: mergedFiles,
+      graph,
+      statistics: {
+        totalFiles: mergedFiles.length,
+        totalLines,
+        languageDistribution,
+        symbolCount,
+      },
+    }
 
-  const duration = Date.now() - startTime
-  logger.info(
-    `patchIndex: applied ${changes.length} change(s), index now has ${mergedFiles.length} files, ${graph.edges.length} edges (${duration}ms)`
-  )
+    tfidfIndex = buildTfIdfIndex(mergedFiles)
+
+    const duration = Date.now() - startTime
+    logger.info(
+      `patchIndex: applied ${changes.length} change(s), index now has ${mergedFiles.length} files, ${graph.edges.length} edges (${duration}ms)`
+    )
+  })
 }

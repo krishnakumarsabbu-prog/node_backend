@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import { createHash } from "crypto";
 
 import { MCPService } from "../llm/mcpService";
 import type { FileMap } from "../llm/constants";
@@ -18,9 +19,19 @@ const inFlightRequests = new Map<string, { requestId: string; abort: () => void 
 
 function getDedupeKey(body: any): string | null {
   if (!body?.messages?.length) return null;
-  const last = body.messages[body.messages.length - 1];
-  const content = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content);
-  return `${body.chatMode || 'discuss'}::${content?.slice(0, 200)}`;
+
+  const fingerprint = (body.messages as any[])
+    .map((m: any) => {
+      const role = m?.role ?? '';
+      const content = typeof m?.content === 'string' ? m.content : JSON.stringify(m?.content ?? '');
+      return `${role}:${content}`;
+    })
+    .join('\n');
+
+  const filesKey = body.files ? Object.keys(body.files).sort().join(',') : '';
+  const raw = `${body.chatMode || 'discuss'}::${filesKey}::${fingerprint}`;
+  const hash = createHash('sha256').update(raw).digest('hex').slice(0, 16);
+  return hash;
 }
 
 export async function chatHandler(req: Request, res: Response) {

@@ -4,7 +4,9 @@ import { createScopedLogger } from '../../../utils/logger.js'
 
 const logger = createScopedLogger('session-store')
 
-const TTL_MS = 2 * 60 * 60 * 1000
+const IDLE_TTL_MS = 2 * 60 * 60 * 1000
+const ABSOLUTE_TTL_MS = 4 * 60 * 60 * 1000
+const MAX_SESSIONS = 100
 
 interface SessionEntry {
   index: RepositoryIndex
@@ -16,14 +18,28 @@ interface SessionEntry {
 
 const sessions = new Map<string, SessionEntry>()
 
-setInterval(() => {
+function evictExpired(): void {
   const now = Date.now()
   for (const [sessionId, entry] of sessions.entries()) {
-    if (now - entry.lastAccessedAt > TTL_MS) {
+    if (now - entry.lastAccessedAt > IDLE_TTL_MS || now - entry.createdAt > ABSOLUTE_TTL_MS) {
       sessions.delete(sessionId)
       logger.info(`Evicted stale session: ${sessionId}`)
     }
   }
+}
+
+function enforceSessionCap(): void {
+  if (sessions.size <= MAX_SESSIONS) return
+  const sorted = Array.from(sessions.entries()).sort((a, b) => a[1].lastAccessedAt - b[1].lastAccessedAt)
+  const toEvict = sorted.slice(0, sessions.size - MAX_SESSIONS)
+  for (const [sessionId] of toEvict) {
+    sessions.delete(sessionId)
+    logger.warn(`Session cap reached — evicted LRU session: ${sessionId}`)
+  }
+}
+
+setInterval(() => {
+  evictExpired()
 }, 10 * 60 * 1000).unref()
 
 export function storeSessionIndex(sessionId: string, index: RepositoryIndex, diskPath: string): void {
@@ -35,6 +51,7 @@ export function storeSessionIndex(sessionId: string, index: RepositoryIndex, dis
     createdAt: Date.now(),
     lastAccessedAt: Date.now(),
   })
+  enforceSessionCap()
   logger.info(`Stored index for session ${sessionId}: ${index.statistics.totalFiles} files at ${diskPath}`)
 }
 
@@ -76,4 +93,8 @@ export function invalidateSession(sessionId: string): void {
 
 export function listSessions(): string[] {
   return Array.from(sessions.keys())
+}
+
+export function getSessionCount(): number {
+  return sessions.size
 }
