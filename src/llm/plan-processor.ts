@@ -13,6 +13,23 @@ import type { ProgressAnnotation } from "../types/context";
 import { searchWithGraph } from "../modules/ai_engine/agent";
 import { selectFilesForBuild } from "./batch/batch-planner";
 
+const TEST_INTENT_PATTERNS = [
+  /\btest(s|ing|ed)?\b/i,
+  /\bunit test/i,
+  /\bintegration test/i,
+  /\be2e\b/i,
+  /\bend[- ]to[- ]end\b/i,
+  /\bspec(s)?\b/i,
+  /\bvitest\b/i,
+  /\bjest\b/i,
+  /\bcypress\b/i,
+  /\bplaywright\b/i,
+];
+
+function isTestGenerationRequest(question: string): boolean {
+  return TEST_INTENT_PATTERNS.some((re) => re.test(question));
+}
+
 export interface StreamWriter {
   writeData: (data: unknown) => boolean;
   writeAnnotation: (annotation: unknown) => boolean;
@@ -270,6 +287,7 @@ async function streamStep(opts: {
   stepIndex: number;
   cumulativeUsage: { completionTokens: number; promptTokens: number; totalTokens: number };
   clientAbortSignal?: AbortSignal;
+  promptId?: string;
 }): Promise<{ stepText: string; succeeded: boolean }> {
   const { requestId, res, stepMessages, filesToUse, allFiles, stepIndex, cumulativeUsage } = opts;
 
@@ -292,7 +310,7 @@ async function streamStep(opts: {
         apiKeys: opts.apiKeys,
         files: allFiles,
         providerSettings: opts.providerSettings,
-        promptId: "plan",
+        promptId: opts.promptId ?? "plan",
         chatMode: opts.chatMode,
         designScheme: opts.designScheme,
         summary: opts.summary,
@@ -539,6 +557,11 @@ export interface StreamPlanOptions {
   };
 }
 
+const CIRCUIT_BREAKER_MIN_ATTEMPTS = 5;
+const CIRCUIT_BREAKER_FAILURE_RATE = 0.7;
+const GRAPH_SEARCH_MAX_FILES = 40;
+const GRAPH_SEARCH_DEPTH = 3;
+
 /**
  * How many files the LLM must select before switching to file-per-step mode.
  * Set to 1 so that ANY non-trivial request with file selection uses file-per-step,
@@ -693,6 +716,11 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
   res.write(`f:${JSON.stringify({ messageId: sharedMessageId })}\n`);
   logger.info(`[${requestId}] Emitted shared messageId: ${sharedMessageId}`);
 
+  const isTestRequest = isTestGenerationRequest(userQuestion ?? "");
+  if (isTestRequest) {
+    logger.info(`[${requestId}] Test generation intent detected — test files will be allowed in execution`);
+  }
+
   let succeededSteps = 0;
   let failedSteps = 0;
   let circuitBroken = false;
@@ -729,7 +757,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     } else {
       try {
         const query = `${step.heading} ${step.details}`;
-        const relevantPaths: string[] = searchWithGraph(query, 20, 2);
+        const relevantPaths: string[] = searchWithGraph(query, GRAPH_SEARCH_MAX_FILES, GRAPH_SEARCH_DEPTH);
         if (relevantPaths.length > 0) {
           const stepFiles: FileMap = {};
           for (const relPath of relevantPaths) {
@@ -767,6 +795,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         stepIndex: step.index,
         cumulativeUsage,
         clientAbortSignal,
+        promptId: isTestRequest ? "plan-test" : "plan",
       });
 
       if (!succeeded) {
@@ -817,9 +846,9 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       failedSteps++;
 
       const totalAttempted = succeededSteps + failedSteps;
-      if (totalAttempted >= 3) {
+      if (totalAttempted >= CIRCUIT_BREAKER_MIN_ATTEMPTS) {
         const failureRate = failedSteps / totalAttempted;
-        if (failureRate >= 0.6) {
+        if (failureRate >= CIRCUIT_BREAKER_FAILURE_RATE) {
           logger.error(`[${requestId}] Circuit breaker triggered: ${failedSteps}/${totalAttempted} steps failed (${Math.round(failureRate * 100)}%). Aborting plan.`);
           writer.writeData({
             type: "progress",

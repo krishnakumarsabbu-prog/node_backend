@@ -80,10 +80,12 @@ export interface StreamingOptions extends Omit<Parameters<typeof _streamText>[0]
 
 const logger = createScopedLogger("stream-text");
 
+const LOCK_FILE_PATTERN = /^<cortexAction[^>]*\bfilePath="[^"]*(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|composer\.lock|Gemfile\.lock|Cargo\.lock|poetry\.lock|go\.sum|shrinkwrap\.json)"[^>]*>[\s\S]*?<\/cortexAction>/gm;
+
 function sanitizeText(text: string): string {
   let sanitized = text.replace(/<div class="__cortexThought__">.*?<\/div>/s, "");
   sanitized = sanitized.replace(/<think>.*?<\/think>/s, "");
-  sanitized = sanitized.replace(/<cortexAction type="file" filePath="package-lock\.json">[\s\S]*?<\/cortexAction>/g, "");
+  sanitized = sanitized.replace(LOCK_FILE_PATTERN, "");
   return sanitized.trim();
 }
 
@@ -150,9 +152,11 @@ export async function streamText(props: {
       },
     }) ?? getSystemPrompt();
 
+  const isPlanMode = promptId === "plan" || promptId === "plan-test";
+
   const shouldInjectContext = contextFiles && (
     (chatMode === "build" && contextOptimization) ||
-    promptId === "plan"
+    isPlanMode
   );
 
   if (shouldInjectContext) {
@@ -229,7 +233,7 @@ ${lockedFilesListString}
 
   const streamParams = {
     model: getTachyonModel(),
-    system: (chatMode === "build" || promptId === "plan") ? systemPrompt : discussPrompt(),
+    system: (chatMode === "build" || isPlanMode) ? systemPrompt : discussPrompt(),
     messages: convertToCoreMessages(processedMessages as any),
     ...(options || {}),
     abortSignal,
@@ -257,11 +261,29 @@ function estimateContextSize(contextFiles: FileMap): { totalChars: number; overs
   return { totalChars, oversizedFiles };
 }
 
-function truncateContextFiles(contextFiles: FileMap, budget: number): FileMap {
+function truncateContextFiles(contextFiles: FileMap, budget: number, priorityPaths?: Set<string>): FileMap {
   const result: FileMap = {};
   let remaining = budget;
-  for (const [path, file] of Object.entries(contextFiles)) {
-    if (!file || file.type !== 'file' || (file as any).isBinary) continue;
+
+  const entries = Object.entries(contextFiles).filter(
+    ([, file]) => file && file.type === 'file' && !(file as any).isBinary,
+  );
+
+  const priority = priorityPaths && priorityPaths.size > 0
+    ? entries.filter(([p]) => priorityPaths.has(p))
+    : [];
+  const rest = entries
+    .filter(([p]) => !priorityPaths?.has(p))
+    .sort((a, b) => {
+      const aLen = ((a[1] as any).content || '').length;
+      const bLen = ((b[1] as any).content || '').length;
+      return aLen - bLen;
+    });
+
+  const ordered = [...priority, ...rest];
+
+  for (const [path, file] of ordered) {
+    if (remaining <= 0) break;
     const content: string = (file as any).content || '';
     if (content.length <= remaining) {
       result[path] = file;
@@ -271,7 +293,6 @@ function truncateContextFiles(contextFiles: FileMap, budget: number): FileMap {
       result[path] = { ...file, content: truncated } as any;
       remaining = 0;
     }
-    if (remaining <= 0) break;
   }
   return result;
 }

@@ -2,7 +2,7 @@ import { getSystemPrompt } from './prompts/prompts';
 import optimized from './prompts/optimized';
 import { getFineTunedPrompt } from './prompts/new-prompt';
 import { DesignScheme } from '../../types/design-scheme';
-import { getPlanPrompt } from './prompts/plan-prompt';
+import { getPlanPrompt, getPlanTestPrompt } from './prompts/plan-prompt';
 
 export interface PromptOptions {
   cwd: string;
@@ -45,8 +45,13 @@ export class PromptLibrary {
     },
     plan: {
       label: 'Plan Implementation Prompt',
-      description: 'Plan for plan mode - generates. only code files, no shell commands',
+      description: 'Plan for plan mode - generates only code files, no shell commands',
       get: (options) => getPlanPrompt(options.cwd, options.supabase, options.designScheme),
+    },
+    'plan-test': {
+      label: 'Plan Test Generation Prompt',
+      description: 'Plan mode variant that explicitly allows and requires test file generation',
+      get: (options) => getPlanTestPrompt(options.cwd, options.supabase, options.designScheme),
     },
   };
   static getList() {

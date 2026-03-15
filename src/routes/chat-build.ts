@@ -84,7 +84,17 @@ export async function handleBuild(
     if (shouldAbort()) return;
     logger.info(`[${requestId}] implementPlan=true starting PLAN.md-driven streaming`);
   } else {
-    if (!userQuestion || shouldAbort()) return;
+    if (shouldAbort()) return;
+    if (!userQuestion) {
+      logger.warn(`[${requestId}] Build mode called with no user question and no implementPlan flag — sending error response`);
+      writeDataPart(res, {
+        type: "error",
+        error: "No question provided. Please describe what you would like to build or change.",
+      });
+      res.write(`d:${JSON.stringify({ finishReason: "error", usage: { promptTokens: 0, completionTokens: 0 } })}\n`);
+      res.end();
+      return;
+    }
     logger.info(`[${requestId}] Build mode auto-planning from question: "${userQuestion.substring(0, 80)}"`);
   }
 

@@ -2,6 +2,28 @@ import { DesignScheme } from "../../../types/design-scheme";
 import { WORK_DIR } from "../../../utils/constants";
 import { allowedHTMLElements } from "../../stream-text";
 
+export const getPlanTestPrompt = (
+  cwd: string = WORK_DIR,
+  supabase?: {
+    isConnected: boolean;
+    hasSelectedProject: boolean;
+    credentials?: { anonKey?: string; supabaseUrl?: string };
+  },
+  designScheme?: DesignScheme,
+): string => getPlanPrompt(cwd, supabase, designScheme).replace(
+  `FORBIDDEN Action Types in Plan Mode:
+- shell — DO NOT USE
+- start — DO NOT USE`,
+  `FORBIDDEN Action Types in Plan Mode:
+- shell — DO NOT USE
+- start — DO NOT USE
+
+TEST GENERATION MODE:
+You are explicitly writing test files for this step. Test files ARE allowed and required.
+Write complete, meaningful tests using the framework already present in the project (e.g. vitest, jest, cypress, playwright).
+Cover: happy paths, edge cases, error states. Import from real source files using correct relative paths.`,
+);
+
 export const getPlanPrompt = (
   cwd: string = WORK_DIR,
   supabase?: {
