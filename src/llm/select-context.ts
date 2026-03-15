@@ -16,6 +16,58 @@ const logger = createScopedLogger("select-context");
 const MAX_CONTEXT_FILES = 100;
 const BATCH_SIZE = 40;
 
+function stripWorkDirPrefix(p: string): string {
+  const prefixes = ["/home/project/", "/workspace/", "/project/"];
+  for (const prefix of prefixes) {
+    if (p.startsWith(prefix)) return p.slice(prefix.length);
+  }
+  return p;
+}
+
+function parseIncludeFiles(block: string): string[] {
+  const results: string[] = [];
+  const re = /<includeFile\s+path="([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(block)) !== null) {
+    const p = m[1].trim();
+    if (p) results.push(p);
+  }
+  return results;
+}
+
+function parseExcludeFiles(block: string): string[] {
+  const results: string[] = [];
+  const re = /<excludeFile\s+path="([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(block)) !== null) {
+    const p = m[1].trim();
+    if (p) results.push(p);
+  }
+  return results;
+}
+
+function buildFileIndex(files: FileMap): Map<string, any> {
+  const index = new Map<string, any>();
+  for (const [rawPath, entry] of Object.entries(files)) {
+    const relPath = stripWorkDirPrefix(rawPath);
+    if (!index.has(relPath)) {
+      index.set(relPath, entry);
+    }
+    if (!index.has(rawPath)) {
+      index.set(rawPath, entry);
+    }
+  }
+  return index;
+}
+
+function removeExcludedFiles(paths: string[], contextFiles: FileMap) {
+  for (const p of paths) {
+    const rel = stripWorkDirPrefix(p);
+    delete (contextFiles as any)[rel];
+    delete (contextFiles as any)[p];
+  }
+}
+
 export async function selectContext(props: {
   messages: Message[];
   files: FileMap;
@@ -42,7 +94,7 @@ export async function selectContext(props: {
 
   const { codeContext } = extractCurrentContext(processedMessages);
 
-  let filePaths = getFilePaths(files || {});
+  const filePaths = getFilePaths(files || {});
 
   let context = "";
   const currentFiles: string[] = [];
@@ -51,15 +103,11 @@ export async function selectContext(props: {
   if (codeContext?.type === "codeContext") {
     const codeContextFiles: string[] = codeContext.files;
 
-    Object.keys(files || {}).forEach((path) => {
-      let relativePath = path;
-
-      if (path.startsWith("/home/project/")) {
-        relativePath = path.replace("/home/project/", "");
-      }
+    Object.keys(files || {}).forEach((rawPath) => {
+      const relativePath = stripWorkDirPrefix(rawPath);
 
       if (codeContextFiles.includes(relativePath)) {
-        contextFiles[relativePath] = (files as any)[path];
+        contextFiles[relativePath] = (files as any)[rawPath];
         currentFiles.push(relativePath);
       }
     });
@@ -79,10 +127,8 @@ export async function selectContext(props: {
 
   const userQuestion = extractTextContent(lastUserMessage);
 
-  const newPaths = filePaths.filter((p) => {
-    const rel = p.startsWith("/home/project/") ? p.replace("/home/project/", "") : p;
-    return !currentFiles.includes(rel);
-  });
+  const currentFilesSet = new Set(currentFiles);
+  const newPaths = filePaths.filter((p) => !currentFilesSet.has(stripWorkDirPrefix(p)));
 
   const prioritized = prioritizePaths(newPaths, userQuestion);
   const batches = chunkArray(prioritized, BATCH_SIZE);
@@ -95,6 +141,8 @@ export async function selectContext(props: {
     const remaining = MAX_CONTEXT_FILES - allIncluded.length;
     if (remaining <= 0) break;
 
+    const batchRelPaths = batch.map(stripWorkDirPrefix);
+
     const resp = await generateText({
       model: getTachyonModel(),
       system: `
@@ -102,7 +150,7 @@ You are a software engineer. You are working on a project. You have access to th
 
 AVAILABLE FILES PATHS
 ---
-${batch.map((path) => `- ${path}`).join("\n")}
+${batchRelPaths.map((p) => `- ${p}`).join("\n")}
 ---
 
 You have following code loaded in the context buffer that you can refer to:
@@ -152,42 +200,36 @@ CRITICAL RULES:
     if (batchIdx === batches.length - 1 && onFinish) onFinish(resp);
 
     const response = resp.text || "";
-    const updateContextBuffer = response.match(/<updateContextBuffer>([\s\S]*?)<\/updateContextBuffer>/);
+    const match = response.match(/<updateContextBuffer>([\s\S]*?)<\/updateContextBuffer>/);
 
-    if (!updateContextBuffer) {
+    if (!match) {
       logger.warn(`selectContext batch ${batchIdx} invalid response, skipping`);
       continue;
     }
 
-    const includeFiles =
-      updateContextBuffer[1]
-        .match(/<includeFile path="(.*?)"/gm)
-        ?.map((x) => x.replace('<includeFile path="', "").replace('"', "")) || [];
-
-    const excludeFiles =
-      updateContextBuffer[1]
-        .match(/<excludeFile path="(.*?)"/gm)
-        ?.map((x) => x.replace('<excludeFile path="', "").replace('"', "")) || [];
-
-    allIncluded.push(...includeFiles);
-    allExcluded.push(...excludeFiles);
+    allIncluded.push(...parseIncludeFiles(match[1]));
+    allExcluded.push(...parseExcludeFiles(match[1]));
   }
 
-  excludeFiles(allExcluded, contextFiles);
+  removeExcludedFiles(allExcluded, contextFiles);
 
   const filteredFiles: FileMap = {};
+  const fileIndex = buildFileIndex(files);
 
-  allIncluded.forEach((path) => {
-    const fullPath = path.startsWith("/home/project/") ? path : `/home/project/${path}`;
+  allIncluded.forEach((rawPath) => {
+    const relPath = stripWorkDirPrefix(rawPath);
 
-    if (!filePaths.includes(fullPath) && !filePaths.includes(path)) {
-      logger.error(`File ${path} is not in AVAILABLE FILES PATHS`);
+    if (currentFilesSet.has(relPath)) return;
+
+    const entry = fileIndex.get(relPath) ?? fileIndex.get(rawPath);
+    if (!entry) {
+      logger.warn(`selectContext: LLM included unknown file "${relPath}", skipping`);
       return;
     }
 
-    if (currentFiles.includes(path)) return;
-
-    filteredFiles[path] = (files as any)[fullPath] || (files as any)[path];
+    if (!filteredFiles[relPath]) {
+      filteredFiles[relPath] = entry;
+    }
   });
 
   const totalFiles = Object.keys(filteredFiles).length;
@@ -200,23 +242,18 @@ CRITICAL RULES:
   return filteredFiles;
 }
 
-function excludeFiles(paths: string[], contextFiles: FileMap) {
-  for (const path of paths) {
-    delete (contextFiles as any)[path];
-  }
-}
-
 function prioritizePaths(paths: string[], query: string): string[] {
   const queryLower = query.toLowerCase();
   const queryTokens = queryLower.split(/\W+/).filter((t) => t.length > 2);
 
   const scored = paths.map((p) => {
-    const relPath = p.startsWith("/home/project/") ? p.replace("/home/project/", "") : p;
-    const parts = relPath.toLowerCase().split(/[/._-]/);
+    const relPath = stripWorkDirPrefix(p).toLowerCase();
+    const parts = relPath.split(/[/._-]/);
     let score = 0;
 
     for (const token of queryTokens) {
       if (parts.some((part) => part.includes(token))) score += 30;
+      if (parts.some((part) => part === token)) score += 20;
     }
 
     const ext = relPath.split(".").pop() || "";
@@ -247,7 +284,7 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
 export function getFilePaths(files: FileMap) {
   let filePaths = Object.keys(files || {});
   filePaths = filePaths.filter((x) => {
-    const relPath = x.replace("/home/project/", "");
+    const relPath = stripWorkDirPrefix(x);
     return !ig.ignores(relPath);
   });
   return filePaths;

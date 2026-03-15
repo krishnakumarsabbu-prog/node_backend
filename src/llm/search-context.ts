@@ -23,6 +23,17 @@ interface SearchContextProps {
 
 let materializePromise: Promise<void> | null = null;
 
+function toRelPath(filePath: string): string {
+  const prefix = WORK_DIR.endsWith("/") ? WORK_DIR : WORK_DIR + "/";
+  if (filePath.startsWith(prefix)) {
+    return filePath.slice(prefix.length);
+  }
+  if (filePath.startsWith("/")) {
+    return filePath.slice(1);
+  }
+  return filePath;
+}
+
 async function materializeFileMapToDisk(files: FileMap): Promise<void> {
   if (materializePromise) {
     return materializePromise;
@@ -39,11 +50,12 @@ async function materializeFileMapToDisk(files: FileMap): Promise<void> {
       for (const [filePath, entry] of Object.entries(files)) {
         if (!entry || entry.type !== "file" || entry.isBinary) continue;
 
-        const relPath = filePath.startsWith(WORK_DIR + "/")
-          ? filePath.replace(WORK_DIR + "/", "")
-          : filePath.startsWith("/")
-            ? filePath.slice(1)
-            : filePath;
+        const relPath = toRelPath(filePath);
+
+        if (!relPath || relPath.startsWith("/")) {
+          logger.warn(`materializeFileMapToDisk: skipping suspicious path "${filePath}"`);
+          continue;
+        }
 
         const dest = path.join(INDEX_TEMP_DIR, relPath);
         const dir = path.dirname(dest);
@@ -51,7 +63,7 @@ async function materializeFileMapToDisk(files: FileMap): Promise<void> {
         writeOps.push(
           fs.mkdir(dir, { recursive: true })
             .then(() => fs.writeFile(dest, entry.content || "", "utf-8"))
-            .catch(() => {})
+            .catch((err) => { logger.warn(`Failed to write ${relPath}:`, err); })
         );
         queued++;
       }
@@ -73,16 +85,18 @@ function buildQueryVariants(userQuestion: string): string[] {
   const base = userQuestion.trim();
   const variants: string[] = [base];
 
-  const tokens = base.split(/\W+/).filter((t) => t.length > 3);
+  const tokens = base.split(/\W+/).filter((t) => t.length > 2);
   if (tokens.length > 3) {
-    variants.push(tokens.slice(0, Math.ceil(tokens.length / 2)).join(" "));
-    variants.push(tokens.slice(Math.floor(tokens.length / 2)).join(" "));
+    const firstHalf = tokens.slice(0, Math.ceil(tokens.length / 2)).join(" ");
+    const secondHalf = tokens.slice(Math.floor(tokens.length / 2)).join(" ");
+    if (firstHalf !== base) variants.push(firstHalf);
+    if (secondHalf !== base && secondHalf !== firstHalf) variants.push(secondHalf);
   }
 
-  const actionWords = ["implement", "create", "update", "fix", "refactor", "add", "remove", "modify", "build"];
+  const actionWords = new Set(["implement", "create", "update", "fix", "refactor", "add", "remove", "modify", "build"]);
   const withoutActions = base
     .split(" ")
-    .filter((w) => !actionWords.includes(w.toLowerCase()))
+    .filter((w) => !actionWords.has(w.toLowerCase()))
     .join(" ");
   if (withoutActions !== base && withoutActions.trim().length > 5) {
     variants.push(withoutActions);
@@ -103,9 +117,7 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
     const codeContextFiles: string[] = codeContext.files;
 
     Object.keys(files || {}).forEach((fullPath) => {
-      const relPath = fullPath.startsWith(`${WORK_DIR}/`)
-        ? fullPath.replace(`${WORK_DIR}/`, "")
-        : fullPath;
+      const relPath = toRelPath(fullPath);
 
       if (codeContextFiles.includes(relPath)) {
         contextFiles[relPath] = (files as any)[fullPath];
@@ -131,7 +143,12 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
     if (!getIndex()) {
       logger.info("searchContext: no index, materializing file map to disk then building index...");
       await materializeFileMapToDisk(files);
-      buildIndex(INDEX_TEMP_DIR);
+      try {
+        buildIndex(INDEX_TEMP_DIR);
+      } catch (buildErr) {
+        logger.error("searchContext: index build failed:", buildErr);
+        throw buildErr;
+      }
     }
 
     const queryVariants = buildQueryVariants(userQuestion);
@@ -139,26 +156,40 @@ export async function searchContext(props: SearchContextProps): Promise<FileMap>
     const relevantPaths: string[] = [];
 
     for (const variant of queryVariants) {
+      if (relevantPaths.length >= MAX_HYBRID_FILES) break;
       const batchSize = Math.ceil(MAX_HYBRID_FILES / queryVariants.length);
       const found = searchWithGraph(variant, batchSize, GRAPH_EXPANSION_DEPTH);
       for (const p of found) {
         if (!seenPaths.has(p)) {
           seenPaths.add(p);
           relevantPaths.push(p);
+          if (relevantPaths.length >= MAX_HYBRID_FILES) break;
         }
-        if (relevantPaths.length >= MAX_HYBRID_FILES) break;
       }
-      if (relevantPaths.length >= MAX_HYBRID_FILES) break;
     }
 
     logger.info(`searchContext (hybrid multi-pass): found ${relevantPaths.length} unique relevant paths across ${queryVariants.length} query variants`);
 
     const newFiles: FileMap = {};
-    for (const relPath of relevantPaths) {
-      const fullPath = `${WORK_DIR}/${relPath}`;
-      const entry = (files as any)[fullPath] || (files as any)[relPath];
-      if (entry) {
-        newFiles[relPath] = entry;
+    for (const indexRelPath of relevantPaths) {
+      const candidates = [
+        `${WORK_DIR}/${indexRelPath}`,
+        indexRelPath,
+        `/${indexRelPath}`,
+      ];
+
+      let found = false;
+      for (const candidate of candidates) {
+        const entry = (files as any)[candidate];
+        if (entry) {
+          newFiles[indexRelPath] = entry;
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        logger.debug(`searchContext: no FileMap entry for index path "${indexRelPath}"`);
       }
     }
 

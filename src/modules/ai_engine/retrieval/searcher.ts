@@ -1,32 +1,23 @@
 import { FileNode, SearchResult } from '../types/index.js'
 
-interface TokenScore {
-  token: string
-  count: number
-  positions: number[]
-}
-
 const IDF_SMOOTHING = 1.0
 const BM25_K1 = 1.5
 const BM25_B = 0.75
 
 function buildIdf(query: string[], files: FileNode[]): Map<string, number> {
-  const df = new Map<string, number>()
   const N = files.length
+  const idf = new Map<string, number>()
 
   for (const token of query) {
     let count = 0
     for (const file of files) {
-      const content = (file.content + ' ' + file.name + ' ' + file.symbols.map(s => s.name).join(' ')).toLowerCase()
+      const symbolNames = (file.symbols || []).map(s => s.name).join(' ')
+      const content = (file.content + ' ' + file.name + ' ' + symbolNames).toLowerCase()
       if (content.includes(token)) count++
     }
-    df.set(token, count)
-  }
-
-  const idf = new Map<string, number>()
-  for (const [token, count] of df.entries()) {
     idf.set(token, Math.log((N - count + IDF_SMOOTHING) / (count + IDF_SMOOTHING) + 1))
   }
+
   return idf
 }
 
@@ -37,11 +28,11 @@ function bm25Score(tf: number, idf: number, docLength: number, avgDocLength: num
 }
 
 export function searchFiles(query: string, files: FileNode[]): SearchResult[] {
+  if (!query || !files || files.length === 0) return []
+
   const queryTokens = tokenize(query.toLowerCase())
 
-  if (queryTokens.length === 0 || files.length === 0) {
-    return []
-  }
+  if (queryTokens.length === 0) return []
 
   const avgDocLength = files.reduce((acc, f) => acc + tokenize(f.content.toLowerCase()).length, 0) / files.length
   const idf = buildIdf(queryTokens, files)
@@ -78,6 +69,8 @@ function calculateFileScore(
   const pathLower = file.path.toLowerCase()
   const contentLower = file.content.toLowerCase()
 
+  const fileNameTokens = new Set(tokenize(fileNameLower))
+  const pathTokens = new Set(tokenize(pathLower))
   const contentTokens = tokenize(contentLower)
   const docLength = contentTokens.length
 
@@ -89,26 +82,26 @@ function calculateFileScore(
   for (const queryToken of queryTokens) {
     const tokenIdf = idf.get(queryToken) || 0
 
-    if (fileNameLower.includes(queryToken)) {
+    const exactTokenInName = fileNameTokens.has(queryToken)
+    const substringInName = !exactTokenInName && fileNameLower.includes(queryToken)
+
+    if (exactTokenInName) {
+      totalScore += 80 * (1 + tokenIdf)
+      reasons.push(`Exact token match in filename: "${queryToken}"`)
+    } else if (substringInName) {
       totalScore += 50 * (1 + tokenIdf)
       reasons.push(`Filename contains "${queryToken}"`)
     }
 
-    const fileNameTokens = tokenize(fileNameLower)
-    if (fileNameTokens.includes(queryToken)) {
-      totalScore += 30 * (1 + tokenIdf)
-      reasons.push(`Exact token match in filename: "${queryToken}"`)
-    }
+    const exactTokenInPath = pathTokens.has(queryToken)
+    const substringInPath = !exactTokenInPath && pathLower.includes(queryToken)
 
-    if (pathLower.includes(queryToken)) {
+    if (exactTokenInPath) {
       totalScore += 20
-      reasons.push(`Path contains "${queryToken}"`)
-    }
-
-    const pathTokens = tokenize(pathLower)
-    if (pathTokens.includes(queryToken)) {
-      totalScore += 10
       reasons.push(`Token in path: "${queryToken}"`)
+    } else if (substringInPath) {
+      totalScore += 10
+      reasons.push(`Path contains "${queryToken}"`)
     }
 
     const tf = tfMap.get(queryToken) || 0
@@ -118,7 +111,8 @@ function calculateFileScore(
       reasons.push(`BM25 match "${queryToken}" (tf=${tf}, score=${bm25.toFixed(2)})`)
     }
 
-    for (const symbol of file.symbols) {
+    const symbols = file.symbols || []
+    for (const symbol of symbols) {
       const symbolLower = symbol.name.toLowerCase()
       if (symbolLower.includes(queryToken)) {
         const exactSymbolMatch = symbolLower === queryToken
@@ -127,7 +121,8 @@ function calculateFileScore(
       }
     }
 
-    for (const imp of file.imports) {
+    const imports = file.imports || []
+    for (const imp of imports) {
       if (imp.toLowerCase().includes(queryToken)) {
         totalScore += 5 * (1 + tokenIdf * 0.3)
         reasons.push(`Import contains "${queryToken}"`)
@@ -166,29 +161,15 @@ function tokenize(text: string): string[] {
     .filter(token => token.length > 1)
 }
 
-function countOccurrences(text: string, substring: string): number {
-  let count = 0
-  let position = 0
-
-  while ((position = text.indexOf(substring, position)) !== -1) {
-    count++
-    position += substring.length
-  }
-
-  return count
-}
-
 export function searchBySymbol(symbolName: string, files: FileNode[]): FileNode[] {
+  const nameLower = symbolName.toLowerCase()
   const results: FileNode[] = []
 
   for (const file of files) {
-    const hasSymbol = file.symbols.some(symbol =>
-      symbol.name.toLowerCase().includes(symbolName.toLowerCase())
+    const hasSymbol = (file.symbols || []).some(symbol =>
+      symbol.name.toLowerCase().includes(nameLower)
     )
-
-    if (hasSymbol) {
-      results.push(file)
-    }
+    if (hasSymbol) results.push(file)
   }
 
   return results
@@ -214,7 +195,7 @@ export function reRankResults(results: SearchResult[], query: string): SearchRes
     const queryTokensInPath = queryTokens.filter(t => pathParts.some(p => p.includes(t)))
     boost += queryTokensInPath.length * 8
 
-    const symbolMatchCount = result.file.symbols.filter(s =>
+    const symbolMatchCount = (result.file.symbols || []).filter(s =>
       queryTokens.some(t => s.name.toLowerCase().includes(t))
     ).length
     if (symbolMatchCount > 0) boost += symbolMatchCount * 12

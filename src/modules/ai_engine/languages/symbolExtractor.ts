@@ -21,7 +21,8 @@ const SYMBOL_PATTERNS: Record<string, RegExp[]> = {
     /^def\s+(\w+)\s*\(/gm,
     /^async\s+def\s+(\w+)\s*\(/gm,
     /^class\s+(\w+)/gm,
-    /^\s{4}def\s+(\w+)\s*\(/gm
+    /^[ \t]+def\s+(\w+)\s*\(/gm,
+    /^[ \t]+async\s+def\s+(\w+)\s*\(/gm
   ],
   java: [
     /(?:public|private|protected)?\s*(?:static\s+)?(?:\w+\s+)?(\w+)\s*\([^)]*\)\s*\{/gm,
@@ -93,47 +94,53 @@ const SYMBOL_PATTERNS: Record<string, RegExp[]> = {
   ]
 }
 
-function determineSymbolType(match: string, pattern: string): Symbol['type'] {
-  if (pattern.includes('class')) return 'class'
-  if (pattern.includes('interface') || pattern.includes('trait') || pattern.includes('protocol')) return 'interface'
-  if (pattern.includes('function') || pattern.includes('def') || pattern.includes('fn')) return 'function'
-  if (pattern.includes('const')) return 'constant'
-  if (pattern.includes('type') || pattern.includes('typedef')) return 'type'
+function determineSymbolType(matchedText: string, patternSource: string): Symbol['type'] {
+  const src = patternSource
+  const text = matchedText
+
+  if (src.includes('class') && /\bclass\b/.test(text)) return 'class'
+  if (src.includes('interface') && /\b(?:interface|protocol|trait)\b/.test(text)) return 'interface'
+  if (src.includes('type') && /\btype\b/.test(text)) return 'type'
+  if (src.includes('const') && /\bconst\b/.test(text)) return 'constant'
+  if (src.includes('enum') && /\benum\b/.test(text)) return 'type'
+  if (src.includes('struct') && /\bstruct\b/.test(text)) return 'class'
+  if (src.includes('namespace') && /\bnamespace\b/.test(text)) return 'class'
+  if (src.includes('module') && /\bmodule\b/.test(text)) return 'class'
+  if (src.includes('object') && /\bobject\b/.test(text)) return 'class'
+  if (src.includes('function') || src.includes('def') || src.includes('fn') || src.includes('func') || src.includes('fun')) return 'function'
+
   return 'function'
 }
 
 export function extractSymbols(content: string, language: string): Symbol[] {
   const patterns = SYMBOL_PATTERNS[language] || []
   const symbols: Symbol[] = []
-  const seenSymbols = new Set<string>()
-  const lines = content.split('\n')
+  const seenKeys = new Set<string>()
 
   for (const pattern of patterns) {
-    pattern.lastIndex = 0
-    const matches = content.matchAll(pattern)
+    const cloned = new RegExp(pattern.source, pattern.flags)
+    cloned.lastIndex = 0
 
-    for (const match of matches) {
-      if (match[1] && match.index !== undefined) {
-        const symbolName = match[1]
+    let match: RegExpExecArray | null
+    while ((match = cloned.exec(content)) !== null) {
+      const symbolName = match[1]
+      if (!symbolName) continue
 
-        if (seenSymbols.has(symbolName)) {
-          continue
-        }
+      const beforeMatch = content.substring(0, match.index)
+      const lineNumber = beforeMatch.split('\n').length
 
-        const beforeMatch = content.substring(0, match.index)
-        const lineNumber = beforeMatch.split('\n').length
+      const symbolType = determineSymbolType(match[0], cloned.source)
 
-        const symbolType = determineSymbolType(match[0], pattern.source)
+      const dedupeKey = `${symbolName}:${symbolType}:${lineNumber}`
+      if (seenKeys.has(dedupeKey)) continue
+      seenKeys.add(dedupeKey)
 
-        symbols.push({
-          name: symbolName,
-          type: symbolType,
-          line: lineNumber,
-          signature: match[0].trim().split('\n')[0]
-        })
-
-        seenSymbols.add(symbolName)
-      }
+      symbols.push({
+        name: symbolName,
+        type: symbolType,
+        line: lineNumber,
+        signature: match[0].trim().split('\n')[0].slice(0, 200)
+      })
     }
   }
 

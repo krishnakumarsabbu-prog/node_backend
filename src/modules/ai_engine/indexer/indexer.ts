@@ -17,15 +17,28 @@ export function indexRepository(rootPath: string): RepositoryIndex {
 
     try {
       file.imports = extractImports(file.content, file.language)
+    } catch (error) {
+      console.warn(`Error extracting imports from ${file.path}:`, error)
+      file.imports = []
+    }
+
+    try {
       file.symbols = extractSymbols(file.content, file.language)
     } catch (error) {
-      console.warn(`Error processing file ${file.path}:`, error)
+      console.warn(`Error extracting symbols from ${file.path}:`, error)
+      file.symbols = []
     }
   })
 
   console.log('Building dependency graph...')
-  const graph = buildDependencyGraph(files)
-  console.log(`Graph: ${graph.nodes.length} nodes, ${graph.edges.length} edges`)
+  let graph
+  try {
+    graph = buildDependencyGraph(files)
+    console.log(`Graph: ${graph.nodes.length} nodes, ${graph.edges.length} edges`)
+  } catch (error) {
+    console.error('Dependency graph build failed, using empty graph:', error)
+    graph = { nodes: [], edges: [] }
+  }
 
   console.log('Computing statistics...')
   const statistics = computeStatistics(files)
@@ -45,10 +58,9 @@ function computeStatistics(files: FileNode[]): IndexStatistics {
   files.forEach(file => {
     languageDistribution[file.language] = (languageDistribution[file.language] || 0) + 1
 
-    const lines = file.content.split('\n').length
-    totalLines += lines
+    totalLines += (file.content.match(/\n/g)?.length ?? 0) + 1
 
-    symbolCount += file.symbols.length
+    symbolCount += (file.symbols || []).length
   })
 
   return {
