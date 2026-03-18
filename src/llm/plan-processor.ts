@@ -580,11 +580,12 @@ const GRAPH_SEARCH_MAX_FILES = 40;
 const GRAPH_SEARCH_DEPTH = 3;
 
 /**
- * How many files the LLM must select before switching to file-per-step mode.
- * Set to 1 so that ANY non-trivial request with file selection uses file-per-step,
- * giving users full per-file progress visibility.
+ * Minimum number of files the LLM must select before switching to file-per-step
+ * batch mode. Below this threshold the request is handled as a single architectural
+ * topic pass via generateStepsFromQuestion, which is better for focused changes.
+ * At or above this threshold every file gets its own step for full progress visibility.
  */
-const FILE_PER_STEP_THRESHOLD = 1;
+const FILE_PER_STEP_THRESHOLD = 10;
 
 
 export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void> {
@@ -693,14 +694,14 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
     // Step 2: decide execution mode
     if (selectedFileList.length >= FILE_PER_STEP_THRESHOLD) {
-      // One step per file — gives per-file progress visibility
+      // Large batch: one step per file for full per-file progress visibility
       executionMode = "files";
       steps = await generateFileSteps(userQuestion!, selectedFileList);
-      logger.info(`[${requestId}] Execution mode: file-per-step (${steps.length} files)`);
+      logger.info(`[${requestId}] Execution mode: file-per-step (${steps.length} files >= threshold ${FILE_PER_STEP_THRESHOLD})`);
     } else {
-      // LLM could not pinpoint specific files → generate architectural topic steps
+      // Small/zero file list: use architectural topic steps — LLM reasons holistically
       executionMode = "steps";
-      logger.info(`[${requestId}] Execution mode: topic-steps (file selector returned 0 files)`);
+      logger.info(`[${requestId}] Execution mode: topic-steps (${selectedFileList.length} files < threshold ${FILE_PER_STEP_THRESHOLD})`);
 
       try {
         steps = await generateStepsFromQuestion(userQuestion!, onUsage);
