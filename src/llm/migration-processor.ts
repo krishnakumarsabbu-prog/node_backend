@@ -169,7 +169,7 @@ MIGRATION DOCUMENT:
 ${migrationDocument}
 </migration>
 
-Parse the Migration.md and produce the ordered step list. Every file listed in the migration document must appear in exactly one step. All output paths must start with migrate/.
+Generate executable migration steps where each step explicitly converts original files into Spring Boot files. Do not summarize — produce transformation instructions. Every file listed in the migration document must appear in exactly one step. All output paths must start with migrate/.
 `,
   });
 
@@ -517,16 +517,94 @@ function buildMigrationFileContext(step: MigrationStep, files: FileMap): string 
 
 const MIGRATION_STEP_INSTRUCTIONS = `## Migration Execution Rules
 
-You are creating files in a fresh migrate/ project. Apply these rules strictly:
+You are performing a REAL framework migration from Spring Web MVC (XML-based) to Spring Boot.
 
-- Create COMPLETE, production-ready files — no stubs, no TODOs, no placeholders
-- ALL output file paths MUST start with migrate/ (e.g. migrate/pom.xml, migrate/src/main/java/...)
-- Port 100% of the business logic from the original source files — do NOT drop any features
-- Preserve method signatures, class names, package structure, and annotations exactly as described
-- Use the target framework's idioms (e.g. Spring Boot annotations instead of Spring MVC XML config)
-- Each file must compile and import correctly relative to the other migrate/ files
+CORE RULE:
+You MUST follow this flow for EVERY file:
+1. READ the original file content (provided above)
+2. UNDERSTAND its behavior and purpose
+3. TRANSFORM it into Spring Boot equivalent
+4. CREATE the new file under migrate/
 
-No shell commands. No npm installs. Output only file changes using <cortexAction type="file"> blocks.`;
+---
+
+## TRANSFORMATION REQUIREMENTS
+
+DO NOT copy code blindly
+DO NOT recreate XML
+ALWAYS convert to Spring Boot style
+
+---
+
+## XML -> SPRING BOOT (MANDATORY)
+
+When handling XML files:
+
+### web.xml
+- DO NOT recreate this file
+- Create: migrate/src/main/java/.../Application.java
+- Add: @SpringBootApplication and public static void main(String[] args)
+- DispatcherServlet is auto-configured; embedded Tomcat replaces servlet container
+
+### dispatcher-servlet.xml
+- DO NOT copy XML
+- Convert to @Configuration class OR remove if Spring Boot auto-config handles it
+- Component scan -> @SpringBootApplication
+- View resolver -> application.properties or config class
+
+### applicationContext.xml
+For EACH <bean>:
+- If it's a service/dao: Convert to @Service / @Repository
+- If it's infrastructure: Create @Configuration class with @Bean methods
+
+### properties / placeholders
+- Move ALL values to: migrate/src/main/resources/application.properties
+
+---
+
+## JAVA FILE TRANSFORMATION
+
+For EACH Java file:
+- Port ALL business logic EXACTLY
+- Update imports and annotations (@Controller -> @RestController if needed)
+- Update dependency injection (XML wiring -> @Autowired or constructor injection)
+- Controllers: ensure @RestController or @Controller with proper @RequestMapping
+
+---
+
+## OUTPUT RULES
+
+- ALL files MUST be created under migrate/
+- Use FULL paths like: migrate/src/main/java/com/example/service/UserService.java
+- Each file must be complete, compilable, and production-ready
+
+---
+
+## CONTEXT AWARENESS
+
+- Use "Original source files to port" as the source of truth
+- If a file already exists in migrate/, EXTEND it — do NOT recreate
+
+---
+
+## FORBIDDEN
+
+- Creating empty files
+- Skipping business logic
+- Copying XML directly
+- Writing pseudo-code or TODOs
+
+---
+
+## OUTPUT FORMAT
+
+ONLY output file changes using:
+
+<cortexAction type="file" filePath="migrate/...">
+...FULL FILE CONTENT...
+</cortexAction>
+
+No explanations. No markdown.`;
 
 async function executeMigrationStep(opts: {
   requestId: string;
