@@ -3,6 +3,7 @@ import optimized from './prompts/optimized';
 import { getFineTunedPrompt } from './prompts/new-prompt';
 import { DesignScheme } from '../../types/design-scheme';
 import { getPlanPrompt, getPlanTestPrompt } from './prompts/plan-prompt';
+import { getMigrationPrompt } from './prompts/migration-prompt';
 
 export interface PromptOptions {
   cwd: string;
@@ -52,6 +53,11 @@ export class PromptLibrary {
       label: 'Plan Test Generation Prompt',
       description: 'Plan mode variant that explicitly allows and requires test file generation',
       get: (options) => getPlanTestPrompt(options.cwd, options.supabase, options.designScheme),
+    },
+    migration: {
+      label: 'Migration Implementation Prompt',
+      description: 'Migration mode — generates only files under migrate/, enforces framework porting rules',
+      get: (options) => getMigrationPrompt(options.cwd, options.supabase),
     },
   };
   static getList() {

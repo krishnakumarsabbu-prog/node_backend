@@ -153,10 +153,12 @@ export async function streamText(props: {
     }) ?? getSystemPrompt();
 
   const isPlanMode = promptId === "plan" || promptId === "plan-test";
+  const isMigrationMode = promptId === "migration";
 
   const shouldInjectContext = contextFiles && (
     (chatMode === "build" && contextOptimization) ||
-    isPlanMode
+    isPlanMode ||
+    isMigrationMode
   );
 
   if (shouldInjectContext) {
