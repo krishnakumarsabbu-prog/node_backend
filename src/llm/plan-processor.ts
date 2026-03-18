@@ -374,6 +374,91 @@ async function streamStep(opts: {
   return { stepText: "", succeeded: false };
 }
 
+function isTestFile(filePath: string): boolean {
+  return (
+    /\.(test|spec)\.[tj]sx?$/.test(filePath) ||
+    /(^|\/)(__tests__|tests?)\//i.test(filePath)
+  );
+}
+
+function STEP_EXECUTION_INSTRUCTIONS(stepIndex: number): string {
+  return [
+    `## Execution Rules for Step ${stepIndex}`,
+    ``,
+    `You are an expert software engineer. Apply the following rules strictly:`,
+    ``,
+    `**For NEW files being created:**`,
+    `- Generate the complete, production-ready implementation — not a stub or skeleton`,
+    `- Include all necessary imports, exports, types, error handling, and edge cases`,
+    `- Design the file as an architect would: correct structure, clean abstractions, idiomatic patterns for the language/framework`,
+    ``,
+    `**For EXISTING files being modified:**`,
+    `- Make ONLY the changes required by this step — do not rewrite or restructure unrelated code`,
+    `- Preserve all existing logic, formatting, and comments outside the changed area`,
+    `- Surgical precision: change what must change, leave everything else intact`,
+    ``,
+    `**For TEST files (new or existing):**`,
+    `- Cover all meaningful scenarios: happy path, edge cases, boundary conditions, error/failure paths`,
+    `- Each test must be independently readable and clearly named`,
+    `- Mock external dependencies; test behavior, not implementation details`,
+    `- Aim for full branch coverage on the code under test`,
+    ``,
+    `No shell commands. No npm installs. Output only file changes.`,
+  ].join("\n");
+}
+
+function FILE_STEP_EXECUTION_INSTRUCTIONS(filePath: string, fileExists: boolean, userQuestion: string): string {
+  const isTest = isTestFile(filePath);
+
+  if (isTest) {
+    return [
+      `## Execution Rules — Test File: ${filePath}`,
+      ``,
+      `You are writing a comprehensive test suite. Apply these rules:`,
+      ``,
+      `- Cover ALL meaningful scenarios: happy path, every edge case, boundary values, and all failure/error paths`,
+      `- Name each test so it reads like a specification ("should return X when Y")`,
+      `- Mock all external dependencies (network, filesystem, databases, third-party modules)`,
+      `- Test observable behavior, not internal implementation details`,
+      `- Each test must be fully self-contained and able to run in isolation`,
+      `- Aim for complete branch coverage of the code under test`,
+      `- ${fileExists ? `Extend the existing test file — preserve passing tests, add missing coverage` : `Create the full test suite from scratch for this file`}`,
+      ``,
+      `No shell commands. No npm installs. Output only this file.`,
+    ].join("\n");
+  }
+
+  if (!fileExists) {
+    return [
+      `## Execution Rules — New File: ${filePath}`,
+      ``,
+      `You are creating this file from scratch. Apply these rules:`,
+      ``,
+      `- Generate the COMPLETE, production-ready implementation — not a stub, not a placeholder`,
+      `- Think as an architect: what is the full responsibility of this file given the request "${userQuestion}"?`,
+      `- Include all imports, exports, types, interfaces, error handling, and edge case logic`,
+      `- Follow the naming conventions, code style, and patterns already established in this project`,
+      `- Do not leave TODOs or placeholder comments — implement everything this file needs to do`,
+      ``,
+      `No shell commands. No npm installs. Output only this file.`,
+    ].join("\n");
+  }
+
+  return [
+    `## Execution Rules — Modifying Existing File: ${filePath}`,
+    ``,
+    `You are modifying this file. Apply these rules:`,
+    ``,
+    `- Make ONLY the changes required to fulfill the current task`,
+    `- Do NOT rewrite, reformat, or restructure code that is not part of this change`,
+    `- Preserve all existing logic, variable names, comments, and code style outside the changed area`,
+    `- Surgical precision: if only one function needs to change, only that function changes`,
+    `- Do not add or remove imports unless directly required by your change`,
+    ``,
+    `No shell commands. No npm installs. Output only this file.`,
+  ].join("\n");
+}
+
 function buildTopicStepMessages(
   messages: Messages,
   steps: PlanStep[],
@@ -419,7 +504,7 @@ function buildTopicStepMessages(
           ? `## Do NOT implement yet (upcoming steps):\n${remainingSteps}`
           : `## This is the FINAL step - complete the implementation.`,
         ``,
-        `Generate ONLY the file changes required for Step ${step.index}. No shell commands. No npm installs.`,
+        STEP_EXECUTION_INSTRUCTIONS(step.index),
       ].join("\n"),
     } as any);
   } else {
@@ -447,7 +532,7 @@ function buildTopicStepMessages(
           ? `## Do NOT implement yet (upcoming steps):\n${remainingSteps}`
           : `## This is the ONLY step - complete the full implementation.`,
         ``,
-        `Generate ONLY the file changes required for Step ${step.index}. No shell commands. No npm installs.`,
+        STEP_EXECUTION_INSTRUCTIONS(step.index),
       ].join("\n"),
     } as any);
   }
@@ -511,8 +596,7 @@ function buildFileStepMessages(
       step.details,
       fileContext,
       ``,
-      `Generate ONLY the changes for ${filePath}. Do not modify any other files in this step.`,
-      `No shell commands. No npm installs.`,
+      FILE_STEP_EXECUTION_INSTRUCTIONS(filePath, !!existingFile, userQuestion),
     ]
       .filter(Boolean)
       .join("\n"),
