@@ -220,6 +220,74 @@ Think through the optimal architecture and zero-overlap step order that fully im
   }
 }
 
+function getPackageJsonContent(files: FileMap): string | null {
+  for (const [path, entry] of Object.entries(files)) {
+    const name = path.split("/").pop()?.toLowerCase();
+    if (
+      name === "package.json" &&
+      entry?.type === "file" &&
+      !(entry as any).isBinary &&
+      typeof (entry as any).content === "string"
+    ) {
+      return (entry as any).content;
+    }
+  }
+  return null;
+}
+
+function buildPackageJsonStep(
+  pkgContent: string,
+  planContent: string | null,
+  userQuestion: string | undefined,
+): PlanStep {
+  let projectNameHint = "";
+
+  const nameFromPlan = planContent
+    ? (planContent.match(/^#\s+(.+)/m)?.[1]?.trim() ?? planContent.match(/project[:\s]+([A-Za-z0-9 _-]+)/i)?.[1]?.trim())
+    : null;
+
+  const nameFromQuestion = userQuestion
+    ? userQuestion.match(/(?:app|application|project|site|platform|tool)\s+(?:called|named|for)\s+["']?([A-Za-z0-9 _-]+)["']?/i)?.[1]?.trim()
+    : null;
+
+  const inferredName = nameFromPlan || nameFromQuestion;
+  if (inferredName) {
+    projectNameHint = ` Set the "name" field to "${inferredName.toLowerCase().replace(/\s+/g, "-")}".`;
+  }
+
+  let currentDeps: string[] = [];
+  try {
+    const parsed = JSON.parse(pkgContent);
+    currentDeps = [
+      ...Object.keys(parsed.dependencies ?? {}),
+      ...Object.keys(parsed.devDependencies ?? {}),
+    ];
+  } catch {
+  }
+
+  const currentDepsList = currentDeps.length > 0 ? `\nCurrently installed packages: ${currentDeps.join(", ")}.` : "";
+
+  return {
+    index: 1,
+    heading: "Update package.json — project name and dependencies",
+    details: `Update package.json to reflect this project.${projectNameHint} Review all imports and features described in the plan and add any npm packages that are required but not yet present in dependencies or devDependencies. Do not remove existing packages.${currentDepsList} Output the complete updated package.json file.`,
+  };
+}
+
+function prependPackageJsonStep(
+  steps: PlanStep[],
+  files: FileMap,
+  planContent: string | null,
+  userQuestion: string | undefined,
+): PlanStep[] {
+  const pkgContent = getPackageJsonContent(files);
+  if (!pkgContent) return steps;
+
+  const pkgStep = buildPackageJsonStep(pkgContent, planContent, userQuestion);
+  const reindexed = steps.map((s) => ({ ...s, index: s.index + 1 }));
+  return [pkgStep, ...reindexed];
+}
+
 function buildExistingFileSummary(files?: FileMap): string {
   if (!files || Object.keys(files).length === 0) return "";
 
@@ -1089,6 +1157,11 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         return;
       }
     }
+  }
+
+  steps = prependPackageJsonStep(steps, files, planContent, userQuestion);
+  if (steps[0]?.heading === "Update package.json — project name and dependencies") {
+    logger.info(`[${requestId}] ► Prepended mandatory package.json step (total steps now: ${steps.length})`);
   }
 
   writer.writeData({
