@@ -596,15 +596,7 @@ For EACH Java file:
 
 ---
 
-## OUTPUT FORMAT
-
-ONLY output file changes using:
-
-<cortexAction type="file" filePath="migrate/...">
-...FULL FILE CONTENT...
-</cortexAction>
-
-No explanations. No markdown.`;
+No explanations. No markdown. Output only this file.`;
 
 async function executeMigrationStep(opts: {
   requestId: string;
