@@ -220,57 +220,141 @@ Think through the optimal architecture and zero-overlap step order that fully im
   }
 }
 
-function getPackageJsonContent(files: FileMap): string | null {
-  for (const [path, entry] of Object.entries(files)) {
-    const name = path.split("/").pop()?.toLowerCase();
-    if (
-      name === "package.json" &&
-      entry?.type === "file" &&
-      !(entry as any).isBinary &&
-      typeof (entry as any).content === "string"
-    ) {
-      return (entry as any).content;
+type ProjectEcosystem =
+  | "node"       // package.json  — npm / yarn / pnpm
+  | "java-maven" // pom.xml       — Maven
+  | "java-gradle"// build.gradle / build.gradle.kts — Gradle
+  | "python"     // requirements.txt / pyproject.toml / Pipfile
+  | "rust"       // Cargo.toml
+  | "go"         // go.mod
+  | "dotnet"     // *.csproj / *.fsproj / *.vbproj
+  | "ruby"       // Gemfile
+  | "php"        // composer.json
+  | "swift"      // Package.swift / *.podspec
+  | "dart"       // pubspec.yaml
+  | "elixir"     // mix.exs
+  | "haskell";   // *.cabal / package.yaml
+
+interface DetectedManifest {
+  ecosystem: ProjectEcosystem;
+  path: string;
+  content: string;
+}
+
+const MANIFEST_DETECTORS: Array<{
+  ecosystem: ProjectEcosystem;
+  match: (filename: string) => boolean;
+}> = [
+  { ecosystem: "node",        match: (f) => f === "package.json" },
+  { ecosystem: "java-maven",  match: (f) => f === "pom.xml" },
+  { ecosystem: "java-gradle", match: (f) => f === "build.gradle" || f === "build.gradle.kts" },
+  { ecosystem: "python",      match: (f) => f === "pyproject.toml" || f === "requirements.txt" || f === "pipfile" },
+  { ecosystem: "rust",        match: (f) => f === "cargo.toml" },
+  { ecosystem: "go",          match: (f) => f === "go.mod" },
+  { ecosystem: "dotnet",      match: (f) => f.endsWith(".csproj") || f.endsWith(".fsproj") || f.endsWith(".vbproj") },
+  { ecosystem: "ruby",        match: (f) => f === "gemfile" },
+  { ecosystem: "php",         match: (f) => f === "composer.json" },
+  { ecosystem: "swift",       match: (f) => f === "package.swift" || f.endsWith(".podspec") },
+  { ecosystem: "dart",        match: (f) => f === "pubspec.yaml" },
+  { ecosystem: "elixir",      match: (f) => f === "mix.exs" },
+  { ecosystem: "haskell",     match: (f) => f.endsWith(".cabal") || f === "package.yaml" },
+];
+
+function detectProjectManifest(files: FileMap): DetectedManifest | null {
+  for (const detector of MANIFEST_DETECTORS) {
+    for (const [path, entry] of Object.entries(files)) {
+      const filename = path.split("/").pop()?.toLowerCase() ?? "";
+      if (
+        detector.match(filename) &&
+        entry?.type === "file" &&
+        !(entry as any).isBinary &&
+        typeof (entry as any).content === "string"
+      ) {
+        return { ecosystem: detector.ecosystem, path, content: (entry as any).content };
+      }
     }
   }
   return null;
 }
 
-function buildPackageJsonStep(
-  pkgContent: string,
+function inferProjectName(
   planContent: string | null,
   userQuestion: string | undefined,
-): PlanStep {
-  let projectNameHint = "";
-
+): string | null {
   const nameFromPlan = planContent
-    ? (planContent.match(/^#\s+(.+)/m)?.[1]?.trim() ?? planContent.match(/project[:\s]+([A-Za-z0-9 _-]+)/i)?.[1]?.trim())
+    ? (planContent.match(/^#\s+(.+)/m)?.[1]?.trim() ??
+       planContent.match(/project[:\s]+([A-Za-z0-9 _-]+)/i)?.[1]?.trim())
     : null;
 
   const nameFromQuestion = userQuestion
-    ? userQuestion.match(/(?:app|application|project|site|platform|tool)\s+(?:called|named|for)\s+["']?([A-Za-z0-9 _-]+)["']?/i)?.[1]?.trim()
+    ? userQuestion.match(
+        /(?:app|application|project|site|platform|tool|service|api|library|module)\s+(?:called|named|for)\s+["']?([A-Za-z0-9 _-]+)["']?/i,
+      )?.[1]?.trim()
     : null;
 
-  const inferredName = nameFromPlan || nameFromQuestion;
-  if (inferredName) {
-    projectNameHint = ` Set the "name" field to "${inferredName.toLowerCase().replace(/\s+/g, "-")}".`;
-  }
+  return nameFromPlan ?? nameFromQuestion ?? null;
+}
 
-  let currentDeps: string[] = [];
-  try {
-    const parsed = JSON.parse(pkgContent);
-    currentDeps = [
-      ...Object.keys(parsed.dependencies ?? {}),
-      ...Object.keys(parsed.devDependencies ?? {}),
-    ];
-  } catch {
-  }
+const ECOSYSTEM_LABELS: Record<ProjectEcosystem, string> = {
+  "node":        "npm/yarn",
+  "java-maven":  "Maven",
+  "java-gradle": "Gradle",
+  "python":      "pip/Poetry",
+  "rust":        "Cargo",
+  "go":          "Go modules",
+  "dotnet":      ".NET",
+  "ruby":        "Bundler",
+  "php":         "Composer",
+  "swift":       "Swift Package Manager / CocoaPods",
+  "dart":        "pub",
+  "elixir":      "Mix",
+  "haskell":     "Cabal/Stack",
+};
 
-  const currentDepsList = currentDeps.length > 0 ? `\nCurrently installed packages: ${currentDeps.join(", ")}.` : "";
+function buildManifestStepDetails(
+  manifest: DetectedManifest,
+  inferredName: string | null,
+): string {
+  const label = ECOSYSTEM_LABELS[manifest.ecosystem];
+  const nameSlug = inferredName
+    ? inferredName.toLowerCase().replace(/\s+/g, manifest.ecosystem === "java-maven" || manifest.ecosystem === "java-gradle" ? "" : "-")
+    : null;
+
+  const namePart = nameSlug
+    ? ` Set the project name / artifactId to "${nameSlug}".`
+    : "";
+
+  const ecosystemInstructions: Record<ProjectEcosystem, string> = {
+    "node": `Update ${manifest.path}.${namePart} Review the plan and add any missing npm packages to dependencies or devDependencies. Do not remove existing packages. Output the complete updated ${manifest.path}.`,
+    "java-maven": `Update ${manifest.path} (Maven POM).${namePart} Review the plan and add any missing <dependency> entries in <dependencies>. Preserve the existing groupId, version, and plugin configuration. Output the complete updated pom.xml.`,
+    "java-gradle": `Update ${manifest.path} (Gradle build file).${namePart} Review the plan and add any missing implementation/api/testImplementation dependencies in the dependencies block. Do not remove existing entries. Output the complete updated ${manifest.path}.`,
+    "python": `Update ${manifest.path}.${namePart} Review the plan and add any missing Python packages (pip-compatible specifiers). For pyproject.toml, add to [project] dependencies or [tool.poetry.dependencies]. For requirements.txt, append new lines. Do not remove existing packages. Output the complete updated ${manifest.path}.`,
+    "rust": `Update Cargo.toml.${namePart} Review the plan and add any missing crate dependencies under [dependencies] or [dev-dependencies]. Preserve existing versions. Output the complete updated Cargo.toml.`,
+    "go": `Update go.mod.${namePart} Review the plan and add any missing module require directives. Output the complete updated go.mod. Also list any new imports that will need \`go get\` to resolve.`,
+    "dotnet": `Update ${manifest.path} (.NET project file).${namePart} Review the plan and add any missing <PackageReference> entries. Preserve existing package versions and project settings. Output the complete updated ${manifest.path}.`,
+    "ruby": `Update Gemfile.${namePart} Review the plan and add any missing gem declarations. Do not remove existing gems. Output the complete updated Gemfile.`,
+    "php": `Update composer.json.${namePart} Review the plan and add any missing packages to require or require-dev. Preserve existing constraints. Output the complete updated composer.json.`,
+    "swift": `Update ${manifest.path}.${namePart} Review the plan and add any missing Swift package dependencies or pod entries. Output the complete updated ${manifest.path}.`,
+    "dart": `Update pubspec.yaml.${namePart} Review the plan and add any missing packages under dependencies or dev_dependencies. Preserve existing version constraints. Output the complete updated pubspec.yaml.`,
+    "elixir": `Update mix.exs.${namePart} Review the plan and add any missing {:package, "~> version"} entries in the deps/0 function. Output the complete updated mix.exs.`,
+    "haskell": `Update ${manifest.path}.${namePart} Review the plan and add any missing build-depends entries. Output the complete updated ${manifest.path}.`,
+  };
+
+  return ecosystemInstructions[manifest.ecosystem];
+}
+
+function buildManifestStep(
+  manifest: DetectedManifest,
+  planContent: string | null,
+  userQuestion: string | undefined,
+): PlanStep {
+  const inferredName = inferProjectName(planContent, userQuestion);
+  const label = ECOSYSTEM_LABELS[manifest.ecosystem];
 
   return {
     index: 1,
-    heading: "Update package.json — project name and dependencies",
-    details: `Update package.json to reflect this project.${projectNameHint} Review all imports and features described in the plan and add any npm packages that are required but not yet present in dependencies or devDependencies. Do not remove existing packages.${currentDepsList} Output the complete updated package.json file.`,
+    heading: `Update ${manifest.path} — project name and ${label} dependencies`,
+    details: buildManifestStepDetails(manifest, inferredName),
   };
 }
 
@@ -280,12 +364,12 @@ function prependPackageJsonStep(
   planContent: string | null,
   userQuestion: string | undefined,
 ): PlanStep[] {
-  const pkgContent = getPackageJsonContent(files);
-  if (!pkgContent) return steps;
+  const manifest = detectProjectManifest(files);
+  if (!manifest) return steps;
 
-  const pkgStep = buildPackageJsonStep(pkgContent, planContent, userQuestion);
+  const manifestStep = buildManifestStep(manifest, planContent, userQuestion);
   const reindexed = steps.map((s) => ({ ...s, index: s.index + 1 }));
-  return [pkgStep, ...reindexed];
+  return [manifestStep, ...reindexed];
 }
 
 function buildExistingFileSummary(files?: FileMap): string {
