@@ -381,6 +381,31 @@ function isTestFile(filePath: string): boolean {
   );
 }
 
+function resolveSourceFileForTest(testPath: string, files: FileMap): string | null {
+  const stripped = testPath
+    .replace(/\.(test|spec)(\.[tj]sx?)$/, "$2")
+    .replace(/(^|\/)__tests__\//, "$1")
+    .replace(/(^|\/)tests?\//, "$1");
+
+  const candidates = [
+    stripped,
+    stripped.replace(/\.[tj]sx?$/, ".ts"),
+    stripped.replace(/\.[tj]sx?$/, ".tsx"),
+    stripped.replace(/\.[tj]sx?$/, ".js"),
+    stripped.replace(/\.[tj]sx?$/, ".jsx"),
+  ];
+
+  for (const candidate of candidates) {
+    if (files[candidate] && files[candidate].type === "file") return candidate;
+    const withSrc = candidate.startsWith("/home/project/src/")
+      ? candidate
+      : candidate.replace("/home/project/", "/home/project/src/");
+    if (files[withSrc] && files[withSrc].type === "file") return withSrc;
+  }
+
+  return null;
+}
+
 function STEP_EXECUTION_INSTRUCTIONS(stepIndex: number): string {
   return [
     `## Execution Rules for Step ${stepIndex}`,
@@ -568,6 +593,15 @@ function buildFileStepMessages(
       ? `\n\nCurrent content of ${filePath}:\n\`\`\`\n${existingFile.content}\n\`\`\``
       : `\n\n${filePath} does not exist yet — create it from scratch.`;
 
+  const sourceFileContext = (() => {
+    if (!isTestFile(filePath)) return "";
+    const sourcePath = resolveSourceFileForTest(filePath, files);
+    if (!sourcePath) return "";
+    const sourceFile = files[sourcePath];
+    if (!sourceFile || sourceFile.type !== "file" || sourceFile.isBinary) return "";
+    return `\n\n## Source file under test — ${sourcePath}:\n\`\`\`\n${sourceFile.content}\n\`\`\``;
+  })();
+
   if (step.index > 1) {
     const prevStep = steps[step.index - 2];
     stepMessages.push({
@@ -595,6 +629,7 @@ function buildFileStepMessages(
       `File: ${filePath}`,
       step.details,
       fileContext,
+      sourceFileContext,
       ``,
       FILE_STEP_EXECUTION_INSTRUCTIONS(filePath, !!existingFile, userQuestion),
     ]
