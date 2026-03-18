@@ -3,6 +3,7 @@ import { MigrationRunner } from "../migration/core/migrationRunner";
 import {
   streamPlanResponse,
   parsePlanIntoSteps,
+  parseMigrationPlanIntoSteps,
   type StreamWriter,
 } from "../llm/plan-processor";
 import type { MigrationPlan } from "../migration/types/migrationTypes";
@@ -76,16 +77,7 @@ export class ChatMigrationHandler {
         message: "Parsing migration steps...",
       } satisfies ProgressAnnotation);
 
-      const migrationFileMap: FileMap = {
-        ...request.files,
-        "migration.md": {
-          type: "file",
-          content: markdownContent,
-          isBinary: false,
-        } as any,
-      };
-
-      const planStepsRaw = await parsePlanIntoSteps(markdownContent, migrationFileMap);
+      const planStepsRaw = await parseMigrationPlanIntoSteps(markdownContent, request.files);
 
       writeMessageAnnotationPart(res, {
         type: "migration_plan",
@@ -102,7 +94,7 @@ export class ChatMigrationHandler {
         type: "planSteps",
         steps: planStepsRaw.map((s) => ({ index: s.index, heading: s.heading })),
         totalSteps: planStepsRaw.length,
-        executionMode: "files",
+        executionMode: "steps",
       });
 
       writeDataPart(res, {
@@ -368,16 +360,6 @@ ${tasks.map((t) => `- ${t.file}: ${t.description}`).join("\n")}`;
         content: migrationDocument,
         isBinary: false,
       } as any;
-    }
-
-    for (const task of plan.tasks) {
-      if (task.action === "create" && !result[task.file]) {
-        result[task.file] = {
-          type: "file",
-          content: "",
-          isBinary: false,
-        } as any;
-      }
     }
 
     return result;
