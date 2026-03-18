@@ -386,27 +386,48 @@ function buildMigrationFileContext(step: MigrationStep, files: FileMap): string 
   const searchText = step.heading + " " + step.details;
 
   const referencedMigratePaths: string[] = [];
+  const referencedSourcePaths: string[] = [];
+
   for (const filePath of Object.keys(files)) {
-    if (
-      (filePath.includes("/migrate/") || filePath.startsWith("migrate/")) &&
-      (searchText.includes(filePath) || searchText.includes(filePath.split("/").pop() ?? ""))
-    ) {
+    const isMigratePath = filePath.includes("/migrate/") || filePath.startsWith("migrate/");
+    const basename = filePath.split("/").pop() ?? "";
+    const relativePath = filePath.replace("/home/project/", "");
+
+    const isReferenced =
+      searchText.includes(filePath) ||
+      searchText.includes(relativePath) ||
+      searchText.includes(basename);
+
+    if (!isReferenced) continue;
+
+    if (isMigratePath) {
       referencedMigratePaths.push(filePath);
+    } else {
+      referencedSourcePaths.push(filePath);
     }
   }
 
-  if (referencedMigratePaths.length === 0) return "";
+  const sections: string[] = [];
 
-  const sections: string[] = [
-    `\n## Already-created migrate/ files referenced in this step (DO NOT recreate — only extend if needed):`,
-  ];
-  for (const filePath of referencedMigratePaths) {
-    const entry = files[filePath] as any;
-    if (!entry || entry.type !== "file" || entry.isBinary) continue;
-    sections.push(`\n### ${filePath}\n\`\`\`\n${entry.content}\n\`\`\``);
+  if (referencedSourcePaths.length > 0) {
+    sections.push(`\n## Original source files to port (use these as the source of truth for business logic):`);
+    for (const filePath of referencedSourcePaths) {
+      const entry = files[filePath] as any;
+      if (!entry || entry.type !== "file" || entry.isBinary) continue;
+      sections.push(`\n### ${filePath}\n\`\`\`\n${entry.content}\n\`\`\``);
+    }
   }
 
-  return sections.length > 1 ? sections.join("\n") : "";
+  if (referencedMigratePaths.length > 0) {
+    sections.push(`\n## Already-created migrate/ files referenced in this step (DO NOT recreate — only extend if needed):`);
+    for (const filePath of referencedMigratePaths) {
+      const entry = files[filePath] as any;
+      if (!entry || entry.type !== "file" || entry.isBinary) continue;
+      sections.push(`\n### ${filePath}\n\`\`\`\n${entry.content}\n\`\`\``);
+    }
+  }
+
+  return sections.length > 0 ? sections.join("\n") : "";
 }
 
 const MIGRATION_STEP_INSTRUCTIONS = `## Migration Execution Rules

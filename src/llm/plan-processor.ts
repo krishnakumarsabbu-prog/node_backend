@@ -869,12 +869,31 @@ function buildStepFileContext(step: PlanStep, files?: FileMap): string {
 
   if (mentionedPaths.length === 0) return "";
 
+  const sourceFilesForTests: string[] = [];
+  for (const filePath of mentionedPaths) {
+    if (isTestFile(filePath)) {
+      const sourcePath = resolveSourceFileForTest(filePath, files);
+      if (sourcePath && !mentionedPaths.includes(sourcePath) && !sourceFilesForTests.includes(sourcePath)) {
+        sourceFilesForTests.push(sourcePath);
+      }
+    }
+  }
+
   const sections: string[] = [`\n## Existing file contents for this step (modify these, do not recreate from scratch):`];
 
   for (const filePath of mentionedPaths) {
     const entry = files[filePath];
     if (!entry || entry.type !== "file" || (entry as any).isBinary) continue;
     sections.push(`\n### ${filePath}\n\`\`\`\n${(entry as any).content}\n\`\`\``);
+  }
+
+  if (sourceFilesForTests.length > 0) {
+    sections.push(`\n## Source files under test (reference these for comprehensive test coverage):`);
+    for (const filePath of sourceFilesForTests) {
+      const entry = files[filePath];
+      if (!entry || entry.type !== "file" || (entry as any).isBinary) continue;
+      sections.push(`\n### ${filePath}\n\`\`\`\n${(entry as any).content}\n\`\`\``);
+    }
   }
 
   return sections.length > 1 ? sections.join("\n") : "";
