@@ -1,11 +1,10 @@
 import type { Response } from "express";
 import { MigrationRunner } from "../migration/core/migrationRunner";
 import {
-  streamPlanResponse,
-  parsePlanIntoSteps,
   parseMigrationPlanIntoSteps,
-  type StreamWriter,
-} from "../llm/plan-processor";
+  streamMigrationResponse,
+  type MigrationStreamWriter,
+} from "../llm/migration-processor";
 import type { MigrationPlan } from "../migration/types/migrationTypes";
 import type { FileMap } from "../llm/constants";
 import type { Messages, StreamingOptions } from "../llm/stream-text";
@@ -152,15 +151,22 @@ export class ChatMigrationHandler {
     } satisfies ProgressAnnotation);
 
     if (apiKeys && streamingOptions) {
-      const userRequest = this.extractUserRequest(request.messages);
+      const migrationFiles = this.buildMigrationFileMap(request.files, migrationDocument);
 
-      const migrationQuestion = this.buildMigrationQuestion(
-        userRequest,
-        plan,
-        migrationDocument,
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-execute",
+        status: "in-progress",
+        order: progressCounter++,
+        message: "Parsing migration steps for execution...",
+      } satisfies ProgressAnnotation);
+
+      const steps = await parseMigrationPlanIntoSteps(
+        migrationDocument || this.buildFallbackDocument(plan),
+        request.files,
       );
 
-      const planWriter: StreamWriter = {
+      const migrationWriter: MigrationStreamWriter = {
         writeData: (data: unknown) => {
           writeDataPart(res, data);
           return true;
@@ -175,21 +181,18 @@ export class ChatMigrationHandler {
       const progressRef = { value: progressCounter };
       const cumulativeUsage = { completionTokens: 0, promptTokens: 0, totalTokens: 0 };
 
-      const migrationFiles = this.buildMigrationFileMap(plan, request.files, migrationDocument);
-
-      await streamPlanResponse({
+      await streamMigrationResponse({
         res,
         requestId: "migration-execute",
         messages: request.messages,
         files: migrationFiles,
-        userQuestion: migrationQuestion,
+        migrationDocument: migrationDocument || this.buildFallbackDocument(plan),
+        steps,
         streamingOptions,
         apiKeys,
         providerSettings: providerSettings || {},
-        promptId: "plan",
-        chatMode: "build",
         progressCounter: progressRef,
-        writer: planWriter,
+        writer: migrationWriter,
         cumulativeUsage,
       });
 
@@ -221,37 +224,20 @@ export class ChatMigrationHandler {
     return progressCounter;
   }
 
-  private buildMigrationQuestion(
-    userRequest: string,
-    plan: MigrationPlan,
-    migrationDocument?: string,
-  ): string {
-    const baseRequest = userRequest || "Migrate the project";
-
-    if (migrationDocument) {
-      return `${baseRequest}
-
-You are implementing a migration. The NEW migrated project must be created inside the \`migrate/\` folder (i.e., all new files go under \`/home/project/migrate/\`).
-
-DO NOT modify the original source files. Only create new files under migrate/.
-
-Here is the detailed Migration.md plan — follow it step by step, implementing every file listed:
-
-${migrationDocument}`;
-    }
-
-    const tasks = plan.tasks;
-
-    return `${baseRequest}
-
-Migration type: ${plan.migrationType}
-
-You are implementing a migration. All new migrated files must be created inside the \`migrate/\` folder (i.e., all paths should start with \`migrate/\`).
-
-DO NOT modify the original source files. Only create new files under migrate/.
-
-Files to create:
-${tasks.map((t) => `- ${t.file}: ${t.description}`).join("\n")}`;
+  private buildFallbackDocument(plan: MigrationPlan): string {
+    const tasks = plan.tasks || [];
+    const lines = [
+      `# Migration Plan: ${plan.migrationType}`,
+      ``,
+      `## Overview`,
+      `Migration type: ${plan.migrationType} (${plan.estimatedComplexity} complexity)`,
+      ``,
+      `## Step 1: Implement Migration`,
+      ``,
+      `### Files`,
+      ...tasks.map((t) => `**\`${t.file}\`** — ${t.description}`),
+    ];
+    return lines.join("\n");
   }
 
   private async executeWithRunner(
@@ -348,7 +334,6 @@ ${tasks.map((t) => `- ${t.file}: ${t.description}`).join("\n")}`;
   }
 
   private buildMigrationFileMap(
-    plan: MigrationPlan,
     originalFiles: FileMap,
     migrationDocument?: string,
   ): FileMap {

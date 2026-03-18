@@ -58,19 +58,16 @@ export interface ParsedPlan {
 export type ExecutionMode = "steps" | "files";
 
 export function extractPlanContent(files: FileMap): string | null {
-  const PLAN_FILENAMES = ["plan.md", "migration.md"];
-  for (const target of PLAN_FILENAMES) {
-    for (const [path, entry] of Object.entries(files)) {
-      const name = path.split("/").pop()?.toLowerCase();
-      if (
-        name === target &&
-        entry &&
-        entry.type === "file" &&
-        !entry.isBinary &&
-        typeof entry.content === "string"
-      ) {
-        return entry.content;
-      }
+  for (const [path, entry] of Object.entries(files)) {
+    const name = path.split("/").pop()?.toLowerCase();
+    if (
+      name === "plan.md" &&
+      entry &&
+      entry.type === "file" &&
+      !entry.isBinary &&
+      typeof entry.content === "string"
+    ) {
+      return entry.content;
     }
   }
   return null;
@@ -146,81 +143,6 @@ Use the exact file paths from the project where applicable. Think through the be
   } catch (err: any) {
     logger.error("Failed to parse LLM step response as JSON, falling back to single step", err);
     return [{ index: 1, heading: "Implement Plan", details: planContent }];
-  }
-}
-
-export async function parseMigrationPlanIntoSteps(
-  migrationDocument: string,
-  originalFiles: FileMap,
-  onFinish?: (resp: GenerateTextResult<Record<string, CoreTool<any, any>>, never>) => void,
-): Promise<PlanStep[]> {
-  logger.info("Parsing Migration.md into steps via LLM (migration-aware)...");
-
-  const originalFileList = Object.keys(originalFiles)
-    .filter((k) => (originalFiles[k] as any)?.type === "file")
-    .join("\n");
-
-  const resp = await generateText({
-    model: getTachyonModel(),
-    system: `
-You are a world-class software architect specializing in framework migrations. Your job is to read a Migration.md document and break it into an ordered list of implementation steps that an LLM coding agent will execute one by one.
-
-Return ONLY a valid JSON array — no prose, no markdown fences. Each element must have:
-"index"   : number  (1-based sequential integer)
-"heading" : string  (concise action-oriented title ≤ 80 chars, e.g. "Create migrate/pom.xml and Application entry point")
-"details" : string  (precise implementation instructions: exact files under migrate/ to create, what each file must contain, class names, annotations, method signatures, config keys, and how this step connects to adjacent steps)
-
-MIGRATION-SPECIFIC RULES:
-- ALL output files live under migrate/ — every file path in "details" must start with migrate/
-- DO NOT modify the original source files — only create new files in migrate/
-- EVERY file listed in the Migration.md "### Files" sections must appear in exactly one step
-- Do not skip any file — if the Migration.md lists 40 files, all 40 must be covered across the steps
-- Group logically related files into one step (e.g. all controllers in one step, all services in one step, build file + entry point in one step)
-- A step may cover up to 8 files if they are tightly related (same layer/package)
-- Steps must be ordered so later steps can import from earlier steps (build config first, then entry point, then config classes, then business logic, then controllers last)
-- Each step must be fully self-contained — the LLM agent executing it must be able to write all listed files without needing information from future steps
-- Reference the EXACT original source file path in "details" when describing what to port (e.g. "Port src/main/java/com/example/UserController.java → migrate/src/main/java/com/example/controller/UserController.java")
-
-STEP ORDER FOR JVM MIGRATIONS (adapt for other ecosystems):
-1. Build file (pom.xml / build.gradle) + Application main class
-2. XML/annotation configuration classes (@Configuration, @EnableWebMvc, security config)
-3. Domain models / entities
-4. Repository / DAO layer
-5. Service layer (group by domain, e.g. UserService + OrderService in one step if small)
-6. Controllers (group by domain)
-7. Static resources, templates, application.properties
-
-FORBIDDEN:
-- Steps that only create empty placeholder files
-- Steps with no actual file content described
-- Catch-all steps like "Migrate everything else"
-- Any step that touches an original (non-migrate/) file
-
-OUTPUT: JSON array only. No explanation. No fences.
-`,
-    prompt: `
-ORIGINAL PROJECT FILES (for reference — do NOT modify these):
-${originalFileList}
-
-MIGRATION DOCUMENT:
-<migration>
-${migrationDocument}
-</migration>
-
-Parse the Migration.md and produce the ordered step list. Every file listed in the migration document must appear in exactly one step. All output paths must start with migrate/.
-`,
-  });
-
-  if (onFinish) onFinish(resp);
-
-  try {
-    const cleaned = resp.text.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "");
-    const parsed = JSON.parse(cleaned) as PlanStep[];
-    logger.info(`Parsed ${parsed.length} migration steps from Migration.md`);
-    return parsed;
-  } catch (err: any) {
-    logger.error("Failed to parse migration step response as JSON, falling back to single step", err);
-    return [{ index: 1, heading: "Implement Migration", details: migrationDocument }];
   }
 }
 
