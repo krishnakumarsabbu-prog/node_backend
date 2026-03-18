@@ -32,6 +32,7 @@ export async function handleMigrate(
     providerSettings,
     migrationAction,
     migrationPlan,
+    migrationDocument,
   } = body;
 
   logger.info(`[${requestId}] Migration mode: action=${migrationAction || "plan"}`);
@@ -55,6 +56,7 @@ export async function handleMigrate(
           workDir: WORK_DIR,
           migrationAction,
           migrationPlan,
+          migrationDocument,
         },
         writeDataPart,
         writeMessageAnnotationPart,

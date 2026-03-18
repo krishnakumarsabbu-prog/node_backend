@@ -55,6 +55,73 @@ Return a structured analysis.`;
     return { sample, truncated: true, totalCount: fileList.length };
   }
 
+  static buildMigrationDocumentPrompt(
+    analysis: ProjectAnalysis,
+    userRequest: string,
+    fileList: string[],
+    fileContents: Record<string, string>
+  ): string {
+    const MAX_FILES_IN_PROMPT = 150;
+    const { sample, truncated, totalCount } = PromptBuilder.sampleFileList(fileList, MAX_FILES_IN_PROMPT);
+
+    const fileSection = truncated
+      ? `${sample.join("\n")}\n\n[Note: Showing ${sample.length} representative files out of ${totalCount} total. All files must be accounted for in the migration — apply patterns consistently to files not listed.]`
+      : sample.join("\n");
+
+    const contentSamples = Object.entries(fileContents)
+      .slice(0, 10)
+      .map(([path, content]) => `### ${path}\n\`\`\`\n${content.slice(0, 800)}${content.length > 800 ? "\n...[truncated]" : ""}\n\`\`\``)
+      .join("\n\n");
+
+    return `You are a senior software architect generating a complete, production-ready migration plan document.
+
+PROJECT ANALYSIS:
+Framework: ${analysis.framework}
+Build Tool: ${analysis.buildTool}
+Controllers: ${analysis.controllers.length}
+Services: ${analysis.services.length}
+Config Files: ${analysis.configFiles.length}
+Total Files: ${totalCount}
+
+USER REQUEST:
+${userRequest}
+
+AVAILABLE FILES (all must be migrated — miss nothing):
+${fileSection}
+
+SAMPLE FILE CONTENTS (for context):
+${contentSamples || "(none available)"}
+
+---
+
+YOUR TASK:
+Generate a complete Migration.md document that serves as a step-by-step implementation guide.
+
+The migration creates a NEW project at: /home/project/migrate/
+
+CRITICAL RULES:
+1. EVERY source file from the original project must have a corresponding entry in the migration — do NOT omit any business logic, configuration, or resource file
+2. The migrate/ folder is a completely fresh project — include ALL setup files (build file, main entry, config files, etc.)
+3. Each step must be self-contained and implementable by an LLM coding agent
+4. Steps must be ordered so later steps never depend on files created by later steps
+5. Describe exactly what each file must contain — reference class names, method signatures, annotations, config keys
+6. Preserve 100% of the business logic — no feature may be dropped in the migration
+
+MIGRATION.md FORMAT:
+Write a proper markdown document with:
+- A title: # Migration Plan: [source framework] → [target framework]
+- A ## Overview section describing what is being migrated and why
+- A ## Migration Strategy section explaining the approach
+- A ## Target Structure section showing the directory tree of migrate/
+- Numbered ## Step N: [Action Title] sections — one per logical group of files
+  - Each step has a ### Goal subsection and a ### Files subsection
+  - Under ### Files, list each file as: **\`migrate/path/to/file\`** — [description of exactly what it should contain]
+- A ## Dependency Changes section listing all new/removed packages
+- A ## Key Differences section noting behavioral changes
+
+Write the full Migration.md document now:`;
+  }
+
   static buildPlanningPrompt(
     analysis: ProjectAnalysis,
     userRequest: string,

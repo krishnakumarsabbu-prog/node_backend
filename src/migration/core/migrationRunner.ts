@@ -183,6 +183,19 @@ export class MigrationRunner {
     return plan;
   }
 
+  async generateMigrationDocument(
+    files: FileMap,
+    userRequest: string
+  ): Promise<{ markdownContent: string; plan: MigrationPlan }> {
+    logger.info("Generating Migration.md document");
+
+    const analysis = await this.analyzerAgent.analyze(files);
+    const doc = await this.plannerAgent.generateMigrationDocument(files, analysis, userRequest);
+
+    logger.info("Migration.md generation complete");
+    return doc;
+  }
+
   async executePlan(plan: MigrationPlan, files: FileMap): Promise<MigrationResult> {
     logger.info("Executing provided migration plan");
 

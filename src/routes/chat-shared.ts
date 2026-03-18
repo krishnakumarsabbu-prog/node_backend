@@ -29,6 +29,7 @@ export type ChatRequestBody = {
   providerSettings: Record<string, IProviderSetting>;
   migrationAction?: "plan" | "implement";
   migrationPlan?: any;
+  migrationDocument?: string;
 };
 
 export const MAX_CONTEXT_FILES = 100;

@@ -1,6 +1,10 @@
 import type { Response } from "express";
 import { MigrationRunner } from "../migration/core/migrationRunner";
-import { streamPlanResponse, type StreamWriter } from "../llm/plan-processor";
+import {
+  streamPlanResponse,
+  parsePlanIntoSteps,
+  type StreamWriter,
+} from "../llm/plan-processor";
 import type { MigrationPlan } from "../migration/types/migrationTypes";
 import type { FileMap } from "../llm/constants";
 import type { Messages, StreamingOptions } from "../llm/stream-text";
@@ -15,6 +19,7 @@ export interface MigrationRequest {
   workDir: string;
   migrationAction?: "plan" | "implement";
   migrationPlan?: any;
+  migrationDocument?: string;
 }
 
 export class ChatMigrationHandler {
@@ -50,17 +55,37 @@ export class ChatMigrationHandler {
     const userRequest = typeof userMessage.content === "string" ? userMessage.content : "";
 
     try {
-      const plan = await this.runner.generatePlanOnly(request.files, userRequest);
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration",
+        status: "in-progress",
+        order: progressCounter++,
+        message: "Generating Migration.md plan document...",
+      } satisfies ProgressAnnotation);
+
+      const { markdownContent, plan } = await this.runner.generateMigrationDocument(
+        request.files,
+        userRequest,
+      );
 
       writeDataPart(res, {
         type: "progress",
         label: "migration",
         status: "in-progress",
         order: progressCounter++,
-        message: `Migration plan ready: ${plan.tasks.length} tasks identified`,
+        message: "Parsing migration steps...",
       } satisfies ProgressAnnotation);
 
-      const planSteps = this.buildPlanStepAnnotations(plan);
+      const migrationFileMap: FileMap = {
+        ...request.files,
+        "migration.md": {
+          type: "file",
+          content: markdownContent,
+          isBinary: false,
+        } as any,
+      };
+
+      const planStepsRaw = await parsePlanIntoSteps(markdownContent, migrationFileMap);
 
       writeMessageAnnotationPart(res, {
         type: "migration_plan",
@@ -70,12 +95,13 @@ export class ChatMigrationHandler {
           tasks: plan.tasks,
           estimatedComplexity: plan.estimatedComplexity,
         },
+        migrationDocument: markdownContent,
       } as ContextAnnotation);
 
       writeMessageAnnotationPart(res, {
         type: "planSteps",
-        steps: planSteps,
-        totalSteps: plan.tasks.length,
+        steps: planStepsRaw.map((s) => ({ index: s.index, heading: s.heading })),
+        totalSteps: planStepsRaw.length,
         executionMode: "files",
       });
 
@@ -84,10 +110,10 @@ export class ChatMigrationHandler {
         label: "migration",
         status: "complete",
         order: progressCounter++,
-        message: `Migration plan generated: ${plan.tasks.length} files to process (${plan.estimatedComplexity || "medium"} complexity)`,
+        message: `Migration plan ready: ${planStepsRaw.length} steps (${plan.estimatedComplexity || "medium"} complexity)`,
       } satisfies ProgressAnnotation);
 
-      logger.info(`Plan generated: ${plan.tasks.length} tasks`);
+      logger.info(`Migration.md plan generated: ${planStepsRaw.length} steps`);
     } catch (error) {
       logger.error(`Plan generation failed: ${(error as Error).message}`);
 
@@ -122,6 +148,7 @@ export class ChatMigrationHandler {
     }
 
     const plan: MigrationPlan = request.migrationPlan;
+    const migrationDocument: string | undefined = request.migrationDocument;
     const tasks = plan.tasks || [];
 
     writeDataPart(res, {
@@ -129,12 +156,17 @@ export class ChatMigrationHandler {
       label: "migration-execute",
       status: "in-progress",
       order: progressCounter++,
-      message: `Starting migration: ${tasks.length} files to process`,
+      message: `Starting migration implementation: creating project under migrate/`,
     } satisfies ProgressAnnotation);
 
     if (apiKeys && streamingOptions) {
       const userRequest = this.extractUserRequest(request.messages);
-      const migrationQuestion = `${userRequest || "Migrate the project"}\n\nMigration type: ${plan.migrationType}\n\nTasks to execute:\n${tasks.map((t) => `- ${t.action} ${t.file}: ${t.description}`).join("\n")}`;
+
+      const migrationQuestion = this.buildMigrationQuestion(
+        userRequest,
+        plan,
+        migrationDocument,
+      );
 
       const planWriter: StreamWriter = {
         writeData: (data: unknown) => {
@@ -149,10 +181,9 @@ export class ChatMigrationHandler {
       };
 
       const progressRef = { value: progressCounter };
-
       const cumulativeUsage = { completionTokens: 0, promptTokens: 0, totalTokens: 0 };
 
-      const migrationFiles = this.buildMigrationFileMap(plan, request.files);
+      const migrationFiles = this.buildMigrationFileMap(plan, request.files, migrationDocument);
 
       await streamPlanResponse({
         res,
@@ -196,6 +227,39 @@ export class ChatMigrationHandler {
     }
 
     return progressCounter;
+  }
+
+  private buildMigrationQuestion(
+    userRequest: string,
+    plan: MigrationPlan,
+    migrationDocument?: string,
+  ): string {
+    const baseRequest = userRequest || "Migrate the project";
+
+    if (migrationDocument) {
+      return `${baseRequest}
+
+You are implementing a migration. The NEW migrated project must be created inside the \`migrate/\` folder (i.e., all new files go under \`/home/project/migrate/\`).
+
+DO NOT modify the original source files. Only create new files under migrate/.
+
+Here is the detailed Migration.md plan — follow it step by step, implementing every file listed:
+
+${migrationDocument}`;
+    }
+
+    const tasks = plan.tasks;
+
+    return `${baseRequest}
+
+Migration type: ${plan.migrationType}
+
+You are implementing a migration. All new migrated files must be created inside the \`migrate/\` folder (i.e., all paths should start with \`migrate/\`).
+
+DO NOT modify the original source files. Only create new files under migrate/.
+
+Files to create:
+${tasks.map((t) => `- ${t.file}: ${t.description}`).join("\n")}`;
   }
 
   private async executeWithRunner(
@@ -291,15 +355,20 @@ export class ChatMigrationHandler {
     return progressCounter;
   }
 
-  private buildPlanStepAnnotations(plan: MigrationPlan): Array<{ index: number; heading: string }> {
-    return plan.tasks.map((task, i) => ({
-      index: i + 1,
-      heading: `${task.action.toUpperCase()}: ${task.file}`,
-    }));
-  }
-
-  private buildMigrationFileMap(plan: MigrationPlan, originalFiles: FileMap): FileMap {
+  private buildMigrationFileMap(
+    plan: MigrationPlan,
+    originalFiles: FileMap,
+    migrationDocument?: string,
+  ): FileMap {
     const result: FileMap = { ...originalFiles };
+
+    if (migrationDocument) {
+      result["migration.md"] = {
+        type: "file",
+        content: migrationDocument,
+        isBinary: false,
+      } as any;
+    }
 
     for (const task of plan.tasks) {
       if (task.action === "create" && !result[task.file]) {
@@ -307,7 +376,7 @@ export class ChatMigrationHandler {
           type: "file",
           content: "",
           isBinary: false,
-        };
+        } as any;
       }
     }
 

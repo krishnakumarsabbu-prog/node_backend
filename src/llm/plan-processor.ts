@@ -58,16 +58,19 @@ export interface ParsedPlan {
 export type ExecutionMode = "steps" | "files";
 
 export function extractPlanContent(files: FileMap): string | null {
-  for (const [path, entry] of Object.entries(files)) {
-    const name = path.split("/").pop()?.toLowerCase();
-    if (
-      name === "plan.md" &&
-      entry &&
-      entry.type === "file" &&
-      !entry.isBinary &&
-      typeof entry.content === "string"
-    ) {
-      return entry.content;
+  const PLAN_FILENAMES = ["plan.md", "migration.md"];
+  for (const target of PLAN_FILENAMES) {
+    for (const [path, entry] of Object.entries(files)) {
+      const name = path.split("/").pop()?.toLowerCase();
+      if (
+        name === target &&
+        entry &&
+        entry.type === "file" &&
+        !entry.isBinary &&
+        typeof entry.content === "string"
+      ) {
+        return entry.content;
+      }
     }
   }
   return null;
