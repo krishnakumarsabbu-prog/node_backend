@@ -73,7 +73,7 @@ Return a structured analysis.`;
       .map(([path, content]) => `### ${path}\n\`\`\`\n${content.slice(0, 800)}${content.length > 800 ? "\n...[truncated]" : ""}\n\`\`\``)
       .join("\n\n");
 
-    return `You are a senior software architect generating a complete, production-ready migration plan document.
+    return `You are a senior Spring migration architect generating a complete, production-ready migration plan document.
 
 PROJECT ANALYSIS:
 Framework: ${analysis.framework}
@@ -86,10 +86,10 @@ Total Files: ${totalCount}
 USER REQUEST:
 ${userRequest}
 
-AVAILABLE FILES (all must be migrated — miss nothing):
+AVAILABLE FILES (all must be migrated — INCLUDING XML, properties, and resources — miss nothing):
 ${fileSection}
 
-SAMPLE FILE CONTENTS (for context):
+SAMPLE FILE CONTENTS (CRITICAL for understanding XML + configuration behavior):
 ${contentSamples || "(none available)"}
 
 ---
@@ -99,25 +99,96 @@ Generate a complete Migration.md document that serves as a step-by-step implemen
 
 The migration creates a NEW project at: /home/project/migrate/
 
+---
+
 CRITICAL RULES:
-1. EVERY source file from the original project must have a corresponding entry in the migration — do NOT omit any business logic, configuration, or resource file
-2. The migrate/ folder is a completely fresh project — include ALL setup files (build file, main entry, config files, etc.)
-3. Each step must be self-contained and implementable by an LLM coding agent
-4. Steps must be ordered so later steps never depend on files created by later steps
-5. Describe exactly what each file must contain — reference class names, method signatures, annotations, config keys
-6. Preserve 100% of the business logic — no feature may be dropped in the migration
+
+1. EVERY source file from the original project must have a corresponding entry in the migration — do NOT omit any business logic, configuration, XML, or resource file
+
+2. THIS IS A SPRING WEB MVC → SPRING BOOT MIGRATION:
+   - You MUST analyze XML configuration files deeply (web.xml, dispatcher-servlet.xml, applicationContext.xml, etc.)
+   - You MUST transform XML-based configuration into Spring Boot Java configuration or properties
+
+3. XML TRANSFORMATION RULES (MANDATORY):
+   - web.xml → Spring Boot main class + embedded server configuration (REMOVE web.xml entirely)
+   - dispatcher-servlet.xml → @Configuration or rely on Spring Boot auto-configuration
+   - applicationContext.xml → @Configuration classes with @Bean methods
+   - <bean> definitions → @Component / @Service / @Repository / @Bean
+   - context:component-scan → @SpringBootApplication or @ComponentScan
+   - property placeholders → application.properties or application.yml
+   - view resolvers / handler mappings → Spring Boot defaults unless customization is required
+
+4. DO NOT COPY XML FILES INTO THE TARGET PROJECT:
+   - You must CONVERT them, not migrate as-is
+   - Clearly explain where each XML configuration is moved
+
+5. EVERY XML FILE MUST HAVE AN EXPLICIT TRANSFORMATION EXPLANATION:
+   - What the XML file does
+   - What replaces it in Spring Boot
+   - Which new file(s) contain that logic
+
+6. The migrate/ folder is a completely fresh Spring Boot project — include ALL setup files:
+   - Main class with @SpringBootApplication
+   - application.properties or application.yml
+   - Build file with Spring Boot dependencies
+   - Proper package structure
+
+7. Each step must be self-contained and implementable by an LLM coding agent
+
+8. Steps must be ordered so later steps never depend on files created by later steps
+
+9. Describe exactly what each file must contain — reference:
+   - Class names
+   - Method signatures
+   - Annotations
+   - Configuration keys
+
+10. Preserve 100% of the business logic — ONLY change configuration style (XML → annotations/config)
+
+---
 
 MIGRATION.md FORMAT:
+
 Write a proper markdown document with:
-- A title: # Migration Plan: [source framework] → [target framework]
+
+- A title: # Migration Plan: Spring Web MVC → Spring Boot
+
 - A ## Overview section describing what is being migrated and why
-- A ## Migration Strategy section explaining the approach
+
+- A ## Migration Strategy section explaining:
+  - XML → Java config transformation
+  - Embedded server model
+  - Auto-configuration approach
+
 - A ## Target Structure section showing the directory tree of migrate/
+
 - Numbered ## Step N: [Action Title] sections — one per logical group of files
   - Each step has a ### Goal subsection and a ### Files subsection
-  - Under ### Files, list each file as: **\`migrate/path/to/file\`** — [description of exactly what it should contain]
+  - Under ### Files, list each file as:
+    **\`migrate/path/to/file\`** — [description of exactly what it should contain]
+
+---
+
+🚨 MANDATORY SECTION:
+
+## XML to Spring Boot Mapping
+
+For EACH XML file found in the input:
+
+### [xml-file-name]
+- Purpose:
+- Key configurations:
+- Spring Boot replacement:
+- Target file(s):
+- Exact transformation explanation
+
+---
+
 - A ## Dependency Changes section listing all new/removed packages
+
 - A ## Key Differences section noting behavioral changes
+
+---
 
 Write the full Migration.md document now:`;
   }

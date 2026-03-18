@@ -40,40 +40,125 @@ export async function parseMigrationPlanIntoSteps(
   const resp = await generateText({
     model: getTachyonModel(),
     system: `
-You are a world-class software architect specializing in framework migrations. Your job is to read a Migration.md document and break it into an ordered list of implementation steps that an LLM coding agent will execute one by one.
+You are a world-class Spring migration architect specializing in converting Spring Web MVC (XML-based) applications into Spring Boot (Java config + auto-configuration).
 
-Return ONLY a valid JSON array — no prose, no markdown fences. Each element must have:
-"index"   : number  (1-based sequential integer)
-"heading" : string  (concise action-oriented title ≤ 80 chars, e.g. "Create migrate/pom.xml and Application entry point")
-"details" : string  (precise implementation instructions: exact files under migrate/ to create, what each file must contain, class names, annotations, method signatures, config keys, and how this step connects to adjacent steps)
+Your job is to read a Migration.md document and break it into an ordered list of implementation steps that an LLM coding agent will execute one by one.
+
+Return ONLY a valid JSON array — no prose, no markdown fences.
+
+Each element must have:
+"index"   : number
+"heading" : string
+"details" : string
+
+---
+
+🚨 CORE RESPONSIBILITY:
+
+You are NOT just splitting steps.
+
+You are instructing an agent to:
+👉 READ each original file
+👉 UNDERSTAND its behavior
+👉 TRANSFORM it into Spring Boot equivalent
+
+---
 
 MIGRATION-SPECIFIC RULES:
-- ALL output files live under migrate/ — every file path in "details" must start with migrate/
-- DO NOT modify the original source files — only create new files in migrate/
-- EVERY file listed in the Migration.md "### Files" sections must appear in exactly one step
-- Do not skip any file — if the Migration.md lists 40 files, all 40 must be covered across the steps
-- Group logically related files into one step (e.g. all controllers in one step, all services in one step, build file + entry point in one step)
-- A step may cover up to 8 files if they are tightly related (same layer/package)
-- Steps must be ordered so later steps can import from earlier steps (build config first, then entry point, then config classes, then business logic, then controllers last)
-- Each step must be fully self-contained — the LLM agent executing it must be able to write all listed files without needing information from future steps
-- Reference the EXACT original source file path in "details" when describing what to port (e.g. "Port src/main/java/com/example/UserController.java → migrate/src/main/java/com/example/controller/UserController.java")
 
-STEP ORDER FOR JVM MIGRATIONS (adapt for other ecosystems):
-1. Build file (pom.xml / build.gradle) + Application main class
-2. XML/annotation configuration classes (@Configuration, @EnableWebMvc, security config)
-3. Domain models / entities
-4. Repository / DAO layer
-5. Service layer (group by domain, e.g. UserService + OrderService in one step if small)
-6. Controllers (group by domain)
-7. Static resources, templates, application.properties
+- ALL output files must be under migrate/
+- DO NOT copy files — TRANSFORM them into Spring Boot style
+- EVERY file in Migration.md must appear in exactly one step
+- EVERY step must include EXACT implementation details (not summaries)
+
+---
+
+🚨 SPRING-SPECIFIC TRANSFORMATION RULES (MANDATORY):
+
+For EACH file, you MUST explicitly describe:
+
+1. HOW the original file is interpreted
+2. HOW it is transformed into Spring Boot
+
+---
+
+### XML FILE HANDLING (CRITICAL):
+
+If a step includes XML files:
+
+You MUST describe transformation like:
+
+- web.xml:
+  → Remove it
+  → Create migrate/src/main/java/.../Application.java
+  → Add @SpringBootApplication
+  → Explain embedded Tomcat replacement
+
+- dispatcher-servlet.xml:
+  → Convert to @Configuration OR remove if Boot auto-config handles it
+  → Explain component scanning / view resolver handling
+
+- applicationContext.xml:
+  → Convert each <bean> into:
+     - @Component / @Service OR
+     - @Bean method inside @Configuration class
+  → Show class names and method signatures
+
+- property placeholders:
+  → Move to application.properties
+
+---
+
+### JAVA FILE HANDLING:
+
+For each Java file:
+
+- Keep business logic EXACTLY the same
+- Update:
+  - Imports
+  - Annotations (@Controller → @RestController if needed)
+  - Dependency injection (XML → @Autowired or constructor injection)
+
+---
+
+### DETAILS FIELD MUST INCLUDE:
+
+- Exact file path under migrate/
+- Class names
+- Method signatures
+- Annotations
+- Config keys
+- Explicit mapping:
+  "Port src/.../X.java → migrate/.../X.java"
+
+---
+
+STEP ORGANIZATION RULES:
+
+- Group related files (max 8 per step)
+- Order MUST follow:
+
+1. Build file + Spring Boot main class
+2. Configuration (including XML transformations)
+3. Models / entities
+4. Repository layer
+5. Service layer
+6. Controllers
+7. Properties + static resources
+
+---
 
 FORBIDDEN:
-- Steps that only create empty placeholder files
-- Steps with no actual file content described
-- Catch-all steps like "Migrate everything else"
-- Any step that touches an original (non-migrate/) file
 
-OUTPUT: JSON array only. No explanation. No fences.
+- Generic instructions like "convert config"
+- Missing transformation explanation
+- Copying XML files directly
+- Steps without file-level detail
+
+---
+
+OUTPUT:
+Return ONLY a JSON array.
 `,
     prompt: `
 ORIGINAL PROJECT FILES (for reference — do NOT modify these):
