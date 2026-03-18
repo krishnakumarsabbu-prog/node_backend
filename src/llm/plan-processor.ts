@@ -14,16 +14,20 @@ import { searchWithGraph, patchIndex, type PatchEntry } from "../modules/ai_engi
 import { selectFilesForBuild } from "./batch/batch-planner";
 
 const TEST_INTENT_PATTERNS = [
-  /\btest(s|ing|ed)?\b/i,
-  /\bunit test/i,
-  /\bintegration test/i,
-  /\be2e\b/i,
-  /\bend[- ]to[- ]end\b/i,
-  /\bspec(s)?\b/i,
+  /\b(write|add|create|generate|run|fix|update)\s+(a\s+)?(unit\s+)?tests?\b/i,
+  /\bunit\s+tests?\b/i,
+  /\bintegration\s+tests?\b/i,
+  /\be2e\s+tests?\b/i,
+  /\bend[- ]to[- ]end\s+tests?\b/i,
+  /\b(test|spec)\s+file\b/i,
+  /\b\.spec\.[tj]sx?\b/i,
+  /\b\.test\.[tj]sx?\b/i,
   /\bvitest\b/i,
   /\bjest\b/i,
   /\bcypress\b/i,
   /\bplaywright\b/i,
+  /\btest\s+suite\b/i,
+  /\btest\s+coverage\b/i,
 ];
 
 function isTestGenerationRequest(question: string): boolean {
@@ -71,9 +75,12 @@ export function extractPlanContent(files: FileMap): string | null {
 
 export async function parsePlanIntoSteps(
   planContent: string,
+  contextFiles?: FileMap,
   onFinish?: (resp: GenerateTextResult<Record<string, CoreTool<any, any>>, never>) => void,
 ): Promise<PlanStep[]> {
   logger.info("Parsing PLAN.md into steps via LLM...");
+
+  const existingFileSummary = buildExistingFileSummary(contextFiles);
 
   const resp = await generateText({
     model: getTachyonModel(),
@@ -86,6 +93,9 @@ Return ONLY a valid JSON array — no prose, no markdown fences. Each element mu
 "index"   : number  (1-based sequential integer)
 "heading" : string  (concise action-oriented title ≤ 80 chars, starting with a verb: "Add", "Create", "Update", "Implement", "Refactor", "Wire", "Integrate")
 "details" : string  (precise implementation guidance covering: what to create/modify, which functions/components/interfaces to write, which patterns to follow, and how this step connects to adjacent steps)
+
+CRITICAL — EXISTING FILE AWARENESS:
+When you reference files in "details", you MUST use the exact file paths from the project. Never invent a path that doesn't exist. If you are creating a new file, follow the project's established directory and naming conventions.
 
 DESIGN FIRST — Before splitting into steps, mentally answer:
 1. What is the optimal architecture for this feature? (data flow, component boundaries, service layers)
@@ -113,13 +123,13 @@ FORBIDDEN steps (never include):
 OUTPUT: JSON array only. No explanation. No fences.
 `,
     prompt: `
-Here is the project plan:
+${existingFileSummary ? `${existingFileSummary}\n\n` : ""}Here is the project plan:
 
 <plan>
 ${planContent}
 </plan>
 
-Think through the best architecture and zero-overlap execution order, then return the JSON array of code change steps.
+Use the exact file paths from the project where applicable. Think through the best architecture and zero-overlap execution order, then return the JSON array of code change steps.
 `,
   });
 
@@ -460,20 +470,64 @@ function resolveContextFilesForStep(step: PlanStep, accumulatedFiles: FileMap): 
   return result;
 }
 
+function resolveContextFilesForTopicStep(step: PlanStep, files: FileMap): FileMap {
+  const result: FileMap = {};
+  const searchText = step.heading + " " + step.details;
+
+  const exact = extractMentionedFilePaths(searchText, files);
+  for (const p of exact) {
+    if (files[p]) result[p] = files[p];
+  }
+
+  if (Object.keys(result).length === 0) {
+    const words = searchText
+      .split(/\s+/)
+      .filter((w) => w.length > 6 && /[a-zA-Z]/.test(w))
+      .map((w) => w.replace(/[^a-zA-Z0-9_\-./]/g, ""));
+
+    const seen = new Set<string>();
+    for (const word of words) {
+      if (!word || seen.has(word)) continue;
+      seen.add(word);
+      const fuzzy = fuzzyFindExistingFile(word, files);
+      if (fuzzy && files[fuzzy] && !result[fuzzy]) {
+        result[fuzzy] = files[fuzzy];
+      }
+    }
+  }
+
+  return result;
+}
+
 function extractMentionedFilePaths(details: string, files: FileMap): string[] {
   const mentioned: string[] = [];
   for (const filePath of Object.keys(files)) {
     const basename = filePath.split("/").pop() ?? "";
     const relativePath = filePath.replace("/home/project/", "");
-    if (
-      details.includes(filePath) ||
-      details.includes(relativePath) ||
-      (basename.length > 4 && details.includes(basename))
-    ) {
+    const stem = basename.replace(/\.[^.]+$/, "");
+
+    if (details.includes(filePath) || details.includes(relativePath)) {
+      mentioned.push(filePath);
+      continue;
+    }
+
+    if (stem.length > 6 && hasWordBoundaryMatch(details, stem)) {
       mentioned.push(filePath);
     }
   }
   return mentioned;
+}
+
+function hasWordBoundaryMatch(text: string, word: string): boolean {
+  const normalized = word
+    .replace(/([a-z])([A-Z])/g, "$1[\\s_\\-]?$2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1[\\s_\\-]?$2");
+  try {
+    const re = new RegExp(`(?<![a-zA-Z])${normalized}(?![a-zA-Z])`, "i");
+    return re.test(text);
+  } catch {
+    return text.toLowerCase().includes(word.toLowerCase());
+  }
 }
 
 function STEP_EXECUTION_INSTRUCTIONS(stepIndex: number): string {
@@ -643,7 +697,24 @@ function buildTopicStepMessages(
 function buildStepFileContext(step: PlanStep, files?: FileMap): string {
   if (!files || Object.keys(files).length === 0) return "";
 
-  const mentionedPaths = extractMentionedFilePaths(step.details + " " + step.heading, files);
+  let mentionedPaths = extractMentionedFilePaths(step.details + " " + step.heading, files);
+
+  if (mentionedPaths.length === 0) {
+    const words = (step.heading + " " + step.details)
+      .split(/\s+/)
+      .filter((w) => w.length > 6 && /[a-zA-Z]/.test(w));
+    const seen = new Set<string>();
+    for (const word of words) {
+      const clean = word.replace(/[^a-zA-Z0-9_\-./]/g, "");
+      if (!clean || seen.has(clean)) continue;
+      seen.add(clean);
+      const fuzzy = fuzzyFindExistingFile(clean, files);
+      if (fuzzy && !mentionedPaths.includes(fuzzy)) {
+        mentionedPaths.push(fuzzy);
+      }
+    }
+  }
+
   if (mentionedPaths.length === 0) return "";
 
   const sections: string[] = [`\n## Existing file contents for this step (modify these, do not recreate from scratch):`];
@@ -704,6 +775,24 @@ function buildFileStepMessages(
     return `\n\n## Source file under test — ${sourcePath}:\n\`\`\`\n${(sourceFile as any).content}\n\`\`\``;
   })();
 
+  const relatedFilesContext = (() => {
+    const mentioned = extractMentionedFilePaths(step.details, files);
+    const related = mentioned.filter(
+      (p) => p !== resolvedFilePath && p !== filePath && (
+        !isTestFile(filePath) || !resolveSourceFileForTest(filePath, files) || p !== resolveSourceFileForTest(filePath, files)
+      ),
+    );
+    if (related.length === 0) return "";
+    const parts = related
+      .map((p) => {
+        const e = files[p];
+        if (!e || e.type !== "file" || (e as any).isBinary) return "";
+        return `\n### Related: ${p}\n\`\`\`\n${(e as any).content}\n\`\`\``;
+      })
+      .filter(Boolean);
+    return parts.length > 0 ? `\n\n## Related files for context:\n${parts.join("\n")}` : "";
+  })();
+
   if (step.index > 1) {
     const prevStep = steps[step.index - 2];
     stepMessages.push({
@@ -732,6 +821,7 @@ function buildFileStepMessages(
       step.details,
       fileContext,
       sourceFileContext,
+      relatedFilesContext,
       ``,
       FILE_STEP_EXECUTION_INSTRUCTIONS(resolvedFilePath, !!resolvedExistingFile, userQuestion),
     ]
@@ -767,11 +857,21 @@ function fuzzyFindExistingFile(targetPath: string, files: FileMap): string | nul
 
 function stemSimilarity(a: string, b: string): number {
   if (a === b) return 1;
+  const normalize = (s: string) =>
+    s
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+      .toLowerCase()
+      .split(/[\s_\-./]+/)
+      .filter((t) => t.length > 0);
+
   const shorter = a.length < b.length ? a : b;
   const longer = a.length < b.length ? b : a;
-  if (longer.includes(shorter)) return shorter.length / longer.length;
-  const tokensA = new Set(a.replace(/([A-Z])/g, " $1").toLowerCase().split(/[\s_-]+/).filter(Boolean));
-  const tokensB = new Set(b.replace(/([A-Z])/g, " $1").toLowerCase().split(/[\s_-]+/).filter(Boolean));
+  if (longer.toLowerCase().includes(shorter.toLowerCase())) return shorter.length / longer.length;
+
+  const tokensA = new Set(normalize(a));
+  const tokensB = new Set(normalize(b));
+  if (tokensA.size === 0 || tokensB.size === 0) return 0;
   const intersection = [...tokensA].filter((t) => tokensB.has(t));
   const union = new Set([...tokensA, ...tokensB]);
   return intersection.length / union.size;
@@ -911,7 +1011,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     } satisfies ProgressAnnotation);
 
     try {
-      steps = await parsePlanIntoSteps(planContent!, onUsage);
+      steps = await parsePlanIntoSteps(planContent!, files, onUsage);
     } catch (err: any) {
       writer.writeData({
         type: "progress",
@@ -1031,6 +1131,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     if (executionMode === "files") {
       filesToUse = resolveContextFilesForStep(step, accumulatedFiles);
     } else {
+      let graphSearchHit = false;
       try {
         const query = `${step.heading} ${step.details}`;
         const relevantPaths: string[] = searchWithGraph(query, GRAPH_SEARCH_MAX_FILES, GRAPH_SEARCH_DEPTH);
@@ -1044,10 +1145,21 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
           }
           if (Object.keys(stepFiles).length > 0) {
             filesToUse = stepFiles;
+            graphSearchHit = true;
           }
         }
       } catch {
-        // index not available — use full file set
+        logger.warn(`[${requestId}] Step ${step.index} graph search unavailable, falling back to keyword context`);
+      }
+
+      if (!graphSearchHit) {
+        const keywordFiles = resolveContextFilesForTopicStep(step, accumulatedFiles);
+        if (Object.keys(keywordFiles).length > 0) {
+          filesToUse = keywordFiles;
+          logger.info(`[${requestId}] Step ${step.index} keyword fallback found ${Object.keys(keywordFiles).length} files`);
+        } else {
+          logger.warn(`[${requestId}] Step ${step.index} no targeted context found, using full accumulated set`);
+        }
       }
     }
 
