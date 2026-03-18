@@ -104,6 +104,7 @@ export async function handleBuild(
     messages: [...processedMessages],
     files: (files || {}) as any,
     userQuestion,
+    implementPlan: !!implementPlan,
     streamingOptions: planStreamingOptions,
     apiKeys,
     providerSettings,

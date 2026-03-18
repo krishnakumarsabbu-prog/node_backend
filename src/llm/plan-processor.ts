@@ -552,6 +552,11 @@ export interface StreamPlanOptions {
   messages: Messages;
   files: FileMap;
   userQuestion?: string;
+  /**
+   * When true: the user explicitly clicked "Implement Plan" — read steps from plan.md.
+   * When false/absent: treat as a normal question, even if plan.md exists in the file set.
+   */
+  implementPlan?: boolean;
   streamingOptions: StreamingOptions;
   apiKeys: Record<string, string>;
   providerSettings: Record<string, IProviderSetting>;
@@ -589,6 +594,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     messages,
     files,
     userQuestion,
+    implementPlan,
     streamingOptions,
     apiKeys,
     providerSettings,
@@ -601,17 +607,24 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     clientAbortSignal,
   } = opts;
 
-  const planContent = extractPlanContent(files);
+  // ── Mode resolution ────────────────────────────────────────────────────────
+  //
+  //  PLAN MODE   : implementPlan === true  → parse plan.md into steps
+  //  QUESTION    : implementPlan !== true  → file-selection + topic steps
+  //                (plan.md may exist in the file set, but we IGNORE it here)
+  //  MIGRATE     : handled upstream by chat-migrate.ts, never reaches here
+  //
+  const planContent = implementPlan ? extractPlanContent(files) : null;
   const usePlanMd = !!planContent;
 
   if (!usePlanMd && !userQuestion?.trim()) {
-    logger.warn(`[${requestId}] No PLAN.md and no user question — skipping`);
+    logger.warn(`[${requestId}] No implementPlan flag and no user question — skipping`);
     writer.writeData({
       type: "progress",
       label: "plan",
       status: "complete",
       order: progressCounter.value++,
-      message: "No PLAN.md and no user question — skipping",
+      message: "Nothing to implement — provide a question or click 'Implement Plan'.",
     } satisfies ProgressAnnotation);
     return;
   }
@@ -628,8 +641,9 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
   let steps: PlanStep[] = [];
   let selectedFileList: Array<{ path: string; reason: string }> = [];
 
+  // ── Branch A: implement plan.md ───────────────────────────────────────────
   if (usePlanMd) {
-    logger.info(`[${requestId}] PLAN.md found (${planContent!.length} chars) — parsing into steps`);
+    logger.info(`[${requestId}] implementPlan=true — parsing plan.md (${planContent!.length} chars) into steps`);
 
     writer.writeData({
       type: "progress",
@@ -653,8 +667,10 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     }
 
     executionMode = "steps";
+
+  // ── Branch B: user question (plan.md irrelevant here) ─────────────────────
   } else {
-    logger.info(`[${requestId}] Build mode — selecting files for: "${userQuestion!.substring(0, 80)}"`);
+    logger.info(`[${requestId}] Question mode — selecting files for: "${userQuestion!.substring(0, 80)}"`);
 
     writer.writeData({
       type: "progress",
@@ -664,27 +680,27 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       message: "Analysing project and identifying files to modify...",
     } satisfies ProgressAnnotation);
 
+    // Step 1: ask LLM which files need touching
     try {
       const batchPlan = await selectFilesForBuild(userQuestion!, files, onUsage);
       selectedFileList = batchPlan.files;
     } catch (err: any) {
-      logger.warn(`[${requestId}] File selection failed (${err?.message}), falling back to steps mode`);
+      logger.warn(`[${requestId}] File selection failed (${err?.message}), falling back to topic-steps mode`);
       selectedFileList = [];
     }
 
     logger.info(`[${requestId}] File selector returned ${selectedFileList.length} files`);
 
-    if (selectedFileList.length > FILE_PER_STEP_THRESHOLD) {
+    // Step 2: decide execution mode
+    if (selectedFileList.length >= FILE_PER_STEP_THRESHOLD) {
+      // One step per file — gives per-file progress visibility
       executionMode = "files";
       steps = await generateFileSteps(userQuestion!, selectedFileList);
-      logger.info(`[${requestId}] Execution mode: files (${steps.length} file steps)`);
-    } else if (selectedFileList.length === 1) {
-      executionMode = "files";
-      steps = await generateFileSteps(userQuestion!, selectedFileList);
-      logger.info(`[${requestId}] Execution mode: files (single file)`);
+      logger.info(`[${requestId}] Execution mode: file-per-step (${steps.length} files)`);
     } else {
+      // LLM could not pinpoint specific files → generate architectural topic steps
       executionMode = "steps";
-      logger.info(`[${requestId}] Execution mode: steps (no files selected — topic grouping)`);
+      logger.info(`[${requestId}] Execution mode: topic-steps (file selector returned 0 files)`);
 
       try {
         steps = await generateStepsFromQuestion(userQuestion!, onUsage);
