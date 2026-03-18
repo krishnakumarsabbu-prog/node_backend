@@ -32,7 +32,6 @@ export async function handleBuild(
   let { progressCounter } = ctx;
   const {
     files,
-    promptId,
     chatMode,
     designScheme,
     supabase,
@@ -108,7 +107,6 @@ export async function handleBuild(
     streamingOptions: planStreamingOptions,
     apiKeys,
     providerSettings,
-    promptId: promptId || "default",
     chatMode: chatMode as "discuss" | "build",
     designScheme,
     summary,

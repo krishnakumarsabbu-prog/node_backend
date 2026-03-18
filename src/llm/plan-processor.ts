@@ -1068,7 +1068,6 @@ export interface StreamPlanOptions {
   streamingOptions: StreamingOptions;
   apiKeys: Record<string, string>;
   providerSettings: Record<string, IProviderSetting>;
-  promptId: string;
   chatMode: "discuss" | "build";
   designScheme?: DesignScheme;
   progressCounter: { value: number };
