@@ -1,4 +1,5 @@
 import type { Response } from "express";
+import { generateId } from "ai";
 import { MigrationRunner } from "../migration/core/migrationRunner";
 import {
   parseMigrationPlanIntoSteps,
@@ -60,7 +61,7 @@ export class ChatMigrationHandler {
         label: "migration",
         status: "in-progress",
         order: progressCounter++,
-        message: "Generating Migration.md plan document...",
+        message: "Generating migration plan...",
       } satisfies ProgressAnnotation);
 
       const { markdownContent, plan } = await this.runner.generateMigrationDocument(
@@ -68,15 +69,22 @@ export class ChatMigrationHandler {
         userRequest,
       );
 
-      writeDataPart(res, {
-        type: "progress",
-        label: "migration",
-        status: "in-progress",
-        order: progressCounter++,
-        message: "Parsing migration steps...",
-      } satisfies ProgressAnnotation);
+      const messageId = generateId();
+      res.write(`f:${JSON.stringify({ messageId })}\n`);
 
-      const planStepsRaw = await parseMigrationPlanIntoSteps(markdownContent, request.files);
+      const migrationFilePath = "/home/project/migration.md";
+      const fileBlock = `<cortexAction type="file" filePath="${migrationFilePath}">${markdownContent}</cortexAction>`;
+
+      const chunks = fileBlock.match(/.{1,1000}/gs) ?? [fileBlock];
+      for (const chunk of chunks) {
+        res.write(`0:${JSON.stringify(chunk)}\n`);
+      }
+
+      res.write(
+        `e:${JSON.stringify({ finishReason: "stop", usage: { promptTokens: 0, completionTokens: 0 } })}\n`,
+      );
+
+      logger.info(`[migration-plan] Streamed migration.md (${markdownContent.length} chars) as cortexAction file block`);
 
       writeMessageAnnotationPart(res, {
         type: "migration_plan",
@@ -89,22 +97,15 @@ export class ChatMigrationHandler {
         migrationDocument: markdownContent,
       } as ContextAnnotation);
 
-      writeMessageAnnotationPart(res, {
-        type: "planSteps",
-        steps: planStepsRaw.map((s) => ({ index: s.index, heading: s.heading })),
-        totalSteps: planStepsRaw.length,
-        executionMode: "steps",
-      });
-
       writeDataPart(res, {
         type: "progress",
         label: "migration",
         status: "complete",
         order: progressCounter++,
-        message: `Migration plan ready: ${planStepsRaw.length} steps (${plan.estimatedComplexity || "medium"} complexity)`,
+        message: `Migration plan ready (${plan.estimatedComplexity || "medium"} complexity). Review migration.md then click Implement Migration to proceed.`,
       } satisfies ProgressAnnotation);
 
-      logger.info(`Migration.md plan generated: ${planStepsRaw.length} steps`);
+      logger.info(`Migration plan generated for ${plan.migrationType} migration`);
     } catch (error) {
       logger.error(`Plan generation failed: ${(error as Error).message}`);
 
