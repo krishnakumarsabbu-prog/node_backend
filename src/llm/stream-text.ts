@@ -163,13 +163,24 @@ export async function streamText(props: {
     const { totalChars, oversizedFiles } = estimateContextSize(contextFiles!);
     let effectiveContextFiles = contextFiles!;
 
+    const contextFileKeys = Object.keys(contextFiles!);
+    logger.info(
+      `[stream-text] CONTEXT BUFFER: ${contextFileKeys.length} file(s), ${Math.round(totalChars / 1000)}k chars, promptId=${promptId ?? "default"}, isPlanMode=${isPlanMode}`,
+    );
+    for (const fp of contextFileKeys) {
+      const entry = (contextFiles as any)![fp];
+      const chars = typeof entry?.content === "string" ? entry.content.length : 0;
+      logger.info(`[stream-text]   ↳ ${fp} (${chars} chars)`);
+    }
+
     if (oversizedFiles.length > 0) {
-      logger.warn(`Large files detected in context: ${oversizedFiles.join(', ')}`);
+      logger.warn(`[stream-text] Oversized files in context: ${oversizedFiles.join(', ')}`);
     }
 
     if (totalChars > MAX_CONTEXT_CHARS) {
-      logger.warn(`Context too large (${Math.round(totalChars / 1000)}k chars > ${Math.round(MAX_CONTEXT_CHARS / 1000)}k limit), truncating`);
+      logger.warn(`[stream-text] Context too large (${Math.round(totalChars / 1000)}k chars > ${Math.round(MAX_CONTEXT_CHARS / 1000)}k limit), truncating`);
       effectiveContextFiles = truncateContextFiles(contextFiles!, MAX_CONTEXT_CHARS);
+      logger.info(`[stream-text] After truncation: ${Object.keys(effectiveContextFiles).length} file(s) kept`);
     }
 
     const codeContext = createFilesContext(effectiveContextFiles, true);

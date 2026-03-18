@@ -974,6 +974,11 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
   const planContent = implementPlan ? extractPlanContent(files) : null;
   const usePlanMd = !!planContent;
 
+  const totalProjectFiles = Object.keys(files).filter((k) => (files[k] as any)?.type === "file").length;
+  logger.info(
+    `[${requestId}] ═══ streamPlanResponse START ═══ mode=${usePlanMd ? "plan-md" : "question"} implementPlan=${!!implementPlan} chatMode=${chatMode} projectFiles=${totalProjectFiles} question="${userQuestion?.slice(0, 100) ?? "(none)"}"`,
+  );
+
   if (!usePlanMd && !userQuestion?.trim()) {
     logger.warn(`[${requestId}] No implementPlan flag and no user question — skipping`);
     writer.writeData({
@@ -1024,6 +1029,10 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     }
 
     executionMode = "steps";
+    logger.info(`[${requestId}] ► PLAN.MD parsed into ${steps.length} step(s) (context files: ${Object.keys(files).length})`);
+    for (const s of steps) {
+      logger.info(`[${requestId}]   step ${s.index}: ${s.heading}`);
+    }
 
   // ── Branch B: user question (plan.md irrelevant here) ─────────────────────
   } else {
@@ -1046,7 +1055,10 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       selectedFileList = [];
     }
 
-    logger.info(`[${requestId}] File selector returned ${selectedFileList.length} files`);
+    logger.info(`[${requestId}] ► BATCH PLANNER returned ${selectedFileList.length} file(s) (threshold=${FILE_PER_STEP_THRESHOLD})`);
+    for (const f of selectedFileList) {
+      logger.info(`[${requestId}]   ↳ ${f.path} — ${f.reason}`);
+    }
 
     // Step 2: decide execution mode
     if (selectedFileList.length >= FILE_PER_STEP_THRESHOLD) {
@@ -1061,6 +1073,11 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
       try {
         steps = await generateStepsFromQuestion(userQuestion!, files, onUsage);
+        logger.info(`[${requestId}] ► TOPIC STEPS generated: ${steps.length} step(s) (context files: ${Object.keys(files).length})`);
+        for (const s of steps) {
+          logger.info(`[${requestId}]   step ${s.index}: ${s.heading}`);
+          logger.info(`[${requestId}]     details: ${s.details.slice(0, 150)}${s.details.length > 150 ? "…" : ""}`);
+        }
       } catch (err: any) {
         writer.writeData({
           type: "progress",
@@ -1111,7 +1128,10 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     if (!writer.isAlive() || circuitBroken) return;
     if (clientAbortSignal?.aborted) return;
 
-    logger.info(`[${requestId}] Step ${step.index}/${steps.length}: "${step.heading}" [${executionMode}]`);
+    const stepTag = `[${requestId}][step ${step.index}/${steps.length}]`;
+
+    logger.info(`${stepTag} ─── START ─── "${step.heading}" [mode=${executionMode}]`);
+    logger.info(`${stepTag} details: ${step.details.slice(0, 200)}${step.details.length > 200 ? "…" : ""}`);
 
     writer.writeData({
       type: "progress",
@@ -1127,45 +1147,79 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles);
 
     let filesToUse: FileMap = accumulatedFiles;
+    let contextSource = "full-accumulated";
 
     if (executionMode === "files") {
       filesToUse = resolveContextFilesForStep(step, accumulatedFiles);
+      contextSource = "files-mode-resolved";
+
+      const primaryPath = step.heading;
+      const resolvedPrimary = filesToUse[primaryPath]
+        ? primaryPath
+        : Object.keys(filesToUse).find((p) => p !== primaryPath) ?? "(none)";
+      logger.info(`${stepTag} [files-mode] primary file: ${primaryPath}`);
+      logger.info(`${stepTag} [files-mode] resolved to: ${resolvedPrimary}`);
+      if (isTestFile(primaryPath)) {
+        const srcPath = resolveSourceFileForTest(primaryPath, accumulatedFiles);
+        logger.info(`${stepTag} [files-mode] is test file → source: ${srcPath ?? "(not found)"}`);
+      }
     } else {
       let graphSearchHit = false;
       try {
         const query = `${step.heading} ${step.details}`;
         const relevantPaths: string[] = searchWithGraph(query, GRAPH_SEARCH_MAX_FILES, GRAPH_SEARCH_DEPTH);
+        logger.info(`${stepTag} [graph-search] query="${query.slice(0, 100)}…" → ${relevantPaths.length} hit(s)`);
+
         if (relevantPaths.length > 0) {
           const stepFiles: FileMap = {};
+          const matched: string[] = [];
+          const missed: string[] = [];
           for (const relPath of relevantPaths) {
             const fullPath = `/home/project/${relPath}`;
             if (Object.prototype.hasOwnProperty.call(accumulatedFiles, fullPath)) {
               stepFiles[fullPath] = accumulatedFiles[fullPath];
+              matched.push(fullPath);
+            } else {
+              missed.push(fullPath);
             }
           }
+          if (matched.length > 0) logger.info(`${stepTag} [graph-search] matched in accumulated (${matched.length}): ${matched.join(", ")}`);
+          if (missed.length > 0) logger.warn(`${stepTag} [graph-search] graph hit but NOT in accumulated (${missed.length}): ${missed.join(", ")}`);
+
           if (Object.keys(stepFiles).length > 0) {
             filesToUse = stepFiles;
             graphSearchHit = true;
+            contextSource = "graph-search";
           }
+        } else {
+          logger.warn(`${stepTag} [graph-search] returned 0 results — falling back to keyword context`);
         }
-      } catch {
-        logger.warn(`[${requestId}] Step ${step.index} graph search unavailable, falling back to keyword context`);
+      } catch (gErr: any) {
+        logger.warn(`${stepTag} [graph-search] unavailable (${gErr?.message ?? "unknown error"}) — falling back to keyword context`);
       }
 
       if (!graphSearchHit) {
         const keywordFiles = resolveContextFilesForTopicStep(step, accumulatedFiles);
         if (Object.keys(keywordFiles).length > 0) {
           filesToUse = keywordFiles;
-          logger.info(`[${requestId}] Step ${step.index} keyword fallback found ${Object.keys(keywordFiles).length} files`);
+          contextSource = "keyword-fallback";
+          logger.info(`${stepTag} [keyword-fallback] found ${Object.keys(keywordFiles).length} file(s): ${Object.keys(keywordFiles).join(", ")}`);
         } else {
-          logger.warn(`[${requestId}] Step ${step.index} no targeted context found, using full accumulated set`);
+          contextSource = "full-accumulated";
+          logger.warn(`${stepTag} [keyword-fallback] no targeted context found → using full accumulated set (${Object.keys(accumulatedFiles).length} files)`);
         }
       }
     }
 
+    const contextFileList = Object.keys(filesToUse);
     logger.info(
-      `[${requestId}] Step ${step.index} context: ${Object.keys(filesToUse).length} focused files, ${Object.keys(accumulatedFiles).length} total files available`,
+      `${stepTag} ► CONTEXT SENT TO LLM [source=${contextSource}] — ${contextFileList.length} file(s) / ${Object.keys(accumulatedFiles).length} accumulated total`,
     );
+    for (const fp of contextFileList) {
+      const entry = filesToUse[fp] as any;
+      const chars = typeof entry?.content === "string" ? entry.content.length : 0;
+      logger.info(`${stepTag}   ↳ ${fp} (${chars} chars)`);
+    }
 
     try {
       const { stepText, succeeded } = await streamStep({
@@ -1187,7 +1241,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       });
 
       if (!succeeded) {
-        logger.warn(`[${requestId}] Step ${step.index} reported failure (all retries exhausted), skipping file extraction`);
+        logger.warn(`${stepTag} ✗ FAILED (all retries exhausted), skipping file extraction`);
         failedSteps++;
         writer.writeData({
           type: "progress",
@@ -1203,7 +1257,11 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       const generatedCount = Object.keys(generatedFiles).length;
       if (generatedCount > 0) {
         Object.assign(accumulatedFiles, generatedFiles);
-        logger.info(`[${requestId}] Step ${step.index} produced ${generatedCount} file(s), accumulated state updated`);
+        logger.info(`${stepTag} ► LLM OUTPUT — ${generatedCount} file(s) generated:`);
+        for (const [fp, entry] of Object.entries(generatedFiles)) {
+          const chars = typeof (entry as any)?.content === "string" ? (entry as any).content.length : 0;
+          logger.info(`${stepTag}   ↳ ${fp} (${chars} chars)`);
+        }
 
         const patches: PatchEntry[] = [];
         for (const [filePath, entry] of Object.entries(generatedFiles)) {
@@ -1214,15 +1272,17 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         if (patches.length > 0) {
           try {
             patchIndex(patches);
-            logger.info(`[${requestId}] Step ${step.index} index patched with ${patches.length} file(s)`);
+            logger.info(`${stepTag} [index] patched with ${patches.length} file(s)`);
           } catch (patchErr: any) {
-            logger.warn(`[${requestId}] Step ${step.index} index patch failed (non-fatal): ${patchErr?.message}`);
+            logger.warn(`${stepTag} [index] patch failed (non-fatal): ${patchErr?.message}`);
           }
         }
+      } else {
+        logger.warn(`${stepTag} ► LLM OUTPUT — 0 files extracted (no <cortexAction type="file"> blocks found in response)`);
       }
 
       if (!writer.isAlive()) {
-        logger.warn(`[${requestId}] Client disconnected during step ${step.index}, aborting`);
+        logger.warn(`${stepTag} client disconnected after step output, aborting`);
         return;
       }
 
@@ -1235,8 +1295,10 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         order: progressCounter.value++,
         message: `Step ${step.index}/${steps.length} done: ${step.heading}`,
       } satisfies ProgressAnnotation);
+
+      logger.info(`${stepTag} ─── DONE ─── succeeded=${succeededSteps} failed=${failedSteps}`);
     } catch (err: any) {
-      logger.error(`[${requestId}] Step ${step.index} error: ${err?.message}`, err);
+      logger.error(`${stepTag} ✗ ERROR: ${err?.message}`, err);
 
       writer.writeData({
         type: "progress",
@@ -1272,7 +1334,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
   }
 
   logger.info(
-    `[${requestId}] All ${steps.length} steps complete. succeeded=${succeededSteps} failed=${failedSteps} totalTokens=${cumulativeUsage.totalTokens}`,
+    `[${requestId}] ═══ PLAN COMPLETE ═══ steps=${steps.length} succeeded=${succeededSteps} failed=${failedSteps} circuitBroken=${circuitBroken} totalTokens=${cumulativeUsage.totalTokens} promptTokens=${cumulativeUsage.promptTokens} completionTokens=${cumulativeUsage.completionTokens}`,
   );
 
   writer.writeData({
