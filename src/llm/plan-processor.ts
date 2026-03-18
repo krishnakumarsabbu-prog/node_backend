@@ -138,9 +138,12 @@ Think through the best architecture and zero-overlap execution order, then retur
 
 export async function generateStepsFromQuestion(
   userQuestion: string,
+  contextFiles?: FileMap,
   onFinish?: (resp: GenerateTextResult<Record<string, CoreTool<any, any>>, never>) => void,
 ): Promise<PlanStep[]> {
   logger.info("Generating implementation steps from user question via LLM...");
+
+  const existingFileSummary = buildExistingFileSummary(contextFiles);
 
   const resp = await generateText({
     model: getTachyonModel(),
@@ -153,6 +156,9 @@ Return ONLY a valid JSON array — no prose, no markdown fences. Each element mu
 "index"   : number  (1-based sequential integer)
 "heading" : string  (concise action-oriented title ≤ 80 chars, starting with a verb: "Add", "Create", "Update", "Implement", "Refactor", "Wire", "Integrate", "Extend", "Build")
 "details" : string  (precise implementation guidance: exact files to create/modify, specific functions/components/types to write, data shapes, API contracts, UI behavior, and how this step integrates with the previous and next steps)
+
+CRITICAL — EXISTING FILE AWARENESS:
+When you reference files in "details", you MUST use the exact file paths from the project. If the user asks about a feature that involves an existing file, reference that exact path — never invent a different name. For example, if the project has "src/pages/PhotosPage.tsx" and the user asks to modify the gallery, your step must reference "src/pages/PhotosPage.tsx", NOT "src/pages/GalleryPage.tsx".
 
 THINK BEFORE YOU PLAN — run this mental checklist:
 1. What is the ideal architecture for this feature? (consider: data model, service layer, API shape, state management, UI components)
@@ -186,8 +192,8 @@ User's request:
 <request>
 ${userQuestion}
 </request>
-
-Think through the optimal architecture and zero-overlap step order that fully implements this request end-to-end. Then return the JSON array of code change steps.
+${existingFileSummary ? `\n${existingFileSummary}\n` : ""}
+Think through the optimal architecture and zero-overlap step order that fully implements this request end-to-end. Use the exact file names from the project where applicable. Then return the JSON array of code change steps.
 `,
   });
 
@@ -202,6 +208,23 @@ Think through the optimal architecture and zero-overlap step order that fully im
     logger.error("Failed to parse LLM step response as JSON, falling back to single step", err);
     return [{ index: 1, heading: "Implement Request", details: userQuestion }];
   }
+}
+
+function buildExistingFileSummary(files?: FileMap): string {
+  if (!files || Object.keys(files).length === 0) return "";
+
+  const entries = Object.entries(files)
+    .filter(([, entry]) => entry?.type === "file" && !(entry as any).isBinary)
+    .map(([path]) => `  - ${path}`);
+
+  if (entries.length === 0) return "";
+
+  return [
+    `<existing_project_files>`,
+    `The project already contains these files. Reference them by their EXACT paths in your step details:`,
+    entries.join("\n"),
+    `</existing_project_files>`,
+  ].join("\n");
 }
 
 export async function generateFileSteps(
@@ -406,6 +429,53 @@ function resolveSourceFileForTest(testPath: string, files: FileMap): string | nu
   return null;
 }
 
+function resolveContextFilesForStep(step: PlanStep, accumulatedFiles: FileMap): FileMap {
+  const filePath = step.heading;
+  const result: FileMap = {};
+
+  const primaryFile = accumulatedFiles[filePath];
+  if (primaryFile) {
+    result[filePath] = primaryFile;
+  } else {
+    const fuzzyMatch = fuzzyFindExistingFile(filePath, accumulatedFiles);
+    if (fuzzyMatch && accumulatedFiles[fuzzyMatch]) {
+      result[fuzzyMatch] = accumulatedFiles[fuzzyMatch];
+    }
+  }
+
+  if (isTestFile(filePath)) {
+    const sourcePath = resolveSourceFileForTest(filePath, accumulatedFiles);
+    if (sourcePath && accumulatedFiles[sourcePath]) {
+      result[sourcePath] = accumulatedFiles[sourcePath];
+    }
+  }
+
+  const mentionedPaths = extractMentionedFilePaths(step.details, accumulatedFiles);
+  for (const p of mentionedPaths) {
+    if (!result[p] && accumulatedFiles[p]) {
+      result[p] = accumulatedFiles[p];
+    }
+  }
+
+  return result;
+}
+
+function extractMentionedFilePaths(details: string, files: FileMap): string[] {
+  const mentioned: string[] = [];
+  for (const filePath of Object.keys(files)) {
+    const basename = filePath.split("/").pop() ?? "";
+    const relativePath = filePath.replace("/home/project/", "");
+    if (
+      details.includes(filePath) ||
+      details.includes(relativePath) ||
+      (basename.length > 4 && details.includes(basename))
+    ) {
+      mentioned.push(filePath);
+    }
+  }
+  return mentioned;
+}
+
 function STEP_EXECUTION_INSTRUCTIONS(stepIndex: number): string {
   return [
     `## Execution Rules for Step ${stepIndex}`,
@@ -491,6 +561,7 @@ function buildTopicStepMessages(
   usePlanMd: boolean,
   planContent: string | null,
   userQuestion: string | null,
+  accumulatedFiles?: FileMap,
 ): Messages {
   const stepMessages: Messages = [...messages];
 
@@ -505,6 +576,8 @@ function buildTopicStepMessages(
     .filter((s) => s.index > step.index)
     .map((s) => `  ${s.index}. ${s.heading}`)
     .join("\n");
+
+  const existingFileContext = buildStepFileContext(step, accumulatedFiles);
 
   if (step.index > 1) {
     const prevStep = steps[step.index - 2];
@@ -524,13 +597,14 @@ function buildTopicStepMessages(
         `## Your Task - Step ${step.index}/${steps.length}: ${step.heading}`,
         ``,
         step.details,
+        existingFileContext,
         ``,
         remainingSteps
           ? `## Do NOT implement yet (upcoming steps):\n${remainingSteps}`
           : `## This is the FINAL step - complete the implementation.`,
         ``,
         STEP_EXECUTION_INSTRUCTIONS(step.index),
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
     } as any);
   } else {
     const planContext = usePlanMd
@@ -552,17 +626,35 @@ function buildTopicStepMessages(
         `## Your Task - Step ${step.index}/${steps.length}: ${step.heading}`,
         ``,
         step.details,
+        existingFileContext,
         ``,
         remainingSteps
           ? `## Do NOT implement yet (upcoming steps):\n${remainingSteps}`
           : `## This is the ONLY step - complete the full implementation.`,
         ``,
         STEP_EXECUTION_INSTRUCTIONS(step.index),
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
     } as any);
   }
 
   return stepMessages;
+}
+
+function buildStepFileContext(step: PlanStep, files?: FileMap): string {
+  if (!files || Object.keys(files).length === 0) return "";
+
+  const mentionedPaths = extractMentionedFilePaths(step.details + " " + step.heading, files);
+  if (mentionedPaths.length === 0) return "";
+
+  const sections: string[] = [`\n## Existing file contents for this step (modify these, do not recreate from scratch):`];
+
+  for (const filePath of mentionedPaths) {
+    const entry = files[filePath];
+    if (!entry || entry.type !== "file" || (entry as any).isBinary) continue;
+    sections.push(`\n### ${filePath}\n\`\`\`\n${(entry as any).content}\n\`\`\``);
+  }
+
+  return sections.length > 1 ? sections.join("\n") : "";
 }
 
 function buildFileStepMessages(
@@ -588,10 +680,20 @@ function buildFileStepMessages(
     .join("\n");
 
   const existingFile = files[filePath];
-  const fileContext =
-    existingFile && existingFile.type === "file" && !existingFile.isBinary
-      ? `\n\nCurrent content of ${filePath}:\n\`\`\`\n${existingFile.content}\n\`\`\``
-      : `\n\n${filePath} does not exist yet — create it from scratch.`;
+
+  const fuzzyMatch = !existingFile ? fuzzyFindExistingFile(filePath, files) : null;
+
+  const resolvedExistingFile = existingFile ?? (fuzzyMatch ? files[fuzzyMatch] : undefined);
+  const resolvedFilePath = existingFile ? filePath : (fuzzyMatch ?? filePath);
+
+  let fileContext: string;
+  if (resolvedExistingFile && resolvedExistingFile.type === "file" && !resolvedExistingFile.isBinary) {
+    fileContext = fuzzyMatch
+      ? `\n\nNOTE: The step references "${filePath}" but the project has "${resolvedFilePath}". Treat them as the same file.\n\nCurrent content of ${resolvedFilePath}:\n\`\`\`\n${resolvedExistingFile.content}\n\`\`\``
+      : `\n\nCurrent content of ${filePath}:\n\`\`\`\n${resolvedExistingFile.content}\n\`\`\``;
+  } else {
+    fileContext = `\n\n${filePath} does not exist yet — create it from scratch.`;
+  }
 
   const sourceFileContext = (() => {
     if (!isTestFile(filePath)) return "";
@@ -599,7 +701,7 @@ function buildFileStepMessages(
     if (!sourcePath) return "";
     const sourceFile = files[sourcePath];
     if (!sourceFile || sourceFile.type !== "file" || sourceFile.isBinary) return "";
-    return `\n\n## Source file under test — ${sourcePath}:\n\`\`\`\n${sourceFile.content}\n\`\`\``;
+    return `\n\n## Source file under test — ${sourcePath}:\n\`\`\`\n${(sourceFile as any).content}\n\`\`\``;
   })();
 
   if (step.index > 1) {
@@ -626,18 +728,53 @@ function buildFileStepMessages(
       `---`,
       ``,
       `## Current Task — Step ${step.index}/${steps.length}`,
-      `File: ${filePath}`,
+      `File: ${resolvedFilePath}`,
       step.details,
       fileContext,
       sourceFileContext,
       ``,
-      FILE_STEP_EXECUTION_INSTRUCTIONS(filePath, !!existingFile, userQuestion),
+      FILE_STEP_EXECUTION_INSTRUCTIONS(resolvedFilePath, !!resolvedExistingFile, userQuestion),
     ]
       .filter(Boolean)
       .join("\n"),
   } as any);
 
   return stepMessages;
+}
+
+function fuzzyFindExistingFile(targetPath: string, files: FileMap): string | null {
+  const targetBasename = targetPath.split("/").pop()?.toLowerCase() ?? "";
+  const targetStem = targetBasename.replace(/\.[^.]+$/, "");
+
+  if (!targetStem || targetStem.length < 3) return null;
+
+  let bestMatch: string | null = null;
+  let bestScore = 0;
+
+  for (const existingPath of Object.keys(files)) {
+    const existingBasename = existingPath.split("/").pop()?.toLowerCase() ?? "";
+    const existingStem = existingBasename.replace(/\.[^.]+$/, "");
+
+    const score = stemSimilarity(targetStem, existingStem);
+    if (score > bestScore && score >= 0.6) {
+      bestScore = score;
+      bestMatch = existingPath;
+    }
+  }
+
+  return bestMatch;
+}
+
+function stemSimilarity(a: string, b: string): number {
+  if (a === b) return 1;
+  const shorter = a.length < b.length ? a : b;
+  const longer = a.length < b.length ? b : a;
+  if (longer.includes(shorter)) return shorter.length / longer.length;
+  const tokensA = new Set(a.replace(/([A-Z])/g, " $1").toLowerCase().split(/[\s_-]+/).filter(Boolean));
+  const tokensB = new Set(b.replace(/([A-Z])/g, " $1").toLowerCase().split(/[\s_-]+/).filter(Boolean));
+  const intersection = [...tokensA].filter((t) => tokensB.has(t));
+  const union = new Set([...tokensA, ...tokensB]);
+  return intersection.length / union.size;
 }
 
 function sanitizeGeneratedPath(rawPath: string): string | null {
@@ -823,7 +960,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       logger.info(`[${requestId}] Execution mode: topic-steps (${selectedFileList.length} files < threshold ${FILE_PER_STEP_THRESHOLD})`);
 
       try {
-        steps = await generateStepsFromQuestion(userQuestion!, onUsage);
+        steps = await generateStepsFromQuestion(userQuestion!, files, onUsage);
       } catch (err: any) {
         writer.writeData({
           type: "progress",
@@ -887,17 +1024,12 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     const stepMessages =
       executionMode === "files"
         ? buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles)
-        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null);
+        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles);
 
     let filesToUse: FileMap = accumulatedFiles;
 
     if (executionMode === "files") {
-      const specificFile = accumulatedFiles[step.heading];
-      if (specificFile) {
-        filesToUse = { [step.heading]: specificFile };
-      } else {
-        filesToUse = {};
-      }
+      filesToUse = resolveContextFilesForStep(step, accumulatedFiles);
     } else {
       try {
         const query = `${step.heading} ${step.details}`;
