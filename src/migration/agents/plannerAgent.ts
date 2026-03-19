@@ -5,8 +5,11 @@ import { MigrationPlanSchema } from "../schemas/migrationSchema";
 import { LLMClient } from "../llm/llmClient";
 import { PromptBuilder } from "../llm/promptBuilder";
 import { getTachyonModel } from "../../modules/llm/providers/tachyon";
-import { buildCodebaseIntelligence } from "../intelligence/contextBuilder";
+import { buildCodebaseIntelligence, type CodebaseIntelligence } from "../intelligence/contextBuilder";
+import { MigrationPlanVerifierAgent } from "./migrationPlanVerifierAgent";
 import { createScopedLogger } from "../../utils/logger";
+
+const MAX_VERIFY_FIX_ATTEMPTS = 2;
 
 const logger = createScopedLogger("planner-agent");
 
@@ -30,6 +33,8 @@ interface DualOutputResponse {
 }
 
 export class PlannerAgent {
+  private verifier = new MigrationPlanVerifierAgent();
+
   constructor(private llmClient: LLMClient) {}
 
   async generateMigrationDocument(
@@ -66,13 +71,78 @@ export class PlannerAgent {
       maxTokens: 8192,
     });
 
-    const { markdownContent, plan } = this.parseDualOutput(result.text.trim(), fileList);
+    let { markdownContent, plan } = this.parseDualOutput(result.text.trim(), fileList);
 
     logger.info(
       `Migration.md generated: ${markdownContent.length} chars, ${plan.tasks.length} tasks`
     );
 
+    ({ markdownContent, plan } = await this.verifyAndFix(
+      intelligence,
+      markdownContent,
+      plan
+    ));
+
     return { markdownContent, plan };
+  }
+
+  private async verifyAndFix(
+    intelligence: CodebaseIntelligence,
+    markdownContent: string,
+    plan: MigrationPlan
+  ): Promise<{ markdownContent: string; plan: MigrationPlan }> {
+    let currentMarkdown = markdownContent;
+    let currentPlan = plan;
+
+    for (let attempt = 1; attempt <= MAX_VERIFY_FIX_ATTEMPTS; attempt++) {
+      logger.info(`Running plan verification (attempt ${attempt}/${MAX_VERIFY_FIX_ATTEMPTS})`);
+
+      const verification = await this.verifier.verify(intelligence, currentMarkdown, currentPlan);
+
+      logger.info(
+        `Verification: status=${verification.status}, ` +
+        `completeness=${verification.scores.completeness}/10, ` +
+        `correctness=${verification.scores.correctness}/10, ` +
+        `executability=${verification.scores.executability}/10`
+      );
+
+      if (verification.status === "PASS") {
+        logger.info("Verification passed — plan accepted");
+        return { markdownContent: currentMarkdown, plan: currentPlan };
+      }
+
+      const totalIssues =
+        verification.missingItems.length +
+        verification.taskIssues.length +
+        verification.dependencyIssues.length +
+        verification.technicalIssues.length;
+
+      logger.warn(
+        `Verification FAILED: ${totalIssues} issues found. ` +
+        `Running auto-fix pass ${attempt}/${MAX_VERIFY_FIX_ATTEMPTS}...`
+      );
+
+      if (attempt === MAX_VERIFY_FIX_ATTEMPTS) {
+        logger.warn("Max fix attempts reached — using last generated plan");
+        break;
+      }
+
+      const fixed = await this.verifier.fix(
+        intelligence,
+        currentMarkdown,
+        currentPlan,
+        verification
+      );
+
+      currentMarkdown = fixed.markdownContent;
+      currentPlan = fixed.plan;
+
+      logger.info(
+        `Fix applied: ${currentMarkdown.length} chars markdown, ${currentPlan.tasks.length} tasks`
+      );
+    }
+
+    return { markdownContent: currentMarkdown, plan: currentPlan };
   }
 
   async generatePlan(

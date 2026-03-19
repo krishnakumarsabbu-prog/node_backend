@@ -1,7 +1,8 @@
-import type { ProjectAnalysis, BuildError } from "../types/migrationTypes";
+import type { ProjectAnalysis, BuildError, MigrationPlan } from "../types/migrationTypes";
 import type { FileMap } from "../../llm/constants";
 import type { CodebaseIntelligence } from "../intelligence/contextBuilder";
 import { buildMigrationContextPrompt } from "../intelligence/contextBuilder";
+import type { MigrationPlanVerificationResult } from "../agents/migrationPlanVerifierAgent";
 
 export class PromptBuilder {
   static buildAnalysisPrompt(files: FileMap): string {
@@ -96,7 +97,7 @@ ${context}
 ${PromptBuilder.getMigrationDocumentInstructions()}`;
   }
 
-  private static getMigrationDocumentInstructions(): string {
+  static getMigrationDocumentInstructions(): string {
     return `YOUR TASK:
 Generate a DUAL OUTPUT: (1) a complete Migration.md document AND (2) a structured task list JSON.
 
@@ -428,4 +429,247 @@ Extract:
 
 Return structured JSON.`;
   }
+
+  static buildVerifierSystemPrompt(): string {
+    return `You are a principal-level Java architect and code migration auditor.
+
+Your task is to rigorously review a generated Spring MVC → Spring Boot migration plan.
+
+You must NOT assume the plan is correct.
+
+You must:
+- Identify missing steps
+- Detect incorrect or risky migration strategies
+- Validate completeness of the migration
+- Validate task dependencies and execution order
+- Ensure alignment with Spring Boot best practices
+
+Be critical, precise, and exhaustive.
+Do not provide generic feedback.
+Score each dimension honestly — do not inflate scores.`;
+  }
+
+  static buildMigrationVerificationPrompt(
+    intelligence: CodebaseIntelligence,
+    markdownContent: string,
+    plan: MigrationPlan
+  ): string {
+    const contextSummary = [
+      `Framework: ${intelligence.framework}`,
+      `Build Tool: ${intelligence.buildTool}`,
+      `Controllers: ${intelligence.stats.controllers}`,
+      `Services: ${intelligence.stats.services}`,
+      `Repositories: ${intelligence.stats.repositories}`,
+      `XML Config Files: ${intelligence.stats.xmlConfigFiles}`,
+      `Total Files: ${intelligence.stats.totalFiles}`,
+      `Circular Dependencies: ${intelligence.graphSummary.circularDependencies}`,
+      `usesXmlConfiguration: ${intelligence.patterns.usesXmlConfiguration}`,
+      `usesFieldInjection: ${intelligence.patterns.usesFieldInjection}`,
+      `hasLegacyDispatcher: ${intelligence.patterns.hasLegacyDispatcher}`,
+      `missingBootMain: ${intelligence.patterns.missingBootMain}`,
+      `hasMultipleXmlConfigs: ${intelligence.patterns.hasMultipleXmlConfigs}`,
+      `usesPropertyPlaceholders: ${intelligence.patterns.usesPropertyPlaceholders}`,
+      `hasCircularDependencies: ${intelligence.patterns.hasCircularDependencies}`,
+      `Controllers: ${intelligence.keyFiles.controllers.slice(0, 10).join(", ") || "(none)"}`,
+      `Services: ${intelligence.keyFiles.services.slice(0, 10).join(", ") || "(none)"}`,
+      `Configs: ${intelligence.keyFiles.configs.slice(0, 10).join(", ") || "(none)"}`,
+      `Entry Points: ${intelligence.keyFiles.entryPoints.join(", ") || "(none)"}`,
+    ].join("\n");
+
+    const tasksJson = JSON.stringify(plan.tasks, null, 2);
+
+    return `You are given:
+
+1) Project Analysis (structured codebase intelligence)
+2) Generated Migration Document (markdown)
+3) Generated Task Plan (JSON)
+
+Your job is to VERIFY the migration quality.
+
+---
+
+### Project Analysis:
+${contextSummary}
+
+---
+
+### Migration Document (first 6000 chars):
+${markdownContent.slice(0, 6000)}${markdownContent.length > 6000 ? "\n...[truncated]" : ""}
+
+---
+
+### Task Plan (JSON):
+${tasksJson.slice(0, 4000)}${tasksJson.length > 4000 ? "\n...[truncated]" : ""}
+
+---
+
+### Perform the following checks:
+
+#### 1. COMPLETENESS CHECK
+- Are all major migration areas covered?
+  - XML → Java Config
+  - Dependency Injection changes
+  - Entry point creation (@SpringBootApplication)
+  - Build file updates (Spring Boot dependencies)
+  - Configuration migration (properties/yml)
+  - Controller/service/repository updates
+
+List missing areas.
+
+#### 2. TASK COVERAGE CHECK
+- Do tasks cover ALL identified components from the Project Analysis?
+- Are any files/components from the analysis missing from tasks?
+- Are config files properly included?
+
+#### 3. DEPENDENCY VALIDATION
+- Are task dependencies logically correct?
+- Is execution order valid (build → config → code → resource)?
+- Are there circular or missing dependencies?
+
+#### 4. TECHNICAL CORRECTNESS
+- Are migration strategies correct for Spring Boot?
+- Any outdated or incorrect practices?
+- Any risky transformations (e.g., incorrect bean replacements, missing annotations)?
+
+#### 5. CONSISTENCY CHECK
+- Do markdown and task plan agree on what needs to be done?
+- Any contradictions between them?
+
+#### 6. RISK ANALYSIS
+- Identify high-risk areas:
+  - complex XML configs not fully handled
+  - tight coupling
+  - missing bean definitions
+  - circular dependencies not resolved
+
+#### 7. IMPROVEMENT SUGGESTIONS
+- Suggest better migration approaches if applicable
+
+---
+
+### OUTPUT FORMAT (STRICT JSON — return ONLY this, no extra text):
+
+\`\`\`json
+{
+  "status": "PASS",
+  "summary": "Short overall assessment",
+  "scores": {
+    "completeness": 8,
+    "correctness": 7,
+    "executability": 9
+  },
+  "missingItems": [
+    "..."
+  ],
+  "taskIssues": [
+    {
+      "taskId": "task-001",
+      "issue": "..."
+    }
+  ],
+  "dependencyIssues": [
+    "..."
+  ],
+  "technicalIssues": [
+    "..."
+  ],
+  "consistencyIssues": [
+    "..."
+  ],
+  "risks": [
+    "..."
+  ],
+  "improvements": [
+    "..."
+  ]
+}
+\`\`\``;
+  }
+
+  static buildMigrationFixPrompt(
+    intelligence: CodebaseIntelligence,
+    markdownContent: string,
+    plan: MigrationPlan,
+    verificationResult: MigrationPlanVerificationResult
+  ): string {
+    const issuesSummary = [
+      verificationResult.missingItems.length > 0
+        ? `MISSING ITEMS:\n${verificationResult.missingItems.map((i) => `- ${i}`).join("\n")}`
+        : null,
+      verificationResult.taskIssues.length > 0
+        ? `TASK ISSUES:\n${verificationResult.taskIssues.map((i) => `- [${i.taskId}] ${i.issue}`).join("\n")}`
+        : null,
+      verificationResult.dependencyIssues.length > 0
+        ? `DEPENDENCY ISSUES:\n${verificationResult.dependencyIssues.map((i) => `- ${i}`).join("\n")}`
+        : null,
+      verificationResult.technicalIssues.length > 0
+        ? `TECHNICAL ISSUES:\n${verificationResult.technicalIssues.map((i) => `- ${i}`).join("\n")}`
+        : null,
+      verificationResult.consistencyIssues.length > 0
+        ? `CONSISTENCY ISSUES:\n${verificationResult.consistencyIssues.map((i) => `- ${i}`).join("\n")}`
+        : null,
+      verificationResult.risks.length > 0
+        ? `RISKS:\n${verificationResult.risks.map((i) => `- ${i}`).join("\n")}`
+        : null,
+      verificationResult.improvements.length > 0
+        ? `SUGGESTED IMPROVEMENTS:\n${verificationResult.improvements.map((i) => `- ${i}`).join("\n")}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    const contextSummary = [
+      `Framework: ${intelligence.framework}`,
+      `Build Tool: ${intelligence.buildTool}`,
+      `Controllers: ${intelligence.stats.controllers}`,
+      `Services: ${intelligence.stats.services}`,
+      `Repositories: ${intelligence.stats.repositories}`,
+      `XML Config Files: ${intelligence.stats.xmlConfigFiles}`,
+      `Detected Patterns — usesXmlConfiguration: ${intelligence.patterns.usesXmlConfiguration}, usesFieldInjection: ${intelligence.patterns.usesFieldInjection}, hasLegacyDispatcher: ${intelligence.patterns.hasLegacyDispatcher}, missingBootMain: ${intelligence.patterns.missingBootMain}`,
+    ].join("\n");
+
+    return `You are a senior Spring migration architect.
+
+A verification audit was run on a generated migration plan and FAILED with the following issues:
+
+---
+
+### Verification Report
+Status: ${verificationResult.status}
+Summary: ${verificationResult.summary}
+Scores: completeness=${verificationResult.scores.completeness}/10, correctness=${verificationResult.scores.correctness}/10, executability=${verificationResult.scores.executability}/10
+
+${issuesSummary}
+
+---
+
+### Project Context:
+${contextSummary}
+
+---
+
+### Original Migration Document (first 4000 chars):
+${markdownContent.slice(0, 4000)}${markdownContent.length > 4000 ? "\n...[truncated]" : ""}
+
+---
+
+### Original Task Plan:
+${JSON.stringify(plan.tasks.slice(0, 30), null, 2)}
+
+---
+
+### YOUR TASK:
+Fix the migration plan based on all identified issues.
+
+RULES:
+1. Address every issue listed in the verification report
+2. Add missing tasks for uncovered components
+3. Fix incorrect dependency ordering
+4. Apply correct Spring Boot patterns
+5. Ensure all XML configs are properly converted in the task list
+6. Return the SAME dual-output format as the original generation
+
+${PromptBuilder.getMigrationDocumentInstructions()}`;
+  }
+
 }
