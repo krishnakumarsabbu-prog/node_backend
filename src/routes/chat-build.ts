@@ -5,6 +5,7 @@ import type { Messages, StreamingOptions } from "../llm/stream-text";
 import type { ProgressAnnotation } from "../types/context";
 import { MCPService } from "../llm/mcpService";
 import { streamPlanResponse, type StreamWriter } from "../llm/plan-processor";
+import { detectArchitecture } from "../llm/architecture/detector";
 
 import {
   logger,
@@ -97,13 +98,18 @@ export async function handleBuild(
     logger.info(`[${requestId}] Build mode auto-planning from question: "${userQuestion.substring(0, 80)}"`);
   }
 
+  const projectFiles = (files || {}) as any;
+  const architecture = detectArchitecture(projectFiles);
+  logger.info(`[${requestId}] Architecture detected: language=${architecture.language} framework=${architecture.framework} type=${architecture.projectType}`);
+
   await streamPlanResponse({
     res,
     requestId,
     messages: [...processedMessages],
-    files: (files || {}) as any,
+    files: projectFiles,
     userQuestion,
     implementPlan: !!implementPlan,
+    architecture,
     streamingOptions: planStreamingOptions,
     apiKeys,
     providerSettings,

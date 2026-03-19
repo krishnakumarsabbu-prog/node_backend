@@ -20,6 +20,8 @@ import { buildSequentialExecutionPlan } from "./agents/sequential-executor";
 import { runPlanSanityCheck, injectSymbolWarningsIntoSteps } from "./agents/plan-sanity";
 import { buildStepSymbolSummaries, buildSymbolContextBlock } from "./agents/symbol-extractor";
 import { checkCompleteness } from "./agents/completeness-checker";
+import type { ProjectArchitecture } from "./architecture/detector";
+import { formatArchitectureBlock, formatArchitectureConstraintRule } from "./architecture/formatter";
 
 const TEST_INTENT_PATTERNS = [
   /\b(write|add|create|generate|run|fix|update)\s+(a\s+)?(unit\s+)?tests?\b/i,
@@ -236,6 +238,7 @@ export async function generateStepsFromQuestion(
   userQuestion: string,
   contextFiles?: FileMap,
   onFinish?: (resp: GenerateTextResult<Record<string, CoreTool<any, any>>, never>) => void,
+  architectureBlock?: string,
 ): Promise<PlanStep[]> {
   logger.info("Generating implementation steps from user question via LLM...");
 
@@ -355,7 +358,7 @@ FORBIDDEN:
 OUTPUT: JSON array only. No explanation text. No markdown fences. No preamble.
 `,
     prompt: `
-User's request:
+${architectureBlock ? `${architectureBlock}\n\nARCHITECTURE CONSTRAINT: Every step MUST follow the detected ProjectArchitecture above. Only create files and patterns that fit the detected framework and project type. Do not invent layers, routing systems, or UI patterns that are not present in the project.\n\n` : ""}User's request:
 
 <request>
 ${userQuestion}
@@ -658,6 +661,7 @@ async function streamStep(opts: {
   cumulativeUsage: { completionTokens: number; promptTokens: number; totalTokens: number };
   clientAbortSignal?: AbortSignal;
   promptId?: string;
+  systemSuffix?: string;
 }): Promise<{ stepText: string; succeeded: boolean }> {
   const { requestId, res, stepMessages, filesToUse, allFiles, stepIndex, cumulativeUsage } = opts;
 
@@ -688,6 +692,7 @@ async function streamStep(opts: {
         contextFiles: filesToUse,
         messageSliceId: undefined,
         clientAbortSignal: opts.clientAbortSignal,
+        systemSuffix: opts.systemSuffix,
       });
 
       const response = result.toDataStreamResponse();
@@ -1007,6 +1012,8 @@ function buildTopicStepMessages(
   accumulatedFiles?: FileMap,
   originalFiles?: FileMap,
   completedSteps?: CompletedStepMemory[],
+  architectureBlock?: string | null,
+  architectureConstraints?: string | null,
 ): Messages {
   const stepMessages: Messages = [...messages];
 
@@ -1040,6 +1047,8 @@ function buildTopicStepMessages(
       id: generateId(),
       role: "user",
       content: [
+        architectureBlock ?? "",
+        architectureConstraints ?? "",
         `## Plan Progress`,
         allStepsList,
         createdFilesFeedback,
@@ -1066,6 +1075,8 @@ function buildTopicStepMessages(
       id: generateId(),
       role: "user",
       content: [
+        architectureBlock ?? "",
+        architectureConstraints ?? "",
         `You are implementing a project plan step by step. There are ${steps.length} steps in total.`,
         ``,
         ...planContext,
@@ -1329,6 +1340,7 @@ export interface StreamPlanOptions {
    * When false/absent: treat as a normal question, even if plan.md exists in the file set.
    */
   implementPlan?: boolean;
+  architecture?: ProjectArchitecture;
   streamingOptions: StreamingOptions;
   apiKeys: Record<string, string>;
   providerSettings: Record<string, IProviderSetting>;
@@ -1367,6 +1379,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     files,
     userQuestion,
     implementPlan,
+    architecture,
     streamingOptions,
     apiKeys,
     providerSettings,
@@ -1378,6 +1391,9 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     cumulativeUsage,
     clientAbortSignal,
   } = opts;
+
+  const archBlock = architecture ? formatArchitectureBlock(architecture) : null;
+  const archConstraints = architecture ? formatArchitectureConstraintRule(architecture) : null;
 
   // ── Mode resolution ────────────────────────────────────────────────────────
   //
@@ -1506,7 +1522,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       logger.info(`[${requestId}] Execution mode: topic-steps (${selectedFileList.length} files < threshold ${FILE_PER_STEP_THRESHOLD})`);
 
       try {
-        steps = await generateStepsFromQuestion(userQuestion!, files, onUsage);
+        steps = await generateStepsFromQuestion(userQuestion!, files, onUsage, archBlock ?? undefined);
         logger.info(`[${requestId}] ► TOPIC STEPS generated: ${steps.length} step(s) (context files: ${Object.keys(files).length})`);
         for (const s of steps) {
           logger.info(`[${requestId}]   step ${s.index}: ${s.heading}`);
@@ -1614,7 +1630,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     const stepMessages =
       executionMode === "files"
         ? buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles)
-        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory);
+        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints);
 
     let filesToUse: FileMap = accumulatedFiles;
     let contextSource = "full-accumulated";
@@ -1708,6 +1724,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         cumulativeUsage,
         clientAbortSignal,
         promptId: isTestRequest ? "plan-test" : "plan",
+        systemSuffix: archConstraints ?? undefined,
       });
     };
 
@@ -1755,7 +1772,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
             }
 
             const repairedMessages = buildTopicStepMessages(
-              messages, steps, finalStep, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory,
+              messages, steps, finalStep, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints,
             );
 
             const healResult = await runStreamStep(finalStep, repairedMessages);

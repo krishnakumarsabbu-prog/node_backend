@@ -107,6 +107,7 @@ export async function streamText(props: {
   promptId?: string;
   env?: any;
   clientAbortSignal?: AbortSignal;
+  systemSuffix?: string;
 }) {
   const {
     messages,
@@ -119,6 +120,7 @@ export async function streamText(props: {
     designScheme,
     promptId,
     clientAbortSignal,
+    systemSuffix,
   } = props;
 
   let processedMessages = messages.map((message: any) => {
@@ -151,6 +153,10 @@ export async function streamText(props: {
         credentials: options?.supabaseConnection?.credentials || undefined,
       },
     }) ?? getSystemPrompt();
+
+  if (systemSuffix) {
+    systemPrompt = `${systemPrompt}\n\n${systemSuffix}`;
+  }
 
   const isPlanMode = promptId === "plan" || promptId === "plan-test";
   const isMigrationMode = promptId === "migration";
