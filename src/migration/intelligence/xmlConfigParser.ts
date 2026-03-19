@@ -55,7 +55,7 @@ function extractBeans(content: string): XmlBeanDefinition[] {
     }
   }
 
-  return beans.slice(0, 30);
+  return beans.slice(0, 20);
 }
 
 function extractServletMappings(content: string): string[] {

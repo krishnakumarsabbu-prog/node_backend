@@ -292,6 +292,8 @@ export function buildMigrationContextPrompt(intelligence: CodebaseIntelligence, 
   sections.push(intelligence.serialized.dependencyGraph);
 
   sections.push(`\n## SEMANTIC FILE SUMMARIES`);
+  const MAX_PROMPT_FILES = 40;
+
   const prioritizedSummaries = [
     ...intelligence.fileSummaries.filter((f) => f.role === "entry"),
     ...intelligence.fileSummaries.filter((f) => f.role === "config"),
@@ -300,7 +302,7 @@ export function buildMigrationContextPrompt(intelligence: CodebaseIntelligence, 
     ...intelligence.fileSummaries.filter((f) => f.role === "repository"),
     ...intelligence.fileSummaries.filter((f) => f.role === "model"),
     ...intelligence.fileSummaries.filter((f) => f.role === "other"),
-  ].slice(0, 80);
+  ].slice(0, MAX_PROMPT_FILES);
 
   sections.push(prioritizedSummaries.map(serializeFileSummary).join("\n\n"));
 

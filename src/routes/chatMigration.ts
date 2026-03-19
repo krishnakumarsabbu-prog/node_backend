@@ -1,11 +1,7 @@
 import type { Response } from "express";
 import { generateId } from "ai";
 import { MigrationRunner } from "../migration/core/migrationRunner";
-import {
-  parseMigrationPlanIntoSteps,
-  streamMigrationResponse,
-  type MigrationStreamWriter,
-} from "../llm/migration-processor";
+import { executeTaskGraphStreaming } from "../migration/core/streamingTaskExecutor";
 import type { MigrationPlan } from "../migration/types/migrationTypes";
 import type { FileMap } from "../llm/constants";
 import type { Messages, StreamingOptions } from "../llm/stream-text";
@@ -119,7 +115,7 @@ export class ChatMigrationHandler {
         label: "migration-plan",
         status: "in-progress",
         order: progressCounter++,
-        message: "Step 3/4 — Generating migration plan (LLM call 1/3: document generation)...",
+        message: "Step 3/4 — Generating migration plan (LLM call: document + task graph generation)...",
       } satisfies ProgressAnnotation);
 
       const { markdownContent, plan } = await this.runner.generateMigrationDocument(
@@ -223,12 +219,10 @@ export class ChatMigrationHandler {
       label: "migration-execute-start",
       status: "in-progress",
       order: progressCounter++,
-      message: `Starting migration implementation — ${tasks.length} tasks, output under migrate/`,
+      message: `Starting migration implementation — ${tasks.length} tasks in task graph (no re-parsing step), output under migrate/`,
     } satisfies ProgressAnnotation);
 
     if (apiKeys && streamingOptions) {
-      const migrationFiles = this.buildMigrationFileMap(request.files, migrationDocument);
-
       let intelligence = this.cachedIntelligence;
 
       if (intelligence) {
@@ -262,81 +256,65 @@ export class ChatMigrationHandler {
         } satisfies ProgressAnnotation);
       }
 
-      writeDataPart(res, {
-        type: "progress",
-        label: "migration-parse-steps",
-        status: "in-progress",
-        order: progressCounter++,
-        message: "Parsing migration document into executable steps (LLM)...",
-      } satisfies ProgressAnnotation);
-
-      const steps = await parseMigrationPlanIntoSteps(
-        migrationDocument || this.buildFallbackDocument(plan),
-        request.files,
-      );
-
-      writeDataPart(res, {
-        type: "progress",
-        label: "migration-parse-steps",
-        status: "complete",
-        order: progressCounter++,
-        message: `Parsed ${steps.length} execution steps from migration document`,
-      } satisfies ProgressAnnotation);
-
-      const migrationWriter: MigrationStreamWriter = {
-        writeData: (data: unknown) => {
-          writeDataPart(res, data);
-          return true;
-        },
-        writeAnnotation: (ann: unknown) => {
-          writeMessageAnnotationPart(res, ann);
-          return true;
-        },
-        isAlive: () => !res.writableEnded && !res.destroyed,
-      };
-
       const progressRef = { value: progressCounter };
-      const cumulativeUsage = { completionTokens: 0, promptTokens: 0, totalTokens: 0 };
 
-      await streamMigrationResponse({
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-graph-exec",
+        status: "in-progress",
+        order: progressRef.value++,
+        message: `Executing task graph directly: ${tasks.length} tasks, dependency-ordered, with global state tracking and static validation`,
+      } satisfies ProgressAnnotation);
+
+      const execResult = await executeTaskGraphStreaming({
         res,
-        requestId: "migration-execute",
+        plan,
+        files: request.files,
         messages: request.messages,
-        files: migrationFiles,
-        migrationDocument: migrationDocument || this.buildFallbackDocument(plan),
-        steps,
+        intelligence,
+        markdownContent: migrationDocument,
         streamingOptions,
         apiKeys,
-        providerSettings: providerSettings || {},
+        providerSettings: providerSettings ?? {},
         progressCounter: progressRef,
-        writer: migrationWriter,
-        cumulativeUsage,
-        intelligence,
+        clientAbortSignal: undefined,
       });
 
       progressCounter = progressRef.value;
 
-      const succeededSteps = steps.length;
-      const totalTokens = cumulativeUsage.totalTokens;
-
+      const successLabel = execResult.success ? "SUCCESS" : "PARTIAL";
       writeDataPart(res, {
         type: "progress",
-        label: "migration-verification-skip",
+        label: "migration-summary",
         status: "complete",
         order: progressCounter++,
-        message: `Build verification skipped in streaming mode (enableVerification=false). Total tokens used: ${totalTokens}. Review generated files under migrate/ and run your build tool manually to verify.`,
+        message: `[${successLabel}] created=${execResult.filesCreated}, modified=${execResult.filesModified}, deleted=${execResult.filesDeleted}, tokens=${execResult.totalTokens}, errors=${execResult.errors.length}, staticIssues=${execResult.staticIssues.length}`,
       } satisfies ProgressAnnotation);
+
+      if (execResult.errors.length > 0) {
+        writeDataPart(res, {
+          type: "progress",
+          label: "migration-errors",
+          status: "complete",
+          order: progressCounter++,
+          message: `Errors: ${execResult.errors.slice(0, 5).join(" | ")}`,
+        } satisfies ProgressAnnotation);
+      }
 
       writeMessageAnnotationPart(res, {
         type: "migration_result",
         result: {
-          success: true,
-          filesModified: tasks.filter((t) => t.action === "modify").length,
-          filesCreated: tasks.filter((t) => t.action === "create").length,
-          filesDeleted: tasks.filter((t) => t.action === "delete").length,
-          totalTokens,
-          errors: [],
-          note: "Streaming execution complete. Run `mvn clean package` or equivalent in migrate/ to verify the build.",
+          success: execResult.success,
+          filesModified: execResult.filesModified,
+          filesCreated: execResult.filesCreated,
+          filesDeleted: execResult.filesDeleted,
+          totalTokens: execResult.totalTokens,
+          errors: execResult.errors,
+          staticIssues: execResult.staticIssues,
+          taskResults: execResult.taskResults,
+          note: execResult.success
+            ? "Execution complete. Run `mvn clean package` in migrate/ to verify the build."
+            : `Execution finished with ${execResult.errors.length} error(s). Review errors above.`,
         },
       } as ContextAnnotation);
     } else {
@@ -354,22 +332,6 @@ export class ChatMigrationHandler {
     }
 
     return progressCounter;
-  }
-
-  private buildFallbackDocument(plan: MigrationPlan): string {
-    const tasks = plan.tasks || [];
-    const lines = [
-      `# Migration Plan: ${plan.migrationType}`,
-      ``,
-      `## Overview`,
-      `Migration type: ${plan.migrationType} (${plan.estimatedComplexity} complexity)`,
-      ``,
-      `## Step 1: Implement Migration`,
-      ``,
-      `### Files`,
-      ...tasks.map((t) => `**\`${t.file}\`** — ${t.description}`),
-    ];
-    return lines.join("\n");
   }
 
   private async executeWithRunner(
@@ -523,35 +485,5 @@ export class ChatMigrationHandler {
     }
 
     return progressCounter;
-  }
-
-  private buildMigrationFileMap(
-    originalFiles: FileMap,
-    migrationDocument?: string,
-  ): FileMap {
-    const result: FileMap = { ...originalFiles };
-
-    if (migrationDocument) {
-      result["migration.md"] = {
-        type: "file",
-        content: migrationDocument,
-        isBinary: false,
-      } as any;
-    }
-
-    return result;
-  }
-
-  private extractUserRequest(messages: Messages): string {
-    const lastUser = [...messages].reverse().find((m: any) => m.role === "user");
-    if (!lastUser) return "";
-    if (typeof lastUser.content === "string") return lastUser.content;
-    if (Array.isArray(lastUser.content)) {
-      return (lastUser.content as any[])
-        .filter((p: any) => p.type === "text")
-        .map((p: any) => p.text)
-        .join(" ");
-    }
-    return "";
   }
 }
