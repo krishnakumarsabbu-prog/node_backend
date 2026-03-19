@@ -358,6 +358,29 @@ function buildManifestStep(
   };
 }
 
+const DEPENDENCY_SIGNAL_PATTERNS = [
+  /\binstall\b/i,
+  /\bnew\s+package\b/i,
+  /\badd\s+(dependency|dep|library|lib|package)\b/i,
+  /\bnpm\s+install\b/i,
+  /\byarn\s+add\b/i,
+  /\bpnpm\s+add\b/i,
+  /\bimport\s+from\s+["'][^./]/i,
+  /\brequire\(['"][^./]/i,
+  /new\s+feature/i,
+  /\bfrom\s+scratch\b/i,
+  /\bnew\s+(app|application|project|site)\b/i,
+  /\bintegrat(e|ion)\b/i,
+];
+
+function planLikelyNeedsNewDependencies(
+  planContent: string | null,
+  userQuestion: string | undefined,
+): boolean {
+  const text = `${planContent ?? ""} ${userQuestion ?? ""}`.toLowerCase();
+  return DEPENDENCY_SIGNAL_PATTERNS.some((re) => re.test(text));
+}
+
 function prependPackageJsonStep(
   steps: PlanStep[],
   files: FileMap,
@@ -366,6 +389,10 @@ function prependPackageJsonStep(
 ): PlanStep[] {
   const manifest = detectProjectManifest(files);
   if (!manifest) return steps;
+
+  if (!planLikelyNeedsNewDependencies(planContent, userQuestion)) {
+    return steps;
+  }
 
   const manifestStep = buildManifestStep(manifest, planContent, userQuestion);
   const reindexed = steps.map((s) => ({ ...s, index: s.index + 1 }));
@@ -760,6 +787,16 @@ function FILE_STEP_EXECUTION_INSTRUCTIONS(filePath: string, fileExists: boolean,
   ].join("\n");
 }
 
+function buildCreatedFilesFeedback(originalFiles: FileMap, accumulatedFiles: FileMap): string {
+  const originalPaths = new Set(Object.keys(originalFiles));
+  const created = Object.keys(accumulatedFiles).filter((p) => !originalPaths.has(p));
+  if (created.length === 0) return "";
+  return [
+    `\n## Files already created in previous steps (available to import/reference):`,
+    created.map((p) => `  - ${p}`).join("\n"),
+  ].join("\n");
+}
+
 function buildTopicStepMessages(
   messages: Messages,
   steps: PlanStep[],
@@ -768,6 +805,7 @@ function buildTopicStepMessages(
   planContent: string | null,
   userQuestion: string | null,
   accumulatedFiles?: FileMap,
+  originalFiles?: FileMap,
 ): Messages {
   const stepMessages: Messages = [...messages];
 
@@ -784,6 +822,9 @@ function buildTopicStepMessages(
     .join("\n");
 
   const existingFileContext = buildStepFileContext(step, accumulatedFiles);
+  const createdFilesFeedback = originalFiles && accumulatedFiles
+    ? buildCreatedFilesFeedback(originalFiles, accumulatedFiles)
+    : "";
 
   if (step.index > 1) {
     const prevStep = steps[step.index - 2];
@@ -799,6 +840,7 @@ function buildTopicStepMessages(
       content: [
         `## Plan Progress`,
         allStepsList,
+        createdFilesFeedback,
         ``,
         `## Your Task - Step ${step.index}/${steps.length}: ${step.heading}`,
         ``,
@@ -1217,15 +1259,34 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     } satisfies ProgressAnnotation);
 
     // Step 1: ask LLM which files need touching
+    let fileSelectionFailed = false;
     try {
       const batchPlan = await selectFilesForBuild(userQuestion!, files, onUsage);
       selectedFileList = batchPlan.files;
+      if (selectedFileList.length === 0 && Object.keys(files).length > 0) {
+        logger.warn(`[${requestId}] File selection returned 0 files for a non-empty project — falling back to topic-steps mode`);
+        writer.writeData({
+          type: "progress",
+          label: "plan-file-select-warn",
+          status: "complete",
+          order: progressCounter.value++,
+          message: "Could not identify specific files to change — using holistic analysis mode instead.",
+        } satisfies ProgressAnnotation);
+      }
     } catch (err: any) {
       logger.warn(`[${requestId}] File selection failed (${err?.message}), falling back to topic-steps mode`);
       selectedFileList = [];
+      fileSelectionFailed = true;
+      writer.writeData({
+        type: "progress",
+        label: "plan-file-select-warn",
+        status: "complete",
+        order: progressCounter.value++,
+        message: `File analysis failed (${err?.message ?? "unknown error"}) — falling back to holistic analysis mode.`,
+      } satisfies ProgressAnnotation);
     }
 
-    logger.info(`[${requestId}] ► BATCH PLANNER returned ${selectedFileList.length} file(s) (threshold=${FILE_PER_STEP_THRESHOLD})`);
+    logger.info(`[${requestId}] ► BATCH PLANNER returned ${selectedFileList.length} file(s) (threshold=${FILE_PER_STEP_THRESHOLD}) failed=${fileSelectionFailed}`);
     for (const f of selectedFileList) {
       logger.info(`[${requestId}]   ↳ ${f.path} — ${f.reason}`);
     }
@@ -1295,9 +1356,11 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
   let succeededSteps = 0;
   let failedSteps = 0;
+  let silentFailedSteps = 0;
   let circuitBroken = false;
 
   const accumulatedFiles: FileMap = { ...files };
+  const originalFiles: FileMap = { ...files };
 
   const executeStep = async (step: PlanStep): Promise<void> => {
     if (!writer.isAlive() || circuitBroken) return;
@@ -1319,7 +1382,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     const stepMessages =
       executionMode === "files"
         ? buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles)
-        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles);
+        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles);
 
     let filesToUse: FileMap = accumulatedFiles;
     let contextSource = "full-accumulated";
@@ -1454,6 +1517,14 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         }
       } else {
         logger.warn(`${stepTag} ► LLM OUTPUT — 0 files extracted (no <cortexAction type="file"> blocks found in response)`);
+        writer.writeData({
+          type: "progress",
+          label: `plan-step${step.index}-warn`,
+          status: "complete",
+          order: progressCounter.value++,
+          message: `Step ${step.index} produced no file changes — the LLM response contained no file blocks. This step may need to be re-run.`,
+        } satisfies ProgressAnnotation);
+        silentFailedSteps++;
       }
 
       if (!writer.isAlive()) {
@@ -1509,14 +1580,54 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
   }
 
   logger.info(
-    `[${requestId}] ═══ PLAN COMPLETE ═══ steps=${steps.length} succeeded=${succeededSteps} failed=${failedSteps} circuitBroken=${circuitBroken} totalTokens=${cumulativeUsage.totalTokens} promptTokens=${cumulativeUsage.promptTokens} completionTokens=${cumulativeUsage.completionTokens}`,
+    `[${requestId}] ═══ PLAN COMPLETE ═══ steps=${steps.length} succeeded=${succeededSteps} failed=${failedSteps} silent=${silentFailedSteps} circuitBroken=${circuitBroken} totalTokens=${cumulativeUsage.totalTokens} promptTokens=${cumulativeUsage.promptTokens} completionTokens=${cumulativeUsage.completionTokens}`,
   );
+
+  const originalFilePaths = new Set(Object.keys(files));
+  const createdFiles: string[] = [];
+  const modifiedFiles: string[] = [];
+  for (const filePath of Object.keys(accumulatedFiles)) {
+    if (!originalFilePaths.has(filePath)) {
+      createdFiles.push(filePath);
+    } else {
+      const originalEntry = (files as any)[filePath];
+      const accEntry = (accumulatedFiles as any)[filePath];
+      if (
+        originalEntry?.type === "file" &&
+        accEntry?.type === "file" &&
+        originalEntry?.content !== accEntry?.content
+      ) {
+        modifiedFiles.push(filePath);
+      }
+    }
+  }
+
+  writer.writeAnnotation({
+    type: "planFileSummary",
+    createdFiles,
+    modifiedFiles,
+    succeededSteps,
+    failedSteps,
+    silentFailedSteps,
+    totalSteps: steps.length,
+  });
+
+  logger.info(
+    `[${requestId}] ► FILE SUMMARY — created=${createdFiles.length} modified=${modifiedFiles.length}`,
+  );
+  for (const f of createdFiles) logger.info(`[${requestId}]   + ${f}`);
+  for (const f of modifiedFiles) logger.info(`[${requestId}]   ~ ${f}`);
+
+  const warnSuffix =
+    silentFailedSteps > 0
+      ? ` (${silentFailedSteps} step${silentFailedSteps !== 1 ? "s" : ""} produced no file changes)`
+      : "";
 
   writer.writeData({
     type: "progress",
     label: "plan-complete",
     status: "complete",
     order: progressCounter.value++,
-    message: `Implementation complete: ${succeededSteps}/${steps.length} step${steps.length !== 1 ? "s" : ""} executed${failedSteps > 0 ? `, ${failedSteps} failed` : ""}`,
+    message: `Implementation complete: ${succeededSteps}/${steps.length} step${steps.length !== 1 ? "s" : ""} executed${failedSteps > 0 ? `, ${failedSteps} failed` : ""}${warnSuffix}. ${createdFiles.length} file${createdFiles.length !== 1 ? "s" : ""} created, ${modifiedFiles.length} modified.`,
   } satisfies ProgressAnnotation);
 }
