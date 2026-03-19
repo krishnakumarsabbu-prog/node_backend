@@ -238,6 +238,7 @@ export class ChatMigrationHandler {
         writeMessageAnnotationPart,
         res,
         progressRef.value,
+        migrationDocument,
       );
       progressCounter = progressRef.value;
     }
@@ -268,6 +269,7 @@ export class ChatMigrationHandler {
     writeMessageAnnotationPart: (res: Response, data: unknown) => void,
     res: Response,
     progressCounter: number,
+    migrationDocument?: string,
   ): Promise<number> {
     const tasks = plan.tasks || [];
 
@@ -292,7 +294,7 @@ export class ChatMigrationHandler {
     }
 
     try {
-      const result = await this.runner.executePlan(plan, files);
+      const result = await this.runner.executePlan(plan, files, undefined, migrationDocument);
 
       const summary = result.success
         ? `Migration complete: ${result.filesModified} modified, ${result.filesCreated} created, ${result.filesDeleted} deleted`

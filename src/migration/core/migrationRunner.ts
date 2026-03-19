@@ -13,6 +13,8 @@ import { VerificationAgent } from "../agents/verificationAgent";
 import { RepairAgent } from "../agents/repairAgent";
 import { MigrationExecutor } from "./migrationExecutor";
 import { LLMClient } from "../llm/llmClient";
+import { buildCodebaseIntelligence, type CodebaseIntelligence } from "../intelligence/contextBuilder";
+import { runStaticValidation, serializeStaticValidationResult } from "./staticValidator";
 import { createScopedLogger } from "../../utils/logger";
 
 const logger = createScopedLogger("migration-runner");
@@ -21,6 +23,7 @@ export interface MigrationRunnerConfig {
   workDir: string;
   enableVerification: boolean;
   enableAutoRepair: boolean;
+  enableStaticValidation: boolean;
   maxRepairAttempts: number;
 }
 
@@ -28,6 +31,7 @@ const DEFAULT_CONFIG: MigrationRunnerConfig = {
   workDir: "/tmp/migration",
   enableVerification: true,
   enableAutoRepair: true,
+  enableStaticValidation: true,
   maxRepairAttempts: 5,
 };
 
@@ -58,7 +62,7 @@ export class MigrationRunner {
   private snapshotFiles(files: FileMap): Map<string, string | null> {
     const snapshot = new Map<string, string | null>();
     for (const [path, file] of Object.entries(files)) {
-      if (file && file.type === 'file') {
+      if (file && file.type === "file") {
         snapshot.set(path, (file as any).content ?? null);
       }
     }
@@ -78,7 +82,7 @@ export class MigrationRunner {
       } else if (files[path]) {
         (files[path] as any).content = content;
       } else {
-        files[path] = { type: 'file', content, isBinary: false } as any;
+        files[path] = { type: "file", content, isBinary: false } as any;
       }
     }
     logger.info(`Rollback complete: restored ${snapshot.size} file(s) to pre-migration state`);
@@ -100,6 +104,13 @@ export class MigrationRunner {
         logger.warn("Unknown build tool detected — build verification will be skipped");
       }
 
+      const intelligence = buildCodebaseIntelligence(context.files, analysis);
+      logger.info(
+        `Intelligence built: ${intelligence.fileSummaries.length} files, ` +
+        `${intelligence.xmlConfigs.length} XML configs, ` +
+        `patterns=[${intelligence.migrationPatterns.join(", ")}]`
+      );
+
       const plan = await this.plannerAgent.generatePlan(
         context.files,
         analysis,
@@ -107,14 +118,31 @@ export class MigrationRunner {
       );
       logger.info("Migration plan generated");
 
-      const result = await this.executor.execute(plan, context.files);
+      const result = await this.executor.execute(plan, context.files, intelligence);
       logger.info("Migration execution complete");
 
       if (analysis.framework === "unknown") {
-        result.frameworkWarning = "Framework could not be detected. Migration plan is based on generic patterns — review all generated files carefully.";
+        result.frameworkWarning =
+          "Framework could not be detected. Migration plan is based on generic patterns — review all generated files carefully.";
       }
       if (analysis.buildTool === "unknown") {
-        result.frameworkWarning = (result.frameworkWarning ? result.frameworkWarning + " " : "") + "Build tool not detected — build verification was skipped.";
+        result.frameworkWarning =
+          (result.frameworkWarning ? result.frameworkWarning + " " : "") +
+          "Build tool not detected — build verification was skipped.";
+      }
+
+      if (this.config.enableStaticValidation) {
+        const migratedFiles = this.buildFileContentsMap(result);
+        const staticResult = runStaticValidation(migratedFiles);
+        const report = serializeStaticValidationResult(staticResult);
+        logger.info(`Static validation:\n${report}`);
+
+        if (!staticResult.passed) {
+          logger.warn(`Static validation found ${staticResult.issues.filter((i) => i.severity === "error").length} errors`);
+          result.errors.push(...staticResult.issues
+            .filter((i) => i.severity === "error")
+            .map((i) => `[static] ${i.message}`));
+        }
       }
 
       if (!this.config.enableVerification || !result.success) {
@@ -126,7 +154,6 @@ export class MigrationRunner {
         return result;
       }
 
-      const fileContents = this.buildFileContentsMap(result);
       const validation = await this.verificationAgent.validate(
         analysis.buildTool,
         this.config.workDir
@@ -148,6 +175,7 @@ export class MigrationRunner {
         return result;
       }
 
+      const fileContents = this.buildFileContentsMap(result);
       const repairedResult = await this.repairLoop(
         result,
         validation,
@@ -170,10 +198,7 @@ export class MigrationRunner {
     }
   }
 
-  async generatePlanOnly(
-    files: FileMap,
-    userRequest: string
-  ): Promise<MigrationPlan> {
+  async generatePlanOnly(files: FileMap, userRequest: string): Promise<MigrationPlan> {
     logger.info("Generating migration plan only");
 
     const analysis = await this.analyzerAgent.analyze(files);
@@ -196,10 +221,27 @@ export class MigrationRunner {
     return doc;
   }
 
-  async executePlan(plan: MigrationPlan, files: FileMap): Promise<MigrationResult> {
+  async executePlan(
+    plan: MigrationPlan,
+    files: FileMap,
+    intelligence?: CodebaseIntelligence,
+    markdownContent?: string
+  ): Promise<MigrationResult> {
     logger.info("Executing provided migration plan");
 
-    const result = await this.executor.execute(plan, files);
+    const result = await this.executor.execute(plan, files, intelligence, markdownContent);
+
+    if (this.config.enableStaticValidation) {
+      const migratedFiles = this.buildFileContentsMap(result);
+      const staticResult = runStaticValidation(migratedFiles);
+      logger.info(`Static validation: ${staticResult.passed ? "PASSED" : "FAILED"} — ${staticResult.issues.length} issues`);
+
+      if (!staticResult.passed) {
+        result.errors.push(...staticResult.issues
+          .filter((i) => i.severity === "error")
+          .map((i) => `[static] ${i.message}`));
+      }
+    }
 
     if (!this.config.enableVerification || !result.success) {
       return result;
