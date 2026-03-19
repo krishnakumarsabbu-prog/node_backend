@@ -10,6 +10,8 @@ import type { MigrationPlan } from "../migration/types/migrationTypes";
 import type { FileMap } from "../llm/constants";
 import type { Messages, StreamingOptions } from "../llm/stream-text";
 import type { ProgressAnnotation, ContextAnnotation } from "../types/context";
+import { AnalyzerAgent } from "../migration/agents/analyzerAgent";
+import { buildCodebaseIntelligence } from "../migration/intelligence/contextBuilder";
 import { createScopedLogger } from "../utils/logger";
 
 const logger = createScopedLogger("chat-migration");
@@ -159,6 +161,23 @@ export class ChatMigrationHandler {
         label: "migration-execute",
         status: "in-progress",
         order: progressCounter++,
+        message: "Building codebase intelligence...",
+      } satisfies ProgressAnnotation);
+
+      const analyzerAgent = new AnalyzerAgent();
+      const analysis = await analyzerAgent.analyze(request.files);
+      const intelligence = buildCodebaseIntelligence(request.files, analysis);
+
+      logger.info(
+        `Intelligence built for execution: ${intelligence.fileSummaries.length} summaries, ` +
+        `${intelligence.xmlConfigs.length} XML configs, patterns=[${intelligence.detectedPatterns.join(", ")}]`
+      );
+
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-execute",
+        status: "in-progress",
+        order: progressCounter++,
         message: "Parsing migration steps for execution...",
       } satisfies ProgressAnnotation);
 
@@ -195,6 +214,7 @@ export class ChatMigrationHandler {
         progressCounter: progressRef,
         writer: migrationWriter,
         cumulativeUsage,
+        intelligence,
       });
 
       progressCounter = progressRef.value;

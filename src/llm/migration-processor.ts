@@ -9,6 +9,8 @@ import { streamText, type Messages, type StreamingOptions } from "./stream-text"
 import type { FileMap } from "./constants";
 import type { IProviderSetting } from "../types/model";
 import type { ProgressAnnotation } from "../types/context";
+import type { CodebaseIntelligence } from "../migration/intelligence/contextBuilder";
+import { buildStepContext } from "../migration/intelligence/contextBuilder";
 
 const logger = createScopedLogger("migration-processor");
 
@@ -204,6 +206,7 @@ export interface StreamMigrationOptions {
     totalTokens: number;
   };
   clientAbortSignal?: AbortSignal;
+  intelligence?: CodebaseIntelligence;
 }
 
 const MAX_STEP_RETRIES = 2;
@@ -226,6 +229,7 @@ export async function streamMigrationResponse(opts: StreamMigrationOptions): Pro
     writer,
     cumulativeUsage,
     clientAbortSignal,
+    intelligence,
   } = opts;
 
   logger.info(
@@ -278,6 +282,7 @@ export async function streamMigrationResponse(opts: StreamMigrationOptions): Pro
       step,
       migrationDocument,
       accumulatedFiles,
+      intelligence,
     );
 
     try {
@@ -382,6 +387,7 @@ function buildMigrationStepMessages(
   step: MigrationStep,
   migrationDocument: string,
   accumulatedFiles: FileMap,
+  intelligence?: CodebaseIntelligence,
 ): Messages {
   const stepMessages: Messages = [...messages];
 
@@ -402,7 +408,9 @@ function buildMigrationStepMessages(
     .map((p) => `  - ${p}`)
     .join("\n");
 
-  const existingFileContext = buildMigrationFileContext(step, accumulatedFiles);
+  const existingFileContext = intelligence
+    ? buildStepContext(intelligence, step.heading, step.details, accumulatedFiles)
+    : buildMigrationFileContext(step, accumulatedFiles);
 
   if (step.index > 1) {
     const prevStep = steps[step.index - 2];

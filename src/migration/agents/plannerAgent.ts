@@ -5,6 +5,7 @@ import { MigrationPlanSchema } from "../schemas/migrationSchema";
 import { LLMClient } from "../llm/llmClient";
 import { PromptBuilder } from "../llm/promptBuilder";
 import { getTachyonModel } from "../../modules/llm/providers/tachyon";
+import { buildCodebaseIntelligence } from "../intelligence/contextBuilder";
 import { createScopedLogger } from "../../utils/logger";
 
 const logger = createScopedLogger("planner-agent");
@@ -22,28 +23,28 @@ export class PlannerAgent {
     analysis: ProjectAnalysis,
     userRequest: string
   ): Promise<MigrationDocument> {
-    logger.info("Generating Migration.md document");
+    logger.info("Building codebase intelligence for migration document generation");
+
+    const intelligence = buildCodebaseIntelligence(files, analysis);
+
+    logger.info(
+      `Intelligence built: ${intelligence.fileSummaries.length} summaries, ` +
+      `${intelligence.dependencyGraph.edges.length} dep edges, ` +
+      `${intelligence.xmlConfigs.length} XML configs, ` +
+      `patterns=[${intelligence.detectedPatterns.join(", ")}]`
+    );
 
     const fileList = Object.keys(files);
-
-    const fileContents: Record<string, string> = {};
-    for (const [path, entry] of Object.entries(files)) {
-      if (
-        entry &&
-        entry.type === "file" &&
-        !entry.isBinary &&
-        typeof (entry as any).content === "string"
-      ) {
-        fileContents[path] = (entry as any).content as string;
-      }
-    }
 
     const prompt = PromptBuilder.buildMigrationDocumentPrompt(
       analysis,
       userRequest,
       fileList,
-      fileContents
+      {},
+      intelligence
     );
+
+    logger.info(`Migration document prompt built: ${prompt.length} chars (was raw content before)`);
 
     const result = await generateText({
       model: getTachyonModel(),
@@ -67,10 +68,12 @@ export class PlannerAgent {
     analysis: ProjectAnalysis,
     userRequest: string
   ): Promise<MigrationPlan> {
-    logger.info("Generating migration plan");
+    logger.info("Building codebase intelligence for plan generation");
+
+    const intelligence = buildCodebaseIntelligence(files, analysis);
 
     const fileList = Object.keys(files);
-    const prompt = PromptBuilder.buildPlanningPrompt(analysis, userRequest, fileList);
+    const prompt = PromptBuilder.buildPlanningPrompt(analysis, userRequest, fileList, intelligence);
 
     const response = await this.llmClient.generateJSON<MigrationPlan>(
       prompt,

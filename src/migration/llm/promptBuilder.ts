@@ -1,5 +1,7 @@
 import type { ProjectAnalysis, BuildError } from "../types/migrationTypes";
 import type { FileMap } from "../../llm/constants";
+import type { CodebaseIntelligence } from "../intelligence/contextBuilder";
+import { buildMigrationContextPrompt } from "../intelligence/contextBuilder";
 
 export class PromptBuilder {
   static buildAnalysisPrompt(files: FileMap): string {
@@ -24,43 +26,17 @@ ${fileList}
 Return a structured analysis.`;
   }
 
-  private static sampleFileList(fileList: string[], maxFiles: number): { sample: string[]; truncated: boolean; totalCount: number } {
-    if (fileList.length <= maxFiles) {
-      return { sample: fileList, truncated: false, totalCount: fileList.length };
-    }
-
-    const configPatterns = /\.(xml|gradle|json|yaml|yml|toml|properties|env)$|^(pom\.xml|build\.gradle|package\.json|settings\.gradle|Cargo\.toml|requirements\.txt|Gemfile|composer\.json)$/i;
-    const entryPatterns = /\/(main|app|index|application|server|bootstrap)\./i;
-    const testPatterns = /\.(test|spec)\.|\/test\/|\/tests\//i;
-
-    const priority: string[] = [];
-    const normal: string[] = [];
-    const tests: string[] = [];
-
-    for (const f of fileList) {
-      const name = f.split('/').pop() || f;
-      if (configPatterns.test(name) || configPatterns.test(f)) priority.push(f);
-      else if (entryPatterns.test(f)) priority.push(f);
-      else if (testPatterns.test(f)) tests.push(f);
-      else normal.push(f);
-    }
-
-    const reserved = Math.min(priority.length, Math.floor(maxFiles * 0.3));
-    const remaining = maxFiles - reserved;
-    const sample = [
-      ...priority.slice(0, reserved),
-      ...normal.slice(0, remaining),
-    ].slice(0, maxFiles);
-
-    return { sample, truncated: true, totalCount: fileList.length };
-  }
-
   static buildMigrationDocumentPrompt(
     analysis: ProjectAnalysis,
     userRequest: string,
     fileList: string[],
-    fileContents: Record<string, string>
+    fileContents: Record<string, string>,
+    intelligence?: CodebaseIntelligence
   ): string {
+    if (intelligence) {
+      return PromptBuilder.buildIntelligentMigrationDocumentPrompt(intelligence, userRequest);
+    }
+
     const MAX_FILES_IN_PROMPT = 150;
     const { sample, truncated, totalCount } = PromptBuilder.sampleFileList(fileList, MAX_FILES_IN_PROMPT);
 
@@ -92,9 +68,32 @@ ${fileSection}
 SAMPLE FILE CONTENTS (CRITICAL for understanding XML + configuration behavior):
 ${contentSamples || "(none available)"}
 
+${PromptBuilder.getMigrationDocumentInstructions()}`;
+  }
+
+  private static buildIntelligentMigrationDocumentPrompt(
+    intelligence: CodebaseIntelligence,
+    userRequest: string
+  ): string {
+    const context = buildMigrationContextPrompt(intelligence, userRequest);
+
+    return `You are a senior Spring migration architect generating a complete, production-ready migration plan document.
+
+You have been provided with structured codebase intelligence — NOT raw file contents. This intelligence was extracted by a pre-processing pipeline that analyzed all files, built a dependency graph, parsed XML configurations, and detected migration patterns.
+
+Use this structured intelligence to generate an accurate, complete Migration.md document.
+
 ---
 
-YOUR TASK:
+${context}
+
+---
+
+${PromptBuilder.getMigrationDocumentInstructions()}`;
+  }
+
+  private static getMigrationDocumentInstructions(): string {
+    return `YOUR TASK:
 Generate a complete Migration.md document that serves as a step-by-step implementation guide.
 
 The migration creates a NEW project at: /home/project/migrate/
@@ -193,11 +192,47 @@ For EACH XML file found in the input:
 Write the full Migration.md document now:`;
   }
 
+  private static sampleFileList(fileList: string[], maxFiles: number): { sample: string[]; truncated: boolean; totalCount: number } {
+    if (fileList.length <= maxFiles) {
+      return { sample: fileList, truncated: false, totalCount: fileList.length };
+    }
+
+    const configPatterns = /\.(xml|gradle|json|yaml|yml|toml|properties|env)$|^(pom\.xml|build\.gradle|package\.json|settings\.gradle|Cargo\.toml|requirements\.txt|Gemfile|composer\.json)$/i;
+    const entryPatterns = /\/(main|app|index|application|server|bootstrap)\./i;
+    const testPatterns = /\.(test|spec)\.|\/test\/|\/tests\//i;
+
+    const priority: string[] = [];
+    const normal: string[] = [];
+    const tests: string[] = [];
+
+    for (const f of fileList) {
+      const name = f.split('/').pop() || f;
+      if (configPatterns.test(name) || configPatterns.test(f)) priority.push(f);
+      else if (entryPatterns.test(f)) priority.push(f);
+      else if (testPatterns.test(f)) tests.push(f);
+      else normal.push(f);
+    }
+
+    const reserved = Math.min(priority.length, Math.floor(maxFiles * 0.3));
+    const remaining = maxFiles - reserved;
+    const sample = [
+      ...priority.slice(0, reserved),
+      ...normal.slice(0, remaining),
+    ].slice(0, maxFiles);
+
+    return { sample, truncated: true, totalCount: fileList.length };
+  }
+
   static buildPlanningPrompt(
     analysis: ProjectAnalysis,
     userRequest: string,
-    fileList: string[]
+    fileList: string[],
+    intelligence?: CodebaseIntelligence
   ): string {
+    if (intelligence) {
+      return PromptBuilder.buildIntelligentPlanningPrompt(intelligence, userRequest);
+    }
+
     const MAX_FILES_IN_PROMPT = 200;
     const { sample, truncated, totalCount } = PromptBuilder.sampleFileList(fileList, MAX_FILES_IN_PROMPT);
 
@@ -221,7 +256,27 @@ ${userRequest}
 AVAILABLE FILES:
 ${fileSection}
 
-CRITICAL RULES:
+${PromptBuilder.getPlanningJsonInstructions()}`;
+  }
+
+  private static buildIntelligentPlanningPrompt(intelligence: CodebaseIntelligence, userRequest: string): string {
+    const context = buildMigrationContextPrompt(intelligence, userRequest);
+
+    return `You are a senior software architect generating a structured migration plan.
+
+You have been provided with structured codebase intelligence extracted by an analysis pipeline. Use this intelligence to produce an accurate migration plan.
+
+---
+
+${context}
+
+---
+
+${PromptBuilder.getPlanningJsonInstructions()}`;
+  }
+
+  private static getPlanningJsonInstructions(): string {
+    return `CRITICAL RULES:
 1. DO NOT include full file code
 2. ONLY return structured JSON migration plan
 3. Each task must specify: file, action (modify/delete/create), description
