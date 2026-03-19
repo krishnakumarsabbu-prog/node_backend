@@ -11,17 +11,18 @@ export const SELF_HEAL_MAX_ATTEMPTS = 2;
 export interface HealedStep {
   repairedStep: PlanStep;
   repairReason: string;
+  freshStart: boolean;
 }
 
-const HEAL_SYSTEM = `
-You are a senior software engineer performing targeted repair of an implementation step that scored below the quality threshold.
+const REPAIR_SYSTEM = `
+You are a senior software engineer repairing an implementation step that failed quality checks.
 
 You will receive:
 1. The original step specification
-2. The generated output that FAILED scoring
-3. Specific failure reasons and repair hints from the scorer
+2. The failed output (for reference — do not blindly continue from it)
+3. Specific failure reasons and repair hints
 
-Your job: produce a REPAIRED version of the step specification (heading + details) that explicitly addresses every failure reason.
+Your job: produce a REPAIRED step specification (heading + details) that explicitly addresses every failure reason.
 
 Return ONLY valid JSON — no prose, no markdown fences.
 
@@ -33,47 +34,73 @@ Schema:
 }
 
 REPAIR RULES:
-- Address every failReason explicitly in the repairedDetails
-- For INTEGRATION failures: add explicit wiring instructions (which file to import from, which route to register, which nav item to add)
-- For COMPLETENESS failures: list every file that must be implemented in full
-- For STATE_HANDLING failures: explicitly require loading, error, empty, success states
-- For DEPENDENCY failures: add explicit "update package.json with X" instructions
-- For CODE_QUALITY failures: add explicit quality requirements
-- Keep the heading focused and action-oriented
-- The repaired details must be MORE specific and prescriptive than the original
-- Do NOT reduce scope — only add clarity and requirements
+- Address every failReason directly in the repairedDetails
+- For NO_FILES: add "Output EVERY file using <cortexAction type=\\"file\\" filePath=\\"..\\"> blocks"
+- For PLACEHOLDER_CODE: add "ZERO placeholder content — every method must be fully implemented"
+- For NO_IMPORTS: add "Include proper import/export statements in every file"
+- For NO_INTEGRATION / SYNTAX_RED: add explicit, targeted instructions
+- Make repairedDetails MORE specific than the original — never less
+- Do NOT reduce scope
+`;
+
+const FRESH_START_SYSTEM = `
+You are a senior software engineer implementing a feature step from scratch.
+
+A previous attempt was discarded due to fundamental failures. Do NOT reference or continue from it.
+Produce a CORRECTED step specification that explicitly requires complete, working output.
+
+Return ONLY valid JSON — no prose, no markdown fences.
+
+Schema:
+{
+  "repairedHeading": string,
+  "repairedDetails": string,
+  "repairReason": string
+}
+
+REQUIREMENTS:
+- State explicitly: "Output ALL files with complete implementations — no stubs, no TODOs"
+- State explicitly: "Every file MUST use <cortexAction type=\\"file\\" filePath=\\"..\\"> blocks"
+- State explicitly: "All imports and exports must be properly declared"
+- For UI steps: "Wire the component into the router and navigation"
+- Address every listed failure reason
+- Be more prescriptive and detailed than the original
 `;
 
 export async function repairStep(
   step: PlanStep,
   failedOutput: string,
   score: ExecutionScore,
+  attemptNumber: number,
 ): Promise<HealedStep> {
-  const outputSnippet = failedOutput.slice(0, 4000);
+  const freshStart = attemptNumber >= 2;
+  const system = freshStart ? FRESH_START_SYSTEM : REPAIR_SYSTEM;
+
   const failureContext = [
     `Score: ${score.score}/100`,
     `Fail reasons: ${score.failReasons.join("; ")}`,
     `Repair hints: ${score.repairHints.join("; ")}`,
-    `Breakdown: completeness=${score.breakdown.completeness} integration=${score.breakdown.integration} quality=${score.breakdown.codeQuality} states=${score.breakdown.stateHandling} deps=${score.breakdown.dependencyCorrectness}`,
   ].join("\n");
+
+  const outputSection = freshStart
+    ? ``
+    : `\nFAILED OUTPUT (first 3000 chars — reference only, do not continue from it):\n${failedOutput.slice(0, 3000)}`;
 
   try {
     const resp = await generateText({
       model: getTachyonModel(),
-      system: HEAL_SYSTEM,
+      system,
       prompt: `
 ORIGINAL STEP:
 Heading: ${step.heading}
 Details:
 ${step.details}
-
-FAILED OUTPUT (first 4000 chars):
-${outputSnippet}
+${outputSection}
 
 FAILURE ANALYSIS:
 ${failureContext}
 
-Produce a repaired step specification that fixes all the issues above.
+${freshStart ? "Produce a fresh complete step specification." : "Produce a repaired step specification."}
 Return JSON only.
 `,
     });
@@ -90,50 +117,61 @@ Return JSON only.
       details:
         typeof parsed.repairedDetails === "string" && parsed.repairedDetails.trim()
           ? parsed.repairedDetails
-          : step.details,
+          : buildFallbackRepair(step, score, freshStart),
     };
 
     const repairReason =
-      typeof parsed.repairReason === "string" ? parsed.repairReason : "Auto-repaired based on scorer feedback";
+      typeof parsed.repairReason === "string"
+        ? parsed.repairReason
+        : freshStart
+          ? "Fresh start: discarded previous output, reimplementing from scratch"
+          : "Auto-repaired based on scorer feedback";
 
-    logger.info(`[self-healing-loop] Step ${step.index} repaired: ${repairReason}`);
+    logger.info(`[self-healing-loop] Step ${step.index} repaired (freshStart=${freshStart}): ${repairReason}`);
 
-    return { repairedStep, repairReason };
+    return { repairedStep, repairReason, freshStart };
   } catch (err: any) {
-    logger.warn(`[self-healing-loop] Repair failed (non-fatal): ${err?.message}`);
-    const fallbackDetails = buildFallbackRepair(step, score);
+    logger.warn(`[self-healing-loop] Repair LLM failed (non-fatal): ${err?.message}`);
+    const fallbackDetails = buildFallbackRepair(step, score, freshStart);
     return {
       repairedStep: { ...step, details: fallbackDetails },
-      repairReason: "Fallback repair: appended explicit requirements from scorer",
+      repairReason: freshStart
+        ? "Fallback fresh-start: stripped previous output, added explicit requirements"
+        : "Fallback repair: appended explicit requirements from scorer",
+      freshStart,
     };
   }
 }
 
-function buildFallbackRepair(step: PlanStep, score: ExecutionScore): string {
+function buildFallbackRepair(step: PlanStep, score: ExecutionScore, freshStart: boolean): string {
   const additions: string[] = [];
 
-  if (score.breakdown.completeness < 15) {
+  if (freshStart) {
     additions.push(
-      "COMPLETENESS REQUIREMENT: Every file listed in this step MUST be fully implemented — no stubs, no TODOs, no empty methods.",
+      "CRITICAL: This is a fresh re-implementation. Do NOT reference or continue from any previous attempt.",
     );
   }
 
-  if (score.breakdown.integration < 15) {
+  additions.push(
+    'OUTPUT REQUIREMENT: Every file MUST be output using <cortexAction type="file" filePath="..."> blocks.',
+  );
+
+  if (score.failReasons.some((r) => r.startsWith("NO_FILES"))) {
+    additions.push("COMPLETENESS: Output ALL files this step creates or modifies as complete file blocks.");
+  }
+
+  if (score.failReasons.some((r) => r.startsWith("PLACEHOLDER_CODE"))) {
     additions.push(
-      "INTEGRATION REQUIREMENT: Every new component, service, and API route MUST be wired into the application. Update the router, sidebar navigation, and any layout files that reference this feature.",
+      "IMPLEMENTATION: ZERO placeholder content. Every function and method must have a complete working implementation.",
     );
   }
 
-  if (score.breakdown.stateHandling < 15) {
-    additions.push(
-      "STATE HANDLING REQUIREMENT: All UI components MUST handle loading (spinner/skeleton), error (user-friendly message + retry), empty (meaningful empty state), and success states.",
-    );
+  if (score.failReasons.some((r) => r.startsWith("NO_IMPORTS"))) {
+    additions.push("IMPORTS: Every file must include proper TypeScript import and export statements.");
   }
 
-  if (score.breakdown.dependencyCorrectness < 15) {
-    additions.push(
-      "DEPENDENCY REQUIREMENT: Before using any npm package, verify it is in package.json. If not, add it. Never import from an undeclared package.",
-    );
+  if (score.failReasons.some((r) => r.startsWith("SYNTAX_RED"))) {
+    additions.push("SYNTAX: Ensure all code blocks are properly closed. Do not truncate any file.");
   }
 
   if (score.repairHints.length > 0) {
@@ -143,7 +181,9 @@ function buildFallbackRepair(step: PlanStep, score: ExecutionScore): string {
     }
   }
 
-  if (additions.length === 0) return step.details;
+  const baseDetails = freshStart
+    ? step.details.split("\n\n---\nADDITIONAL REQUIREMENTS")[0]
+    : step.details;
 
-  return `${step.details}\n\n---\nADDITIONAL REQUIREMENTS (from quality review):\n${additions.join("\n")}`;
+  return `${baseDetails}\n\n---\nADDITIONAL REQUIREMENTS (from quality review):\n${additions.join("\n")}`;
 }

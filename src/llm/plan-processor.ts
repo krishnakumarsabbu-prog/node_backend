@@ -16,7 +16,10 @@ import { validateStep } from "./agents/step-validator";
 import { injectMissingDependencies, extractPackageJson } from "./agents/dependency-injector";
 import { scoreExecution, PASS_THRESHOLD } from "./agents/execution-scorer";
 import { repairStep, SELF_HEAL_MAX_ATTEMPTS } from "./agents/self-healing-loop";
-import { buildParallelExecutionPlan } from "./agents/parallel-planner";
+import { buildSequentialExecutionPlan } from "./agents/sequential-executor";
+import { runPlanSanityCheck, injectSymbolWarningsIntoSteps } from "./agents/plan-sanity";
+import { buildStepSymbolSummaries, buildSymbolContextBlock } from "./agents/symbol-extractor";
+import { checkCompleteness } from "./agents/completeness-checker";
 
 const TEST_INTENT_PATTERNS = [
   /\b(write|add|create|generate|run|fix|update)\s+(a\s+)?(unit\s+)?tests?\b/i,
@@ -908,7 +911,10 @@ function buildCreatedFilesFeedback(originalFiles: FileMap, accumulatedFiles: Fil
   ].join("\n");
 }
 
-function buildStepMemoryContext(completedSteps: CompletedStepMemory[]): string {
+function buildStepMemoryContext(
+  completedSteps: CompletedStepMemory[],
+  accumulatedFiles?: FileMap,
+): string {
   if (completedSteps.length === 0) return "";
 
   const lines: string[] = [
@@ -920,10 +926,18 @@ function buildStepMemoryContext(completedSteps: CompletedStepMemory[]): string {
     if (s.filesProduced.length > 0) {
       lines.push(`Files produced:`);
       for (const f of s.filesProduced) {
-        lines.push(`  - ${f}`);
+        lines.push(`  - ${f.replace("/home/project/", "")}`);
       }
     } else {
       lines.push(`  (no file changes detected)`);
+    }
+  }
+
+  if (accumulatedFiles) {
+    const symbolSummaries = buildStepSymbolSummaries(completedSteps, accumulatedFiles);
+    const symbolContext = buildSymbolContextBlock(symbolSummaries);
+    if (symbolContext) {
+      lines.push(symbolContext);
     }
   }
 
@@ -968,7 +982,7 @@ function buildTopicStepMessages(
   const createdFilesFeedback = originalFiles && accumulatedFiles
     ? buildCreatedFilesFeedback(originalFiles, accumulatedFiles)
     : "";
-  const stepMemoryContext = completedSteps ? buildStepMemoryContext(completedSteps) : "";
+  const stepMemoryContext = completedSteps ? buildStepMemoryContext(completedSteps, accumulatedFiles) : "";
 
   if (step.index > 1) {
     const prevStep = steps[step.index - 2];
@@ -1546,7 +1560,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       }
 
       const packageJson = extractPackageJson(accumulatedFiles);
-      const depResult = await injectMissingDependencies(step, packageJson);
+      const depResult = injectMissingDependencies(step, packageJson);
       if (depResult.injected) {
         logger.info(`${stepTag} [dep-injector] injected missing deps into step: ${depResult.missingDeps.join(", ")}`);
         step = depResult.enrichedStep;
@@ -1673,10 +1687,10 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       let finalStep = step;
 
       if (executionMode !== "files") {
-        const score = await scoreExecution(step, stepText);
+        const score = scoreExecution(step, stepText);
 
         if (!score.passed) {
-          logger.warn(`${stepTag} [scorer] score=${score.score}/${100} below threshold=${PASS_THRESHOLD} — entering self-heal loop`);
+          logger.warn(`${stepTag} [scorer] score=${score.score}/100 below threshold=${PASS_THRESHOLD} — entering self-heal loop`);
 
           for (let healAttempt = 1; healAttempt <= SELF_HEAL_MAX_ATTEMPTS; healAttempt++) {
             if (clientAbortSignal?.aborted || !writer.isAlive()) break;
@@ -1689,8 +1703,12 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
               message: `Step ${step.index} quality below threshold (score ${score.score}/100) — self-healing attempt ${healAttempt}/${SELF_HEAL_MAX_ATTEMPTS}`,
             } satisfies ProgressAnnotation);
 
-            const { repairedStep } = await repairStep(finalStep, finalStepText, score);
+            const { repairedStep, freshStart } = await repairStep(finalStep, finalStepText, score, healAttempt);
             finalStep = repairedStep;
+
+            if (freshStart) {
+              logger.info(`${stepTag} [self-heal] attempt ${healAttempt} is a FRESH START — discarding previous output`);
+            }
 
             const repairedMessages = buildTopicStepMessages(
               messages, steps, finalStep, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory,
@@ -1705,7 +1723,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
             finalStepText = healResult.stepText;
 
-            const reScore = await scoreExecution(finalStep, finalStepText);
+            const reScore = scoreExecution(finalStep, finalStepText);
             logger.info(`${stepTag} [self-heal] attempt ${healAttempt} re-score=${reScore.score}/100 passed=${reScore.passed}`);
 
             if (reScore.passed) {
@@ -1824,53 +1842,43 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     }
   };
 
-  if (executionMode !== "files" && steps.length > 2) {
-    const parallelPlan = await buildParallelExecutionPlan(steps);
-    logger.info(
-      `[${requestId}] [parallel-planner] ${parallelPlan.totalGroups} group(s), parallelizable=${parallelPlan.parallelizable}`,
-    );
+  if (executionMode !== "files") {
+    const sanity = runPlanSanityCheck(steps);
 
-    const stepByIndex = new Map(steps.map((s) => [s.index, s]));
+    if (sanity.issues.length > 0) {
+      const blockers = sanity.issues.filter((i) => i.type === "FORWARD_REF");
+      const warnings = sanity.issues.filter((i) => i.type !== "FORWARD_REF");
 
-    for (const group of parallelPlan.groups) {
-      if (!writer.isAlive() || circuitBroken) break;
-
-      const groupSteps = group.steps
-        .map((idx) => stepByIndex.get(idx))
-        .filter((s): s is PlanStep => s !== undefined);
-
-      if (groupSteps.length === 0) continue;
-
-      if (groupSteps.length === 1) {
-        await executeStep(groupSteps[0]);
-      } else {
-        logger.info(
-          `[${requestId}] [parallel-planner] executing group ${group.group} in parallel: [${groupSteps.map((s) => s.index).join(", ")}]`,
+      if (blockers.length > 0) {
+        logger.warn(
+          `[${requestId}] [plan-sanity] ${blockers.length} forward-reference issue(s) detected — steps may fail`,
         );
         writer.writeData({
           type: "progress",
-          label: `plan-group${group.group}`,
-          status: "in-progress",
-          order: progressCounter.value++,
-          message: `Executing group ${group.group}: ${groupSteps.map((s) => s.heading).join(", ")}`,
-        } satisfies ProgressAnnotation);
-
-        await Promise.all(groupSteps.map((s) => executeStep(s)));
-
-        writer.writeData({
-          type: "progress",
-          label: `plan-group${group.group}`,
+          label: "plan-sanity-warn",
           status: "complete",
           order: progressCounter.value++,
-          message: `Group ${group.group} complete`,
+          message: `Plan warning: ${blockers.length} step(s) may have forward references. Proceeding but some steps may need repair.`,
         } satisfies ProgressAnnotation);
       }
+
+      if (warnings.length > 0) {
+        logger.info(`[${requestId}] [plan-sanity] ${warnings.length} non-blocking issue(s): ${warnings.map((i) => i.message).join("; ")}`);
+      }
     }
-  } else {
-    for (const step of steps) {
-      if (!writer.isAlive() || circuitBroken) break;
-      await executeStep(step);
+
+    if (sanity.symbolConflicts.length > 0) {
+      logger.warn(`[${requestId}] [plan-sanity] ${sanity.symbolConflicts.length} potential symbol conflict(s) — injecting consistency warnings`);
+      steps = injectSymbolWarningsIntoSteps(steps, sanity.symbolConflicts);
     }
+  }
+
+  const sequentialPlan = buildSequentialExecutionPlan(steps);
+  logger.info(`[${requestId}] [sequential-executor] executing ${sequentialPlan.totalSteps} step(s) sequentially`);
+
+  for (const step of sequentialPlan.steps) {
+    if (!writer.isAlive() || circuitBroken) break;
+    await executeStep(step);
   }
 
   logger.info(
@@ -1893,6 +1901,22 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       ) {
         modifiedFiles.push(filePath);
       }
+    }
+  }
+
+  if (executionMode !== "files" && succeededSteps > 0 && writer.isAlive()) {
+    const completeness = checkCompleteness(accumulatedFiles, originalFiles);
+    if (completeness.orphanFiles.length > 0 || !completeness.hasEntryPoint) {
+      logger.warn(`[${requestId}] [completeness] ${completeness.summary}`);
+      writer.writeData({
+        type: "progress",
+        label: "plan-completeness-warn",
+        status: "complete",
+        order: progressCounter.value++,
+        message: `Completeness check: ${completeness.summary}`,
+      } satisfies ProgressAnnotation);
+    } else {
+      logger.info(`[${requestId}] [completeness] All generated files appear connected`);
     }
   }
 
