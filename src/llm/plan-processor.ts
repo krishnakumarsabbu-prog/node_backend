@@ -106,8 +106,31 @@ Return ONLY a valid JSON array — no prose, no markdown fences. Each element mu
 "heading" : string  (concise action-oriented title ≤ 80 chars, starting with a verb: "Implement", "Build", "Add", "Wire", "Integrate", "Create", "Update", "Extend")
 "details" : string  (comprehensive implementation guidance: exact files to create/modify, specific functions/components/types, data shapes, API contracts, UI behavior, dependency wiring, integration points — must include inputs, processing logic, outputs, and dependency declarations)
 
+CRITICAL — PLAN INTERPRETATION:
+The plan may use fine-grained checklist items, tasks, or sub-items. IGNORE that granularity entirely.
+Group related checklist items into higher-level feature implementations.
+Each step represents a COMPLETE FEATURE, not individual checklist items or sub-tasks.
+
 CRITICAL — EXISTING FILE AWARENESS:
 When referencing files in "details", use the exact file paths from the project. Never invent a path that does not exist. For new files, follow the project's established directory and naming conventions.
+
+STEP SIZE CONSTRAINT (HARD RULE):
+- Each step MUST produce between 2 and 8 files (create or meaningfully modify)
+- A step that touches only 1 file is almost always TOO SMALL — merge it with adjacent related steps
+- A step that touches more than 8 files is probably TOO LARGE — split by feature boundary only
+- Target: 3–6 meaningful file changes per step
+
+FEATURE GROUPING RULE (HARD RULE):
+- Each step must correspond to ONE complete user-facing feature or backend capability
+- A full feature includes ALL of: data model + business logic + API (if applicable) + UI + routing (if applicable)
+- Do NOT split a feature across multiple steps by technical layer (no "service step" then "UI step" for the same feature)
+- Only split by feature boundary — not by technical layer
+
+STEP COMPLEXITY RULE:
+- Each step should represent roughly equal implementation effort
+- Avoid extremely small steps (single file, single method) — these indicate fragmentation
+- Avoid extremely large steps (entire application) — these indicate missed feature boundaries
+- Ask: would a skilled developer implement this step in a single focused coding session?
 
 FEATURE EXTRACTION LAYER — Before producing steps, do this mental decomposition:
 1. Identify all FEATURE-LEVEL modules in the plan (e.g., Authentication, Dashboard, Orders — NOT atomic tasks)
@@ -131,7 +154,7 @@ Each step MUST produce fully working, integrated, and usable functionality. Avoi
 
 OVERLAP RULE:
 - Steps may modify the same file if necessary, but each modification must be additive and non-conflicting with previous steps
-- Do NOT merge unrelated features into a single step just because they touch the same file (e.g. App.tsx, router, or shared config files grow incrementally — that is fine)
+- Do NOT merge unrelated features into a single step just because they touch the same file
 
 CONSISTENCY RULE:
 - Follow a consistent architectural pattern across all steps (naming conventions, folder structure, API design, error handling style)
@@ -181,6 +204,7 @@ FORBIDDEN:
 - Documentation / README / JSDoc / comments steps
 - Test files / unit tests / integration tests / e2e tests steps
 - Linting / formatting / deployment / CI/CD steps
+- Steps that produce only 1 file (except for foundation/config steps that must stand alone)
 
 OUTPUT: JSON array only. No explanation. No fences.
 `,
@@ -191,7 +215,7 @@ ${existingFileSummary ? `${existingFileSummary}\n\n` : ""}Here is the project pl
 ${planContent}
 </plan>
 
-Think through what each feature needs to be complete and usable end-to-end. Use the exact file paths from the project where applicable. Return the JSON array of code change steps.
+IMPORTANT: Ignore the plan's fine-grained task breakdown. Group checklist items into complete feature implementations. Each step must touch 2–8 files and deliver one complete, usable feature end-to-end. Return the JSON array of code change steps.
 `,
   });
 
@@ -230,6 +254,25 @@ Return ONLY a valid JSON array — no prose, no markdown fences. Each element mu
 CRITICAL — EXISTING FILE AWARENESS:
 When referencing files in "details", use the exact file paths from the project. If the request involves an existing file, reference that exact path — never invent a different name. For new files, follow the project's established directory and naming conventions.
 
+STEP SIZE CONSTRAINT (HARD RULE):
+- Each step MUST produce between 2 and 8 files (create or meaningfully modify)
+- A step that touches only 1 file is almost always TOO SMALL — merge it with adjacent related steps
+- A step that touches more than 8 files is probably TOO LARGE — split by feature boundary only
+- Target: 3–6 meaningful file changes per step
+- Exception: the first foundation step (types, config, shared utils) may touch fewer files if genuinely standalone
+
+FEATURE GROUPING RULE (HARD RULE):
+- Each step must correspond to ONE complete user-facing feature or backend capability
+- A full feature includes ALL of: data model + business logic + API (if applicable) + UI + routing (if applicable)
+- Do NOT split a feature across multiple steps by technical layer (no "service step" then "UI step" for the same feature)
+- Only split by feature boundary — not by technical layer
+
+STEP COMPLEXITY RULE:
+- Each step should represent roughly equal implementation effort
+- Avoid extremely small steps (single file, single method) — these indicate fragmentation
+- Avoid extremely large steps (entire application at once) — these indicate missed feature boundaries
+- Ask: would a skilled developer implement this in a single focused coding session?
+
 FEATURE EXTRACTION LAYER — Before producing steps, do this mental decomposition:
 1. Identify all FEATURE-LEVEL modules the request implies (complete capabilities, not atomic tasks)
 2. For each feature, define:
@@ -253,7 +296,7 @@ Each step MUST produce fully working, integrated, and usable functionality. Avoi
 
 OVERLAP RULE:
 - Steps may modify the same file if necessary, but each modification must be additive and non-conflicting with previous steps
-- Do NOT merge unrelated features into a single step just because they touch the same file (e.g. App.tsx, router, or shared config files grow incrementally — that is fine)
+- Do NOT merge unrelated features into a single step just because they touch the same file
 
 CONSISTENCY RULE:
 - Follow a consistent architectural pattern across all steps (naming conventions, folder structure, API design, error handling style)
@@ -307,6 +350,7 @@ FORBIDDEN:
 - Documentation / README / JSDoc / comments steps
 - Test files / unit tests / integration tests / e2e tests steps
 - Linting / formatting / deployment / CI/CD steps
+- Steps that produce only 1 file (except standalone foundation/config steps)
 
 OUTPUT: JSON array only. No explanation text. No markdown fences. No preamble.
 `,
@@ -317,7 +361,7 @@ User's request:
 ${userQuestion}
 </request>
 ${existingFileSummary ? `\n${existingFileSummary}\n` : ""}
-Think through what each feature needs to be complete and usable end-to-end. Use the exact file names from the project where applicable. Return the JSON array of code change steps.
+Think through what each feature needs to be complete and usable end-to-end. Each step must touch 2–8 files and deliver one complete feature. Use the exact file names from the project where applicable. Return the JSON array of code change steps.
 `,
   });
 
@@ -1906,17 +1950,33 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
   if (executionMode !== "files" && succeededSteps > 0 && writer.isAlive()) {
     const completeness = checkCompleteness(accumulatedFiles, originalFiles);
-    if (completeness.orphanFiles.length > 0 || !completeness.hasEntryPoint) {
+    const hasIntegrationIssues =
+      completeness.orphanFiles.length > 0 ||
+      !completeness.hasEntryPoint ||
+      completeness.routingIssues.length > 0 ||
+      completeness.serviceIssues.length > 0;
+
+    if (hasIntegrationIssues) {
       logger.warn(`[${requestId}] [completeness] ${completeness.summary}`);
+      if (completeness.routingIssues.length > 0) {
+        for (const issue of completeness.routingIssues) {
+          logger.warn(`[${requestId}] [completeness] ROUTING: ${issue.message}`);
+        }
+      }
+      if (completeness.serviceIssues.length > 0) {
+        for (const issue of completeness.serviceIssues) {
+          logger.warn(`[${requestId}] [completeness] SERVICE: ${issue.message}`);
+        }
+      }
       writer.writeData({
         type: "progress",
         label: "plan-completeness-warn",
         status: "complete",
         order: progressCounter.value++,
-        message: `Completeness check: ${completeness.summary}`,
+        message: `Integration check: ${completeness.summary}`,
       } satisfies ProgressAnnotation);
     } else {
-      logger.info(`[${requestId}] [completeness] All generated files appear connected`);
+      logger.info(`[${requestId}] [completeness] All generated files appear connected and integrated`);
     }
   }
 
