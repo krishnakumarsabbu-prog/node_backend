@@ -50,6 +50,12 @@ export interface PlanStep {
   details: string;
 }
 
+export interface CompletedStepMemory {
+  index: number;
+  heading: string;
+  filesProduced: string[];
+}
+
 export interface ParsedPlan {
   steps: PlanStep[];
   rawContent: string;
@@ -103,22 +109,46 @@ DESIGN FIRST — Before splitting into steps, mentally answer:
 PRIMARY RULE:
 Each step MUST produce fully working, integrated, and usable functionality. Avoid partial implementations. Prefer vertical slices (feature-complete) over horizontal slices (layer-only). A step that creates a service without wiring it to anything is NOT acceptable.
 
+OVERLAP RULE:
+- Steps may modify the same file if necessary, but each modification must be additive and non-conflicting with previous steps
+- Do NOT merge unrelated features into a single step just because they touch the same file (e.g. App.tsx, router, or shared config files grow incrementally — that is fine)
+
+CONSISTENCY RULE:
+- Follow a consistent architectural pattern across all steps (naming conventions, folder structure, API design, error handling style)
+- Reuse patterns and utilities introduced in earlier steps — never introduce a parallel approach to something already established
+- Do not duplicate configuration or redefine shared utilities that already exist
+
+STEP LINKING RULE:
+- Each step must explicitly build on outputs from previous steps
+- Reference previously created services, hooks, types, and components by name
+- Do not redefine entities already created in earlier steps — extend or import them
+
+DEPENDENCY ORDER RULE:
+- A step must NOT reference any file, API, type, or component that has not been created by a previous step or within the same step
+- If a dependency is required, ensure it is created in an earlier step — never forward-reference
+
+MODIFICATION RULE:
+- Prefer updating and extending existing files over creating new parallel implementations
+- When modifying a file, clearly specify what to add, where, and why it is needed
+- Avoid creating duplicate implementations of the same responsibility
+
+ANTI-FRAGMENTATION RULE:
+- Do NOT split a feature into multiple steps unless it is genuinely too large to implement coherently in one step
+- Prefer fewer, complete steps over many partial steps
+- Wiring, routing, and integration belong in the same step as the feature they connect — not a separate "Wire X" step unless unavoidable
+
 STEP RULES:
 - Include ONLY source code change steps — no documentation, no tests, no README updates
 - Each step must produce complete, compilable, runnable code with no missing imports or undefined references
-- Order steps in strict dependency order so each one builds directly on the previous
-- Zero overlap between steps — if two steps touch the same file, merge them into one
-- Prefer feature-based (vertical) steps: a step may include data model + service + API + UI component + routing if they together implement one coherent feature
-- Avoid splitting steps purely by technical layer (service alone, controller alone, UI alone) when those pieces only make sense together
-- Every UI component created must be wired to routing/navigation in the same step or an explicit wiring step immediately after
+- Every UI component created must be connected to routing/navigation in the same step
 - Every API endpoint created must be connected to its service layer in the same step
 - Every service must be consumed by at least one upstream component — no orphan services
-- If a step introduces new dependencies (library, framework, plugin), it MUST update the build manifest (package.json / pom.xml / build.gradle) in the same step
+- If a step introduces new dependencies, it MUST update the build manifest (package.json / pom.xml / build.gradle) in the same step
 - Avoid skeleton, stub, or placeholder implementations — every file must be complete and functional
 
 DEFINITION OF DONE (each step must satisfy ALL of these):
 - Code compiles with no errors
-- All imports are resolved — no references to files that don't exist yet
+- All imports are resolved — no references to files that do not exist yet
 - No unused or unreachable components
 - Every created component is wired and reachable from the application entry point
 - Feature is usable end-to-end, not just scaffolded
@@ -189,23 +219,50 @@ THINK BEFORE YOU PLAN — run this mental checklist:
 PRIMARY RULE:
 Each step MUST produce fully working, integrated, and usable functionality. Avoid partial implementations. Prefer vertical slices (feature-complete) over horizontal slices (layer-only). A step that creates a service without wiring it to anything is NOT acceptable.
 
+OVERLAP RULE:
+- Steps may modify the same file if necessary, but each modification must be additive and non-conflicting with previous steps
+- Do NOT merge unrelated features into a single step just because they touch the same file (e.g. App.tsx, router, or shared config files grow incrementally — that is fine)
+
+CONSISTENCY RULE:
+- Follow a consistent architectural pattern across all steps (naming conventions, folder structure, API design, error handling style)
+- Reuse patterns and utilities introduced in earlier steps — never introduce a parallel approach to something already established
+- Do not duplicate configuration or redefine shared utilities that already exist
+
+STEP LINKING RULE:
+- Each step must explicitly build on outputs from previous steps
+- Reference previously created services, hooks, types, and components by name
+- Do not redefine entities already created in earlier steps — extend or import them
+
+DEPENDENCY ORDER RULE:
+- A step must NOT reference any file, API, type, or component that has not been created by a previous step or within the same step
+- If a dependency is required, ensure it is created in an earlier step — never forward-reference
+
+MODIFICATION RULE:
+- Prefer updating and extending existing files over creating new parallel implementations
+- When modifying a file, clearly specify what to add, where, and why it is needed
+- Avoid creating duplicate implementations of the same responsibility
+
+ANTI-FRAGMENTATION RULE:
+- Do NOT split a feature into multiple steps unless it is genuinely too large to implement coherently in one step
+- Prefer fewer, complete steps over many partial steps
+- Wiring, routing, and integration belong in the same step as the feature they connect — not a separate "Wire X" step unless unavoidable
+
 STEP RULES:
 - Include ONLY source code change steps — no documentation, no tests, no README updates
 - Each step must produce complete, compilable, runnable code with no missing imports or undefined references
 - Order steps in strict dependency order — no step should require code from a later step
-- Zero overlap between steps — if two steps touch the same file, merge them into one
 - Prefer feature-based (vertical) steps: a step may span data model + service + API + UI + routing if they together implement one coherent feature
 - Avoid splitting steps purely by technical layer (service alone, controller alone, UI alone) when those pieces only make sense together
-- Every UI component created must be wired to routing/navigation in the same step or an explicit wiring step immediately after
+- Every UI component created must be connected to routing/navigation in the same step
 - Every API endpoint created must be connected to its service layer in the same step
 - Every service must be consumed by at least one upstream component — no orphan services
-- If a step introduces new dependencies (library, framework, plugin), it MUST update the build manifest (package.json / pom.xml / build.gradle) in the same step
+- If a step introduces new dependencies, it MUST update the build manifest (package.json / pom.xml / build.gradle) in the same step
 - All UI states must be handled: loading, empty, error, success
 - Avoid skeleton, stub, or placeholder implementations — every file must be complete and functional
 
 DEFINITION OF DONE (each step must satisfy ALL of these):
 - Code compiles with no errors
-- All imports are resolved — no references to files that don't exist yet
+- All imports are resolved — no references to files that do not exist yet
 - No unused or unreachable components
 - Every created component is wired and reachable from the application entry point
 - Feature is usable end-to-end, not just scaffolded
@@ -822,6 +879,37 @@ function buildCreatedFilesFeedback(originalFiles: FileMap, accumulatedFiles: Fil
   ].join("\n");
 }
 
+function buildStepMemoryContext(completedSteps: CompletedStepMemory[]): string {
+  if (completedSteps.length === 0) return "";
+
+  const lines: string[] = [
+    `\n## Completed Steps — What Already Exists (DO NOT recreate or redefine these)`,
+  ];
+
+  for (const s of completedSteps) {
+    lines.push(`\n### Step ${s.index}: ${s.heading}`);
+    if (s.filesProduced.length > 0) {
+      lines.push(`Files produced:`);
+      for (const f of s.filesProduced) {
+        lines.push(`  - ${f}`);
+      }
+    } else {
+      lines.push(`  (no file changes detected)`);
+    }
+  }
+
+  lines.push(
+    ``,
+    `MEMORY RULES:`,
+    `- Extend and import from the files listed above — do NOT rewrite or duplicate them`,
+    `- Use the same naming conventions, patterns, and folder structure established above`,
+    `- If a service, hook, type, or component already exists above, reuse it — never redefine it`,
+    `- If you need to modify a file from a previous step to wire this step, output the full updated file`,
+  );
+
+  return lines.join("\n");
+}
+
 function buildTopicStepMessages(
   messages: Messages,
   steps: PlanStep[],
@@ -831,6 +919,7 @@ function buildTopicStepMessages(
   userQuestion: string | null,
   accumulatedFiles?: FileMap,
   originalFiles?: FileMap,
+  completedSteps?: CompletedStepMemory[],
 ): Messages {
   const stepMessages: Messages = [...messages];
 
@@ -850,6 +939,7 @@ function buildTopicStepMessages(
   const createdFilesFeedback = originalFiles && accumulatedFiles
     ? buildCreatedFilesFeedback(originalFiles, accumulatedFiles)
     : "";
+  const stepMemoryContext = completedSteps ? buildStepMemoryContext(completedSteps) : "";
 
   if (step.index > 1) {
     const prevStep = steps[step.index - 2];
@@ -866,6 +956,7 @@ function buildTopicStepMessages(
         `## Plan Progress`,
         allStepsList,
         createdFilesFeedback,
+        stepMemoryContext,
         ``,
         `## Your Task - Step ${step.index}/${steps.length}: ${step.heading}`,
         ``,
@@ -1386,6 +1477,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
   const accumulatedFiles: FileMap = { ...files };
   const originalFiles: FileMap = { ...files };
+  const completedStepMemory: CompletedStepMemory[] = [];
 
   const executeStep = async (step: PlanStep): Promise<void> => {
     if (!writer.isAlive() || circuitBroken) return;
@@ -1407,7 +1499,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     const stepMessages =
       executionMode === "files"
         ? buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles)
-        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles);
+        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory);
 
     let filesToUse: FileMap = accumulatedFiles;
     let contextSource = "full-accumulated";
@@ -1556,6 +1648,12 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         logger.warn(`${stepTag} client disconnected after step output, aborting`);
         return;
       }
+
+      completedStepMemory.push({
+        index: step.index,
+        heading: step.heading,
+        filesProduced: Object.keys(generatedFiles),
+      });
 
       succeededSteps++;
 
