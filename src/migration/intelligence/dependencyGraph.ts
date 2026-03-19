@@ -15,11 +15,20 @@ export interface GraphEdge {
   type: EdgeType;
 }
 
+export interface GraphSummary {
+  totalNodes: number;
+  totalEdges: number;
+  circularDependencies: number;
+  circularPaths: string[][];
+  unusedBeans: string[];
+}
+
 export interface DependencyGraph {
   nodes: GraphNode[];
   edges: GraphEdge[];
   adjacency: Record<string, string[]>;
   reverseAdjacency: Record<string, string[]>;
+  summary: GraphSummary;
 }
 
 function normalizeImport(imp: string, fromPath: string): string | null {
@@ -102,7 +111,73 @@ export function buildDependencyGraph(summaries: FileSummary[]): DependencyGraph 
     reverseAdjacency[edge.to].push(edge.from);
   }
 
-  return { nodes, edges, adjacency, reverseAdjacency };
+  const summary = computeGraphSummary(nodes, edges, adjacency, reverseAdjacency);
+
+  return { nodes, edges, adjacency, reverseAdjacency, summary };
+}
+
+function computeGraphSummary(
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+  adjacency: Record<string, string[]>,
+  reverseAdjacency: Record<string, string[]>
+): GraphSummary {
+  const circularPaths = detectCircularDependencies(adjacency);
+
+  const unusedBeans = nodes
+    .filter((n) => {
+      const isService = n.type === "service" || n.type === "repository";
+      if (!isService) return false;
+      const usedBy = reverseAdjacency[n.id] || [];
+      return usedBy.length === 0;
+    })
+    .map((n) => n.filePath);
+
+  return {
+    totalNodes: nodes.length,
+    totalEdges: edges.length,
+    circularDependencies: circularPaths.length,
+    circularPaths: circularPaths.slice(0, 10),
+    unusedBeans: unusedBeans.slice(0, 20),
+  };
+}
+
+function detectCircularDependencies(adjacency: Record<string, string[]>): string[][] {
+  const cycles: string[][] = [];
+  const visited = new Set<string>();
+  const inStack = new Set<string>();
+  const path: string[] = [];
+
+  function dfs(node: string): void {
+    if (inStack.has(node)) {
+      const cycleStart = path.indexOf(node);
+      if (cycleStart !== -1) {
+        cycles.push([...path.slice(cycleStart), node]);
+      }
+      return;
+    }
+    if (visited.has(node)) return;
+
+    visited.add(node);
+    inStack.add(node);
+    path.push(node);
+
+    for (const neighbor of adjacency[node] || []) {
+      if (cycles.length >= 10) break;
+      dfs(neighbor);
+    }
+
+    path.pop();
+    inStack.delete(node);
+  }
+
+  for (const node of Object.keys(adjacency)) {
+    if (!visited.has(node) && cycles.length < 10) {
+      dfs(node);
+    }
+  }
+
+  return cycles;
 }
 
 export function getNodesByRole(graph: DependencyGraph, role: FileRole): GraphNode[] {

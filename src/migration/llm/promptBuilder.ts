@@ -77,11 +77,15 @@ ${PromptBuilder.getMigrationDocumentInstructions()}`;
   ): string {
     const context = buildMigrationContextPrompt(intelligence, userRequest);
 
-    return `You are a senior Spring migration architect generating a complete, production-ready migration plan document.
+    return `You are a senior Spring migration architect generating a complete, production-ready migration plan.
 
-You have been provided with structured codebase intelligence — NOT raw file contents. This intelligence was extracted by a pre-processing pipeline that analyzed all files, built a dependency graph, parsed XML configurations, and detected migration patterns.
+You have been provided with structured codebase intelligence — NOT raw file contents. This intelligence was extracted by a pre-processing pipeline that:
+- Analyzed all Java/XML/build files semantically
+- Built a dependency graph with circular dependency detection
+- Parsed all XML configuration files (web.xml, applicationContext.xml, etc.)
+- Detected migration patterns (field injection, legacy dispatcher, missing Boot main, etc.)
 
-Use this structured intelligence to generate an accurate, complete Migration.md document.
+Use this structured intelligence to generate BOTH a Migration.md document AND a structured task list.
 
 ---
 
@@ -94,7 +98,7 @@ ${PromptBuilder.getMigrationDocumentInstructions()}`;
 
   private static getMigrationDocumentInstructions(): string {
     return `YOUR TASK:
-Generate a complete Migration.md document that serves as a step-by-step implementation guide.
+Generate a DUAL OUTPUT: (1) a complete Migration.md document AND (2) a structured task list JSON.
 
 The migration creates a NEW project at: /home/project/migrate/
 
@@ -117,14 +121,11 @@ CRITICAL RULES:
    - property placeholders → application.properties or application.yml
    - view resolvers / handler mappings → Spring Boot defaults unless customization is required
 
-4. DO NOT COPY XML FILES INTO THE TARGET PROJECT:
-   - You must CONVERT them, not migrate as-is
-   - Clearly explain where each XML configuration is moved
+4. FIELD INJECTION → CONSTRUCTOR INJECTION:
+   - If the project uses field injection (@Autowired on fields), convert to constructor injection in the target
 
-5. EVERY XML FILE MUST HAVE AN EXPLICIT TRANSFORMATION EXPLANATION:
-   - What the XML file does
-   - What replaces it in Spring Boot
-   - Which new file(s) contain that logic
+5. DO NOT COPY XML FILES INTO THE TARGET PROJECT:
+   - You must CONVERT them, not migrate as-is
 
 6. The migrate/ folder is a completely fresh Spring Boot project — include ALL setup files:
    - Main class with @SpringBootApplication
@@ -132,64 +133,89 @@ CRITICAL RULES:
    - Build file with Spring Boot dependencies
    - Proper package structure
 
-7. Each step must be self-contained and implementable by an LLM coding agent
+7. Each step must be self-contained and ordered (earlier steps must not depend on later steps)
 
-8. Steps must be ordered so later steps never depend on files created by later steps
+8. Describe exactly what each file must contain — reference class names, method signatures, annotations, config keys
 
-9. Describe exactly what each file must contain — reference:
-   - Class names
-   - Method signatures
-   - Annotations
-   - Configuration keys
-
-10. Preserve 100% of the business logic — ONLY change configuration style (XML → annotations/config)
+9. Preserve 100% of the business logic — ONLY change configuration style
 
 ---
 
-MIGRATION.md FORMAT:
+OUTPUT FORMAT (MANDATORY DUAL OUTPUT):
 
-Write a proper markdown document with:
+You MUST return your response in EXACTLY this structure:
 
-- A title: # Migration Plan: Spring Web MVC → Spring Boot
+\`\`\`json
+{
+  "markdown": "<FULL Migration.md content as a string — include all sections, properly escaped>",
+  "tasks": [
+    {
+      "id": "task-001",
+      "title": "Create Spring Boot main application class",
+      "type": "build",
+      "files": ["migrate/src/main/java/com/example/Application.java"],
+      "dependsOn": [],
+      "description": "Create @SpringBootApplication entry point replacing web.xml"
+    },
+    {
+      "id": "task-002",
+      "title": "Update pom.xml for Spring Boot",
+      "type": "build",
+      "files": ["migrate/pom.xml"],
+      "dependsOn": [],
+      "description": "Add spring-boot-starter-parent, spring-boot-starter-web, spring-boot-maven-plugin"
+    }
+  ]
+}
+\`\`\`
 
-- A ## Overview section describing what is being migrated and why
-
-- A ## Migration Strategy section explaining:
-  - XML → Java config transformation
-  - Embedded server model
-  - Auto-configuration approach
-
-- A ## Target Structure section showing the directory tree of migrate/
-
-- Numbered ## Step N: [Action Title] sections — one per logical group of files
-  - Each step has a ### Goal subsection and a ### Files subsection
-  - Under ### Files, list each file as:
-    **\`migrate/path/to/file\`** — [description of exactly what it should contain]
+TASK RULES:
+- Each task MUST have: id, title, type, files[], dependsOn[], description
+- id must be unique: "task-001", "task-002", etc.
+- type must be one of: "build" | "config" | "code" | "resource"
+  - "build": pom.xml, build files, main class
+  - "config": application.properties, @Configuration classes, replacing XML configs
+  - "code": controllers, services, repositories, models
+  - "resource": static files, templates, other non-code resources
+- files[] must list ALL target files created/modified in this task (paths under migrate/)
+- dependsOn[] must list task IDs that MUST be completed before this task
+- Tasks must be ordered: build → config → code → resource
+- NO orphan tasks (every dependsOn id must exist)
+- NO circular dependencies in tasks
 
 ---
 
-🚨 MANDATORY SECTION:
+MIGRATION.md CONTENT (inside the "markdown" field) MUST INCLUDE:
+
+# Migration Plan: Spring Web MVC → Spring Boot
+
+## Overview
+[What is being migrated and why]
+
+## Migration Strategy
+[XML → Java config transformation, embedded server model, auto-configuration approach]
+
+## Target Structure
+[Directory tree of migrate/]
+
+## Step N: [Action Title]
+[One section per logical group of files]
+### Goal
+### Files
+**\`migrate/path/to/file\`** — [description]
 
 ## XML to Spring Boot Mapping
+[For EACH XML file: Purpose, Key configurations, Spring Boot replacement, Target file(s)]
 
-For EACH XML file found in the input:
+## Dependency Changes
+[New/removed packages]
 
-### [xml-file-name]
-- Purpose:
-- Key configurations:
-- Spring Boot replacement:
-- Target file(s):
-- Exact transformation explanation
+## Key Differences
+[Behavioral changes]
 
 ---
 
-- A ## Dependency Changes section listing all new/removed packages
-
-- A ## Key Differences section noting behavioral changes
-
----
-
-Write the full Migration.md document now:`;
+Return ONLY the JSON block. No explanations before or after it.`;
   }
 
   private static sampleFileList(fileList: string[], maxFiles: number): { sample: string[]; truncated: boolean; totalCount: number } {

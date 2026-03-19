@@ -170,7 +170,7 @@ export class ChatMigrationHandler {
 
       logger.info(
         `Intelligence built for execution: ${intelligence.fileSummaries.length} summaries, ` +
-        `${intelligence.xmlConfigs.length} XML configs, patterns=[${intelligence.detectedPatterns.join(", ")}]`
+        `${intelligence.xmlConfigs.length} XML configs, patterns=[${intelligence.migrationPatterns.join(", ")}]`
       );
 
       writeDataPart(res, {

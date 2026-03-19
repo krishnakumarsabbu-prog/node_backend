@@ -1,5 +1,5 @@
 import { generateText } from "ai";
-import type { ProjectAnalysis, MigrationPlan } from "../types/migrationTypes";
+import type { ProjectAnalysis, MigrationPlan, MigrationTask, MigrationTaskCategory } from "../types/migrationTypes";
 import type { FileMap } from "../../llm/constants";
 import { MigrationPlanSchema } from "../schemas/migrationSchema";
 import { LLMClient } from "../llm/llmClient";
@@ -13,6 +13,20 @@ const logger = createScopedLogger("planner-agent");
 export interface MigrationDocument {
   markdownContent: string;
   plan: MigrationPlan;
+}
+
+interface DualOutputTask {
+  id: string;
+  title: string;
+  type: MigrationTaskCategory;
+  files: string[];
+  dependsOn: string[];
+  description: string;
+}
+
+interface DualOutputResponse {
+  markdown: string;
+  tasks: DualOutputTask[];
 }
 
 export class PlannerAgent {
@@ -31,7 +45,7 @@ export class PlannerAgent {
       `Intelligence built: ${intelligence.fileSummaries.length} summaries, ` +
       `${intelligence.dependencyGraph.edges.length} dep edges, ` +
       `${intelligence.xmlConfigs.length} XML configs, ` +
-      `patterns=[${intelligence.detectedPatterns.join(", ")}]`
+      `patterns=[${intelligence.migrationPatterns.join(", ")}]`
     );
 
     const fileList = Object.keys(files);
@@ -44,7 +58,7 @@ export class PlannerAgent {
       intelligence
     );
 
-    logger.info(`Migration document prompt built: ${prompt.length} chars (was raw content before)`);
+    logger.info(`Migration document prompt built: ${prompt.length} chars`);
 
     const result = await generateText({
       model: getTachyonModel(),
@@ -52,12 +66,10 @@ export class PlannerAgent {
       maxTokens: 8192,
     });
 
-    const markdownContent = result.text.trim();
-
-    const plan = this.extractPlanFromDocument(markdownContent, fileList);
+    const { markdownContent, plan } = this.parseDualOutput(result.text.trim(), fileList);
 
     logger.info(
-      `Migration.md generated: ${markdownContent.length} chars, ${plan.tasks.length} inferred tasks`
+      `Migration.md generated: ${markdownContent.length} chars, ${plan.tasks.length} tasks`
     );
 
     return { markdownContent, plan };
@@ -103,10 +115,134 @@ export class PlannerAgent {
     return plan;
   }
 
-  private extractPlanFromDocument(markdownContent: string, existingFiles: string[]): MigrationPlan {
-    const stepMatches = markdownContent.matchAll(/^##\s+Step\s+\d+[:\s]+(.+)$/gm);
-    const steps = Array.from(stepMatches).map((m) => m[1].trim());
+  private parseDualOutput(text: string, fileList: string[]): { markdownContent: string; plan: MigrationPlan } {
+    const jsonMatch = text.match(/```json\s*([\s\S]*?)```/);
+    const rawJson = jsonMatch ? jsonMatch[1].trim() : text.trim();
 
+    try {
+      const parsed: DualOutputResponse = JSON.parse(rawJson);
+
+      if (!parsed.markdown || !Array.isArray(parsed.tasks)) {
+        throw new Error("Invalid dual-output structure: missing markdown or tasks");
+      }
+
+      const tasks = this.convertAndValidateTasks(parsed.tasks);
+
+      const plan: MigrationPlan = {
+        migrationType: this.extractMigrationTypeFromMarkdown(parsed.markdown),
+        summary: {
+          filesToModify: 0,
+          filesToDelete: 0,
+          filesToCreate: tasks.filter((t) => t.action === "create").length,
+        },
+        tasks,
+        estimatedComplexity: tasks.length > 20 ? "high" : tasks.length > 8 ? "medium" : "low",
+      };
+
+      logger.info(`Parsed dual-output: ${parsed.markdown.length} chars markdown, ${tasks.length} tasks`);
+
+      return { markdownContent: parsed.markdown, plan };
+    } catch (err) {
+      logger.warn(`Failed to parse dual-output JSON: ${err}. Falling back to markdown extraction.`);
+      return this.fallbackExtract(text, fileList);
+    }
+  }
+
+  private convertAndValidateTasks(dualTasks: DualOutputTask[]): MigrationTask[] {
+    const idSet = new Set(dualTasks.map((t) => t.id));
+
+    const validDependsOn = (deps: string[]): string[] => {
+      return deps.filter((dep) => {
+        if (!idSet.has(dep)) {
+          logger.warn(`Task dependsOn references unknown task id: ${dep}`);
+          return false;
+        }
+        return true;
+      });
+    };
+
+    const tasks: MigrationTask[] = dualTasks.map((t, i) => {
+      const primaryFile = t.files && t.files.length > 0 ? t.files[0] : `migrate/task-${t.id}`;
+      return {
+        id: t.id || `task-${String(i + 1).padStart(3, "0")}`,
+        file: primaryFile,
+        action: "create" as const,
+        description: t.description || t.title,
+        type: t.type,
+        files: t.files || [],
+        dependsOn: validDependsOn(t.dependsOn || []),
+        priority: this.taskTypeToPriority(t.type),
+      };
+    });
+
+    this.validateTaskGraph(tasks);
+
+    return tasks;
+  }
+
+  private taskTypeToPriority(type: MigrationTaskCategory | undefined): number {
+    switch (type) {
+      case "build": return 10;
+      case "config": return 7;
+      case "code": return 5;
+      case "resource": return 2;
+      default: return 5;
+    }
+  }
+
+  private validateTaskGraph(tasks: MigrationTask[]): void {
+    const idSet = new Set(tasks.map((t) => t.id));
+
+    const uniqueIds = new Set<string>();
+    for (const task of tasks) {
+      if (uniqueIds.has(task.id)) {
+        logger.warn(`Duplicate task id detected: ${task.id}`);
+      }
+      uniqueIds.add(task.id);
+    }
+
+    const adjacency: Record<string, string[]> = {};
+    for (const task of tasks) {
+      adjacency[task.id] = task.dependsOn || [];
+    }
+
+    const visited = new Set<string>();
+    const inStack = new Set<string>();
+
+    const hasCycle = (id: string): boolean => {
+      if (inStack.has(id)) return true;
+      if (visited.has(id)) return false;
+      visited.add(id);
+      inStack.add(id);
+      for (const dep of adjacency[id] || []) {
+        if (hasCycle(dep)) return true;
+      }
+      inStack.delete(id);
+      return false;
+    };
+
+    for (const id of Object.keys(adjacency)) {
+      if (hasCycle(id)) {
+        logger.warn(`Circular dependency detected in task graph at: ${id}`);
+        break;
+      }
+    }
+  }
+
+  private extractMigrationTypeFromMarkdown(markdown: string): string {
+    const typeMatch = markdown.match(/^#\s+Migration Plan[:\s]+(.+)$/m);
+    return typeMatch
+      ? typeMatch[1].trim().replace(/\s+/g, "_").toLowerCase()
+      : "project_migration";
+  }
+
+  private fallbackExtract(text: string, fileList: string[]): { markdownContent: string; plan: MigrationPlan } {
+    const markdownContent = text;
+    const plan = this.extractPlanFromDocument(markdownContent, fileList);
+    return { markdownContent, plan };
+  }
+
+  private extractPlanFromDocument(markdownContent: string, existingFiles: string[]): MigrationPlan {
     const fileMatches = markdownContent.matchAll(/\*\*`(migrate\/[^`]+)`\*\*/g);
     const migrateFiles = Array.from(new Set(
       Array.from(fileMatches).map((m) => m[1])
@@ -117,7 +253,8 @@ export class PlannerAgent {
       ? typeMatch[1].trim().replace(/\s+/g, "_").toLowerCase()
       : "project_migration";
 
-    const tasks = migrateFiles.map((file) => ({
+    const tasks: MigrationTask[] = migrateFiles.map((file, i) => ({
+      id: `task-${String(i + 1).padStart(3, "0")}`,
       file,
       action: "create" as const,
       description: `Create ${file} as part of the migration to the new project structure`,

@@ -2,11 +2,17 @@ import { z } from "zod";
 
 export const MigrationActionSchema = z.enum(["modify", "delete", "create"]);
 
+export const MigrationTaskCategorySchema = z.enum(["config", "code", "build", "resource"]);
+
 export const MigrationTaskSchema = z.object({
+  id: z.string().min(1).default(() => `task-${Math.random().toString(36).slice(2, 9)}`),
   file: z.string().min(1, "File path cannot be empty"),
   action: MigrationActionSchema,
   description: z.string().min(10, "Description must be at least 10 characters"),
   priority: z.number().min(0).max(10).optional(),
+  type: MigrationTaskCategorySchema.optional(),
+  files: z.array(z.string()).optional(),
+  dependsOn: z.array(z.string()).optional(),
 });
 
 export const MigrationSummarySchema = z.object({

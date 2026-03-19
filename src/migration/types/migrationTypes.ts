@@ -52,11 +52,27 @@ export type Framework =
   | "tauri"
   | "unknown";
 
+export type MigrationTaskCategory = "config" | "code" | "build" | "resource";
+
 export interface MigrationTask {
+  id: string;
   file: string;
   action: MigrationAction;
   description: string;
   priority?: number;
+  type?: MigrationTaskCategory;
+  files?: string[];
+  dependsOn?: string[];
+}
+
+export interface DetectedPatterns {
+  usesXmlConfiguration: boolean;
+  usesFieldInjection: boolean;
+  hasLegacyDispatcher: boolean;
+  missingBootMain: boolean;
+  hasMultipleXmlConfigs: boolean;
+  usesPropertyPlaceholders: boolean;
+  hasCircularDependencies: boolean;
 }
 
 export interface MigrationSummary {

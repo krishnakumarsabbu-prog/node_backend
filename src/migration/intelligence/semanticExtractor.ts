@@ -9,6 +9,12 @@ export interface MethodSummary {
   params: string[];
 }
 
+export interface InjectedField {
+  name: string;
+  type: string;
+  injectionStyle: "field" | "constructor" | "setter";
+}
+
 export interface FileSummary {
   path: string;
   role: FileRole;
@@ -17,10 +23,15 @@ export interface FileSummary {
   imports: string[];
   classNames: string[];
   methods: MethodSummary[];
+  injectedFields: InjectedField[];
   usesXmlConfig: boolean;
   usesAutowired: boolean;
+  usesFieldInjection: boolean;
+  usesConstructorInjection: boolean;
   usesComponentScan: boolean;
   usesTransactional: boolean;
+  isSpringBootMain: boolean;
+  hasDispatcherServletRef: boolean;
   lineCount: number;
 }
 
@@ -33,6 +44,48 @@ const TS_IMPORT_RE = /^import\s+.*?from\s+['"]([^'"]+)['"]/gm;
 const TS_CLASS_RE = /(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/g;
 const TS_DECORATOR_RE = /@(\w+)(?:\([^)]*\))?/g;
 const TS_METHOD_RE = /(?:async\s+)?(\w+)\s*\(([^)]*)\)\s*(?::\s*[\w<>\[\],\s|?]+)?\s*\{/g;
+
+function extractInjectedFields(lines: string[]): InjectedField[] {
+  const fields: InjectedField[] = [];
+  let pendingAnnotations: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+
+    const annMatch = line.match(/^@(\w+)/);
+    if (annMatch) {
+      pendingAnnotations.push(annMatch[1]);
+      continue;
+    }
+
+    if (pendingAnnotations.includes("Autowired") || pendingAnnotations.includes("Inject") || pendingAnnotations.includes("Resource")) {
+      const fieldMatch = line.match(/^(?:private|protected|public)\s+([\w<>[\],\s]+?)\s+(\w+)\s*;/);
+      if (fieldMatch) {
+        fields.push({ name: fieldMatch[2], type: fieldMatch[1].trim(), injectionStyle: "field" });
+        pendingAnnotations = [];
+        continue;
+      }
+      const constructorMatch = line.match(/^(?:public|protected)\s+\w+\s*\(/);
+      if (constructorMatch) {
+        fields.push({ name: "constructor", type: "multiple", injectionStyle: "constructor" });
+        pendingAnnotations = [];
+        continue;
+      }
+      const setterMatch = line.match(/^(?:public|protected)\s+void\s+set(\w+)\s*\(/);
+      if (setterMatch) {
+        fields.push({ name: setterMatch[1].charAt(0).toLowerCase() + setterMatch[1].slice(1), type: "unknown", injectionStyle: "setter" });
+        pendingAnnotations = [];
+        continue;
+      }
+    }
+
+    if (line.length > 0 && !line.startsWith("//") && !line.startsWith("*")) {
+      pendingAnnotations = [];
+    }
+  }
+
+  return fields;
+}
 
 function extractJavaFileSummary(path: string, content: string): FileSummary {
   const annotations: string[] = [];
@@ -57,9 +110,8 @@ function extractJavaFileSummary(path: string, content: string): FileSummary {
     classNames.push(m[1]);
   }
 
-  JAVA_METHOD_RE.lastIndex = 0;
-  const methodAnnotations: string[] = [];
   const lines = content.split("\n");
+  const methodAnnotations: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     const annMatch = line.match(/^@(\w+)/);
@@ -81,7 +133,12 @@ function extractJavaFileSummary(path: string, content: string): FileSummary {
     }
   }
 
+  const injectedFields = extractInjectedFields(lines);
+  const usesFieldInjection = injectedFields.some((f) => f.injectionStyle === "field");
+  const usesConstructorInjection = injectedFields.some((f) => f.injectionStyle === "constructor");
   const role = detectJavaRole(path, annotations);
+  const isSpringBootMain = annotations.includes("SpringBootApplication") || content.includes("@SpringBootApplication");
+  const hasDispatcherServletRef = content.includes("DispatcherServlet") || content.includes("dispatcher-servlet");
 
   return {
     path,
@@ -91,10 +148,15 @@ function extractJavaFileSummary(path: string, content: string): FileSummary {
     imports,
     classNames,
     methods: methods.slice(0, 20),
+    injectedFields,
     usesXmlConfig: content.includes(".xml") && (content.includes("ClassPathXmlApplicationContext") || content.includes("XmlWebApplicationContext")),
     usesAutowired: annotations.includes("Autowired") || content.includes("@Autowired"),
+    usesFieldInjection,
+    usesConstructorInjection,
     usesComponentScan: annotations.includes("ComponentScan") || content.includes("@ComponentScan"),
     usesTransactional: annotations.includes("Transactional") || content.includes("@Transactional"),
+    isSpringBootMain,
+    hasDispatcherServletRef,
     lineCount: lines.length,
   };
 }
@@ -156,10 +218,15 @@ function extractTsFileSummary(path: string, content: string): FileSummary {
     imports,
     classNames,
     methods: methods.slice(0, 20),
+    injectedFields: [],
     usesXmlConfig: false,
     usesAutowired: annotations.includes("Inject") || annotations.includes("Injectable"),
+    usesFieldInjection: false,
+    usesConstructorInjection: false,
     usesComponentScan: false,
     usesTransactional: annotations.includes("Transaction") || content.includes("transaction"),
+    isSpringBootMain: false,
+    hasDispatcherServletRef: false,
     lineCount: lines.length,
   };
 }
@@ -211,10 +278,15 @@ export function extractFileSummaries(files: FileMap): FileSummary[] {
         imports: [],
         classNames: [],
         methods: [],
+        injectedFields: [],
         usesXmlConfig: false,
         usesAutowired: false,
+        usesFieldInjection: false,
+        usesConstructorInjection: false,
         usesComponentScan: false,
         usesTransactional: false,
+        isSpringBootMain: false,
+        hasDispatcherServletRef: false,
         lineCount: content.split("\n").length,
       });
     }
@@ -236,11 +308,19 @@ export function serializeFileSummary(s: FileSummary): string {
     parts.push(`  Methods: ${methStr}`);
   }
 
+  if (s.injectedFields.length > 0) {
+    const fieldStr = s.injectedFields.slice(0, 5).map((f) => `${f.type} ${f.name}[${f.injectionStyle}]`).join(", ");
+    parts.push(`  Injected: ${fieldStr}`);
+  }
+
   const flags: string[] = [];
-  if (s.usesAutowired) flags.push("@Autowired");
+  if (s.usesFieldInjection) flags.push("field-injection");
+  if (s.usesConstructorInjection) flags.push("constructor-injection");
   if (s.usesComponentScan) flags.push("@ComponentScan");
   if (s.usesTransactional) flags.push("@Transactional");
   if (s.usesXmlConfig) flags.push("XML-context");
+  if (s.isSpringBootMain) flags.push("SpringBoot-main");
+  if (s.hasDispatcherServletRef) flags.push("DispatcherServlet-ref");
   if (flags.length > 0) parts.push(`  Flags: ${flags.join(", ")}`);
 
   return parts.join("\n");

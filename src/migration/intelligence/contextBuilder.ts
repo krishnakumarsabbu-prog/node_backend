@@ -1,7 +1,7 @@
 import type { FileMap } from "../../llm/constants";
-import type { ProjectAnalysis } from "../types/migrationTypes";
+import type { ProjectAnalysis, DetectedPatterns } from "../types/migrationTypes";
 import { extractFileSummaries, serializeFileSummary, type FileSummary } from "./semanticExtractor";
-import { buildDependencyGraph, serializeDependencyGraph, type DependencyGraph } from "./dependencyGraph";
+import { buildDependencyGraph, serializeDependencyGraph, type DependencyGraph, type GraphSummary } from "./dependencyGraph";
 import { parseXmlConfigs, serializeAllXmlSummaries, type XmlFileSummary } from "./xmlConfigParser";
 import { analyzeBuildFile, serializeBuildSummary, type BuildFileSummary } from "./dependencyAnalyzer";
 import { createScopedLogger } from "../../utils/logger";
@@ -18,25 +18,42 @@ export type MigrationPattern =
   | "convert-security-xml"
   | "convert-persistence-xml";
 
+export interface ProjectStats {
+  totalFiles: number;
+  sourceFiles: number;
+  controllers: number;
+  services: number;
+  repositories: number;
+  models: number;
+  configFiles: number;
+  xmlConfigFiles: number;
+  testFiles: number;
+}
+
+export interface KeyFiles {
+  controllers: string[];
+  services: string[];
+  repositories: string[];
+  configs: string[];
+  entryPoints: string[];
+  models: string[];
+}
+
 export interface CodebaseIntelligence {
   framework: string;
   buildTool: string;
-  totalFiles: number;
-  sourceFiles: number;
+
+  stats: ProjectStats;
+  patterns: DetectedPatterns;
+  graphSummary: GraphSummary;
+  keyFiles: KeyFiles;
 
   fileSummaries: FileSummary[];
   dependencyGraph: DependencyGraph;
   xmlConfigs: XmlFileSummary[];
   buildSummary: BuildFileSummary;
 
-  detectedPatterns: MigrationPattern[];
-
-  entryPoints: string[];
-  configFiles: string[];
-  controllers: string[];
-  services: string[];
-  repositories: string[];
-  models: string[];
+  migrationPatterns: MigrationPattern[];
 
   serialized: {
     fileSummaries: string;
@@ -44,46 +61,77 @@ export interface CodebaseIntelligence {
     xmlConfigs: string;
     buildSummary: string;
     patterns: string;
+    detectedPatterns: string;
+  };
+}
+
+function computeDetectedPatterns(
+  fileSummaries: FileSummary[],
+  xmlConfigs: XmlFileSummary[],
+  buildSummary: BuildFileSummary,
+  graphSummary: GraphSummary
+): DetectedPatterns {
+  const hasWebXml = xmlConfigs.some((x) => x.xmlType === "web-xml");
+  const hasDispatcherServlet = xmlConfigs.some((x) => x.dispatcherServlet) ||
+    fileSummaries.some((f) => f.hasDispatcherServletRef);
+  const hasSpringBootMain = fileSummaries.some((f) => f.isSpringBootMain) ||
+    buildSummary.hasSpringBootParent;
+  const usesFieldInjection = fileSummaries.some((f) => f.usesFieldInjection);
+  const hasXmlBeans = xmlConfigs.some((x) => x.beanCount > 0);
+  const hasPropertyPlaceholders = xmlConfigs.some((x) => x.propertyPlaceholder);
+
+  return {
+    usesXmlConfiguration: hasWebXml || hasXmlBeans || xmlConfigs.length > 0,
+    usesFieldInjection,
+    hasLegacyDispatcher: hasWebXml || hasDispatcherServlet,
+    missingBootMain: !hasSpringBootMain,
+    hasMultipleXmlConfigs: xmlConfigs.length > 1,
+    usesPropertyPlaceholders: hasPropertyPlaceholders,
+    hasCircularDependencies: graphSummary.circularDependencies > 0,
   };
 }
 
 function detectMigrationPatterns(
   xmlConfigs: XmlFileSummary[],
   buildSummary: BuildFileSummary,
-  fileSummaries: FileSummary[]
+  fileSummaries: FileSummary[],
+  patterns: DetectedPatterns
 ): MigrationPattern[] {
-  const patterns: MigrationPattern[] = [];
+  const result: MigrationPattern[] = [];
 
-  if (xmlConfigs.some((x) => x.xmlType === "web-xml")) {
-    patterns.push("remove-web-xml");
-    patterns.push("add-spring-boot-main");
+  if (patterns.hasLegacyDispatcher || xmlConfigs.some((x) => x.xmlType === "web-xml")) {
+    result.push("remove-web-xml");
   }
 
-  if (xmlConfigs.some((x) => x.beanCount > 0)) {
-    patterns.push("xml-to-annotation");
-    patterns.push("convert-xml-beans");
+  if (patterns.missingBootMain) {
+    result.push("add-spring-boot-main");
+  }
+
+  if (patterns.usesXmlConfiguration) {
+    result.push("xml-to-annotation");
+    if (xmlConfigs.some((x) => x.beanCount > 0)) result.push("convert-xml-beans");
   }
 
   if (!buildSummary.hasSpringBootParent || !buildSummary.hasSpringBootPlugin) {
-    patterns.push("update-build-file");
+    result.push("update-build-file");
   }
 
   if (!fileSummaries.some((f) => f.path.match(/application\.(properties|yml|yaml)$/))) {
-    patterns.push("add-application-properties");
+    result.push("add-application-properties");
   }
 
   if (xmlConfigs.some((x) => x.securityConfig)) {
-    patterns.push("convert-security-xml");
+    result.push("convert-security-xml");
   }
 
   if (xmlConfigs.some((x) => x.dataSource || x.transactionManager)) {
-    patterns.push("convert-persistence-xml");
+    result.push("convert-persistence-xml");
   }
 
-  return patterns;
+  return result;
 }
 
-function serializePatterns(patterns: MigrationPattern[]): string {
+function serializeMigrationPatterns(patterns: MigrationPattern[]): string {
   if (patterns.length === 0) return "(no specific migration patterns detected)";
 
   const descriptions: Record<MigrationPattern, string> = {
@@ -100,6 +148,18 @@ function serializePatterns(patterns: MigrationPattern[]): string {
   return patterns.map((p) => `  → [${p}] ${descriptions[p]}`).join("\n");
 }
 
+function serializeDetectedPatterns(patterns: DetectedPatterns): string {
+  const lines: string[] = [];
+  lines.push(`usesXmlConfiguration: ${patterns.usesXmlConfiguration}`);
+  lines.push(`usesFieldInjection: ${patterns.usesFieldInjection} ${patterns.usesFieldInjection ? "(⚠ convert to constructor injection)" : ""}`);
+  lines.push(`hasLegacyDispatcher: ${patterns.hasLegacyDispatcher} ${patterns.hasLegacyDispatcher ? "(⚠ remove DispatcherServlet config)" : ""}`);
+  lines.push(`missingBootMain: ${patterns.missingBootMain} ${patterns.missingBootMain ? "(⚠ need @SpringBootApplication class)" : ""}`);
+  lines.push(`hasMultipleXmlConfigs: ${patterns.hasMultipleXmlConfigs}`);
+  lines.push(`usesPropertyPlaceholders: ${patterns.usesPropertyPlaceholders} ${patterns.usesPropertyPlaceholders ? "(→ move to application.properties)" : ""}`);
+  lines.push(`hasCircularDependencies: ${patterns.hasCircularDependencies} ${patterns.hasCircularDependencies ? "(⚠ must resolve before migration)" : ""}`);
+  return lines.join("\n");
+}
+
 export function buildCodebaseIntelligence(files: FileMap, analysis: ProjectAnalysis): CodebaseIntelligence {
   logger.info("Building codebase intelligence layer...");
 
@@ -107,7 +167,7 @@ export function buildCodebaseIntelligence(files: FileMap, analysis: ProjectAnaly
   logger.info(`Extracted ${fileSummaries.length} file summaries`);
 
   const dependencyGraph = buildDependencyGraph(fileSummaries);
-  logger.info(`Built dependency graph: ${dependencyGraph.nodes.length} nodes, ${dependencyGraph.edges.length} edges`);
+  logger.info(`Built dependency graph: ${dependencyGraph.nodes.length} nodes, ${dependencyGraph.edges.length} edges, ${dependencyGraph.summary.circularDependencies} cycles`);
 
   const xmlConfigs = parseXmlConfigs(files);
   logger.info(`Parsed ${xmlConfigs.length} XML config files`);
@@ -115,56 +175,112 @@ export function buildCodebaseIntelligence(files: FileMap, analysis: ProjectAnaly
   const buildSummary = analyzeBuildFile(files);
   logger.info(`Analyzed build file: type=${buildSummary.type}`);
 
-  const detectedPatterns = detectMigrationPatterns(xmlConfigs, buildSummary, fileSummaries);
-  logger.info(`Detected ${detectedPatterns.length} migration patterns: ${detectedPatterns.join(", ")}`);
+  const graphSummary = dependencyGraph.summary;
+  const detectedPatterns = computeDetectedPatterns(fileSummaries, xmlConfigs, buildSummary, graphSummary);
+  const migrationPatterns = detectMigrationPatterns(xmlConfigs, buildSummary, fileSummaries, detectedPatterns);
+
+  logger.info(`Detected patterns: xmlConfig=${detectedPatterns.usesXmlConfiguration}, fieldInj=${detectedPatterns.usesFieldInjection}, legacyDisp=${detectedPatterns.hasLegacyDispatcher}, missingMain=${detectedPatterns.missingBootMain}`);
+  logger.info(`Migration patterns: [${migrationPatterns.join(", ")}]`);
 
   const byRole = (role: string) => fileSummaries.filter((f) => f.role === role).map((f) => f.path);
+
+  const controllers = byRole("controller");
+  const services = byRole("service");
+  const repositories = byRole("repository");
+  const configFiles = byRole("config");
+  const entryPoints = byRole("entry");
+  const models = byRole("model");
+  const testFiles = byRole("test");
+
+  const stats: ProjectStats = {
+    totalFiles: Object.keys(files).length,
+    sourceFiles: fileSummaries.length,
+    controllers: controllers.length,
+    services: services.length,
+    repositories: repositories.length,
+    models: models.length,
+    configFiles: configFiles.length,
+    xmlConfigFiles: xmlConfigs.length,
+    testFiles: testFiles.length,
+  };
+
+  const keyFiles: KeyFiles = {
+    controllers,
+    services,
+    repositories,
+    configs: configFiles,
+    entryPoints,
+    models,
+  };
 
   const intelligence: CodebaseIntelligence = {
     framework: analysis.framework,
     buildTool: analysis.buildTool,
-    totalFiles: Object.keys(files).length,
-    sourceFiles: fileSummaries.length,
+
+    stats,
+    patterns: detectedPatterns,
+    graphSummary,
+    keyFiles,
 
     fileSummaries,
     dependencyGraph,
     xmlConfigs,
     buildSummary,
-    detectedPatterns,
-
-    entryPoints: byRole("entry"),
-    configFiles: byRole("config"),
-    controllers: byRole("controller"),
-    services: byRole("service"),
-    repositories: byRole("repository"),
-    models: byRole("model"),
+    migrationPatterns,
 
     serialized: {
       fileSummaries: fileSummaries.map(serializeFileSummary).join("\n\n"),
       dependencyGraph: serializeDependencyGraph(dependencyGraph),
       xmlConfigs: serializeAllXmlSummaries(xmlConfigs),
       buildSummary: serializeBuildSummary(buildSummary),
-      patterns: serializePatterns(detectedPatterns),
+      patterns: serializeMigrationPatterns(migrationPatterns),
+      detectedPatterns: serializeDetectedPatterns(detectedPatterns),
     },
   };
 
   return intelligence;
 }
 
+export { type DetectedPatterns };
+
 export function buildMigrationContextPrompt(intelligence: CodebaseIntelligence, userRequest: string): string {
   const sections: string[] = [];
 
   sections.push(`FRAMEWORK: ${intelligence.framework}`);
   sections.push(`BUILD TOOL: ${intelligence.buildTool}`);
-  sections.push(`TOTAL FILES: ${intelligence.totalFiles} (${intelligence.sourceFiles} source files analyzed)`);
 
-  sections.push(`\n## ARCHITECTURE OVERVIEW`);
-  sections.push(`Controllers (${intelligence.controllers.length}): ${intelligence.controllers.slice(0, 10).join(", ")}`);
-  sections.push(`Services (${intelligence.services.length}): ${intelligence.services.slice(0, 10).join(", ")}`);
-  sections.push(`Repositories (${intelligence.repositories.length}): ${intelligence.repositories.slice(0, 10).join(", ")}`);
-  sections.push(`Models (${intelligence.models.length}): ${intelligence.models.slice(0, 10).join(", ")}`);
-  sections.push(`Config Files (${intelligence.configFiles.length}): ${intelligence.configFiles.slice(0, 10).join(", ")}`);
-  sections.push(`Entry Points: ${intelligence.entryPoints.join(", ") || "(none detected)"}`);
+  sections.push(`\n## PROJECT STATS`);
+  sections.push(`Total Files: ${intelligence.stats.totalFiles}`);
+  sections.push(`Source Files Analyzed: ${intelligence.stats.sourceFiles}`);
+  sections.push(`Controllers: ${intelligence.stats.controllers}`);
+  sections.push(`Services: ${intelligence.stats.services}`);
+  sections.push(`Repositories: ${intelligence.stats.repositories}`);
+  sections.push(`Models: ${intelligence.stats.models}`);
+  sections.push(`Config Files: ${intelligence.stats.configFiles}`);
+  sections.push(`XML Config Files: ${intelligence.stats.xmlConfigFiles}`);
+  sections.push(`Test Files: ${intelligence.stats.testFiles}`);
+
+  sections.push(`\n## GRAPH SUMMARY`);
+  sections.push(`Nodes: ${intelligence.graphSummary.totalNodes}`);
+  sections.push(`Edges: ${intelligence.graphSummary.totalEdges}`);
+  sections.push(`Circular Dependencies: ${intelligence.graphSummary.circularDependencies}`);
+  if (intelligence.graphSummary.circularPaths.length > 0) {
+    sections.push(`Circular Paths: ${intelligence.graphSummary.circularPaths.map((p) => p.map((f) => f.split("/").pop()).join(" → ")).join("; ")}`);
+  }
+  if (intelligence.graphSummary.unusedBeans.length > 0) {
+    sections.push(`Potentially Unused Beans: ${intelligence.graphSummary.unusedBeans.slice(0, 5).map((f) => f.split("/").pop()).join(", ")}`);
+  }
+
+  sections.push(`\n## DETECTED PATTERNS`);
+  sections.push(intelligence.serialized.detectedPatterns);
+
+  sections.push(`\n## KEY FILES`);
+  sections.push(`Entry Points: ${intelligence.keyFiles.entryPoints.join(", ") || "(none detected)"}`);
+  sections.push(`Controllers: ${intelligence.keyFiles.controllers.slice(0, 15).join(", ")}`);
+  sections.push(`Services: ${intelligence.keyFiles.services.slice(0, 15).join(", ")}`);
+  sections.push(`Repositories: ${intelligence.keyFiles.repositories.slice(0, 15).join(", ")}`);
+  sections.push(`Configs: ${intelligence.keyFiles.configs.slice(0, 10).join(", ")}`);
+  sections.push(`Models: ${intelligence.keyFiles.models.slice(0, 15).join(", ")}`);
 
   sections.push(`\n## BUILD FILE ANALYSIS`);
   sections.push(intelligence.serialized.buildSummary);
@@ -188,7 +304,7 @@ export function buildMigrationContextPrompt(intelligence: CodebaseIntelligence, 
 
   sections.push(prioritizedSummaries.map(serializeFileSummary).join("\n\n"));
 
-  sections.push(`\n## DETECTED MIGRATION PATTERNS`);
+  sections.push(`\n## REQUIRED MIGRATION ACTIONS`);
   sections.push(intelligence.serialized.patterns);
 
   sections.push(`\n## USER REQUEST`);
