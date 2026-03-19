@@ -11,7 +11,7 @@ import type { FileMap } from "../llm/constants";
 import type { Messages, StreamingOptions } from "../llm/stream-text";
 import type { ProgressAnnotation, ContextAnnotation } from "../types/context";
 import { AnalyzerAgent } from "../migration/agents/analyzerAgent";
-import { buildCodebaseIntelligence } from "../migration/intelligence/contextBuilder";
+import { buildCodebaseIntelligence, type CodebaseIntelligence } from "../migration/intelligence/contextBuilder";
 import { createScopedLogger } from "../utils/logger";
 
 const logger = createScopedLogger("chat-migration");
@@ -27,12 +27,14 @@ export interface MigrationRequest {
 
 export class ChatMigrationHandler {
   private runner: MigrationRunner;
+  private cachedIntelligence: CodebaseIntelligence | null = null;
 
   constructor(workDir: string, enableVerification = false) {
     this.runner = new MigrationRunner({
       workDir,
       enableVerification,
       enableAutoRepair: enableVerification,
+      enableStaticValidation: true,
       maxRepairAttempts: 5,
     });
   }
@@ -46,30 +48,100 @@ export class ChatMigrationHandler {
   ): Promise<number> {
     logger.info("Handling migration plan generation");
 
-    writeDataPart(res, {
-      type: "progress",
-      label: "migration",
-      status: "in-progress",
-      order: progressCounter++,
-      message: "Analysing project structure...",
-    } satisfies ProgressAnnotation);
-
     const userMessage = request.messages[request.messages.length - 1];
     const userRequest = typeof userMessage.content === "string" ? userMessage.content : "";
 
     try {
       writeDataPart(res, {
         type: "progress",
-        label: "migration",
+        label: "migration-analyze",
         status: "in-progress",
         order: progressCounter++,
-        message: "Generating migration plan...",
+        message: "Step 1/4 — Analysing project structure...",
+      } satisfies ProgressAnnotation);
+
+      const analyzerAgent = new AnalyzerAgent();
+      const analysis = await analyzerAgent.analyze(request.files);
+
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-analyze",
+        status: "complete",
+        order: progressCounter++,
+        message: `Step 1/4 — Analysis complete: framework=${analysis.framework}, buildTool=${analysis.buildTool}, controllers=${analysis.controllers.length}, services=${analysis.services.length}, xmlConfigs=${analysis.xmlConfigs.length}`,
+      } satisfies ProgressAnnotation);
+
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-intelligence",
+        status: "in-progress",
+        order: progressCounter++,
+        message: "Step 2/4 — Building codebase intelligence (dependency graph, XML parsing, pattern detection)...",
+      } satisfies ProgressAnnotation);
+
+      const intelligence = buildCodebaseIntelligence(request.files, analysis);
+      this.cachedIntelligence = intelligence;
+
+      const patternList = intelligence.migrationPatterns.length > 0
+        ? intelligence.migrationPatterns.join(", ")
+        : "none";
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-intelligence",
+        status: "complete",
+        order: progressCounter++,
+        message: `Step 2/4 — Intelligence ready: ${intelligence.fileSummaries.length} files summarised, ${intelligence.xmlConfigs.length} XML configs parsed, ${intelligence.dependencyGraph.edges.length} dependency edges, patterns=[${patternList}]`,
+      } satisfies ProgressAnnotation);
+
+      const cycleCount = intelligence.graphSummary.circularDependencies;
+      if (cycleCount > 0) {
+        writeDataPart(res, {
+          type: "progress",
+          label: "migration-warning",
+          status: "complete",
+          order: progressCounter++,
+          message: `WARNING: ${cycleCount} circular dependenc${cycleCount === 1 ? "y" : "ies"} detected in project. These must be resolved during migration. Paths: ${intelligence.graphSummary.circularPaths.map((p) => p.map((f) => f.split("/").pop()).join(" → ")).slice(0, 3).join("; ")}`,
+        } satisfies ProgressAnnotation);
+      }
+
+      if (intelligence.patterns.usesFieldInjection) {
+        writeDataPart(res, {
+          type: "progress",
+          label: "migration-warning",
+          status: "complete",
+          order: progressCounter++,
+          message: "WARNING: Field injection (@Autowired on fields) detected. Migration will convert to constructor injection.",
+        } satisfies ProgressAnnotation);
+      }
+
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-plan",
+        status: "in-progress",
+        order: progressCounter++,
+        message: "Step 3/4 — Generating migration plan (LLM call 1/3: document generation)...",
       } satisfies ProgressAnnotation);
 
       const { markdownContent, plan } = await this.runner.generateMigrationDocument(
         request.files,
         userRequest,
       );
+
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-plan",
+        status: "complete",
+        order: progressCounter++,
+        message: `Step 3/4 — Plan generated: ${plan.tasks.length} tasks, type=${plan.migrationType}, complexity=${plan.estimatedComplexity || "medium"}`,
+      } satisfies ProgressAnnotation);
+
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-stream",
+        status: "in-progress",
+        order: progressCounter++,
+        message: "Step 4/4 — Streaming migration.md to project...",
+      } satisfies ProgressAnnotation);
 
       const messageId = generateId();
       res.write(`f:${JSON.stringify({ messageId })}\n`);
@@ -99,12 +171,13 @@ export class ChatMigrationHandler {
         migrationDocument: markdownContent,
       } as ContextAnnotation);
 
+      const taskBreakdown = `modify=${plan.summary.filesToModify}, create=${plan.summary.filesToCreate}, delete=${plan.summary.filesToDelete}`;
       writeDataPart(res, {
         type: "progress",
-        label: "migration",
+        label: "migration-stream",
         status: "complete",
         order: progressCounter++,
-        message: `Migration plan ready (${plan.estimatedComplexity || "medium"} complexity). Review migration.md then click Implement Migration to proceed.`,
+        message: `Step 4/4 — Done. migration.md ready (${markdownContent.length} chars). Tasks: ${taskBreakdown}. Complexity: ${plan.estimatedComplexity || "medium"}. Review migration.md then click Implement Migration to proceed.`,
       } satisfies ProgressAnnotation);
 
       logger.info(`Migration plan generated for ${plan.migrationType} migration`);
@@ -113,7 +186,7 @@ export class ChatMigrationHandler {
 
       writeDataPart(res, {
         type: "progress",
-        label: "migration",
+        label: "migration-error",
         status: "complete",
         order: progressCounter++,
         message: `Plan generation failed: ${(error as Error).message}`,
@@ -147,44 +220,68 @@ export class ChatMigrationHandler {
 
     writeDataPart(res, {
       type: "progress",
-      label: "migration-execute",
+      label: "migration-execute-start",
       status: "in-progress",
       order: progressCounter++,
-      message: `Starting migration implementation: creating project under migrate/`,
+      message: `Starting migration implementation — ${tasks.length} tasks, output under migrate/`,
     } satisfies ProgressAnnotation);
 
     if (apiKeys && streamingOptions) {
       const migrationFiles = this.buildMigrationFileMap(request.files, migrationDocument);
 
+      let intelligence = this.cachedIntelligence;
+
+      if (intelligence) {
+        writeDataPart(res, {
+          type: "progress",
+          label: "migration-intelligence",
+          status: "complete",
+          order: progressCounter++,
+          message: `Using cached codebase intelligence: ${intelligence.fileSummaries.length} files, ${intelligence.xmlConfigs.length} XML configs, patterns=[${intelligence.migrationPatterns.join(", ")}]`,
+        } satisfies ProgressAnnotation);
+      } else {
+        writeDataPart(res, {
+          type: "progress",
+          label: "migration-intelligence",
+          status: "in-progress",
+          order: progressCounter++,
+          message: "Rebuilding codebase intelligence (no cache from plan phase)...",
+        } satisfies ProgressAnnotation);
+
+        const analyzerAgent = new AnalyzerAgent();
+        const analysis = await analyzerAgent.analyze(request.files);
+        intelligence = buildCodebaseIntelligence(request.files, analysis);
+        this.cachedIntelligence = intelligence;
+
+        writeDataPart(res, {
+          type: "progress",
+          label: "migration-intelligence",
+          status: "complete",
+          order: progressCounter++,
+          message: `Intelligence ready: ${intelligence.fileSummaries.length} files, ${intelligence.xmlConfigs.length} XML configs, patterns=[${intelligence.migrationPatterns.join(", ")}]`,
+        } satisfies ProgressAnnotation);
+      }
+
       writeDataPart(res, {
         type: "progress",
-        label: "migration-execute",
+        label: "migration-parse-steps",
         status: "in-progress",
         order: progressCounter++,
-        message: "Building codebase intelligence...",
-      } satisfies ProgressAnnotation);
-
-      const analyzerAgent = new AnalyzerAgent();
-      const analysis = await analyzerAgent.analyze(request.files);
-      const intelligence = buildCodebaseIntelligence(request.files, analysis);
-
-      logger.info(
-        `Intelligence built for execution: ${intelligence.fileSummaries.length} summaries, ` +
-        `${intelligence.xmlConfigs.length} XML configs, patterns=[${intelligence.migrationPatterns.join(", ")}]`
-      );
-
-      writeDataPart(res, {
-        type: "progress",
-        label: "migration-execute",
-        status: "in-progress",
-        order: progressCounter++,
-        message: "Parsing migration steps for execution...",
+        message: "Parsing migration document into executable steps (LLM)...",
       } satisfies ProgressAnnotation);
 
       const steps = await parseMigrationPlanIntoSteps(
         migrationDocument || this.buildFallbackDocument(plan),
         request.files,
       );
+
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-parse-steps",
+        status: "complete",
+        order: progressCounter++,
+        message: `Parsed ${steps.length} execution steps from migration document`,
+      } satisfies ProgressAnnotation);
 
       const migrationWriter: MigrationStreamWriter = {
         writeData: (data: unknown) => {
@@ -219,6 +316,17 @@ export class ChatMigrationHandler {
 
       progressCounter = progressRef.value;
 
+      const succeededSteps = steps.length;
+      const totalTokens = cumulativeUsage.totalTokens;
+
+      writeDataPart(res, {
+        type: "progress",
+        label: "migration-verification-skip",
+        status: "complete",
+        order: progressCounter++,
+        message: `Build verification skipped in streaming mode (enableVerification=false). Total tokens used: ${totalTokens}. Review generated files under migrate/ and run your build tool manually to verify.`,
+      } satisfies ProgressAnnotation);
+
       writeMessageAnnotationPart(res, {
         type: "migration_result",
         result: {
@@ -226,7 +334,9 @@ export class ChatMigrationHandler {
           filesModified: tasks.filter((t) => t.action === "modify").length,
           filesCreated: tasks.filter((t) => t.action === "create").length,
           filesDeleted: tasks.filter((t) => t.action === "delete").length,
+          totalTokens,
           errors: [],
+          note: "Streaming execution complete. Run `mvn clean package` or equivalent in migrate/ to verify the build.",
         },
       } as ContextAnnotation);
     } else {
@@ -273,36 +383,93 @@ export class ChatMigrationHandler {
   ): Promise<number> {
     const tasks = plan.tasks || [];
 
-    for (let i = 0; i < tasks.length; i++) {
-      const task = tasks[i];
+    writeDataPart(res, {
+      type: "progress",
+      label: "migration-runner-start",
+      status: "in-progress",
+      order: progressCounter++,
+      message: `Runner mode: executing ${tasks.length} tasks via MigrationExecutor (topological order, up to 4 parallel)...`,
+    } satisfies ProgressAnnotation);
 
-      writeDataPart(res, {
-        type: "progress",
-        label: `migration-task-${i + 1}`,
-        status: "in-progress",
-        order: progressCounter++,
-        message: `Step ${i + 1}/${tasks.length}: ${task.action} ${task.file}`,
-      } satisfies ProgressAnnotation);
-
-      writeDataPart(res, {
-        type: "progress",
-        label: `migration-task-${i + 1}`,
-        status: "complete",
-        order: progressCounter++,
-        message: `Step ${i + 1}/${tasks.length} done: ${task.file}`,
-      } satisfies ProgressAnnotation);
-    }
+    let completedTasks = 0;
+    let failedTasks = 0;
 
     try {
-      const result = await this.runner.executePlan(plan, files, undefined, migrationDocument);
+      const result = await this.runner.executePlan(plan, files, this.cachedIntelligence ?? undefined, migrationDocument);
+
+      for (const op of result.operations) {
+        const taskIdx = tasks.findIndex((t) => t.file === op.file);
+        const displayIdx = taskIdx >= 0 ? taskIdx + 1 : completedTasks + 1;
+
+        if (op.action !== "delete" && !op.content) {
+          failedTasks++;
+          writeDataPart(res, {
+            type: "progress",
+            label: `migration-task-${displayIdx}`,
+            status: "complete",
+            order: progressCounter++,
+            message: `Task ${displayIdx}/${tasks.length} FAILED — ${op.action} ${op.file} (no content generated)`,
+          } satisfies ProgressAnnotation);
+        } else {
+          completedTasks++;
+          writeDataPart(res, {
+            type: "progress",
+            label: `migration-task-${displayIdx}`,
+            status: "complete",
+            order: progressCounter++,
+            message: `Task ${displayIdx}/${tasks.length} done — ${op.action} ${op.file}`,
+          } satisfies ProgressAnnotation);
+        }
+      }
+
+      if (result.errors.length > 0) {
+        for (const err of result.errors) {
+          writeDataPart(res, {
+            type: "progress",
+            label: "migration-task-error",
+            status: "complete",
+            order: progressCounter++,
+            message: `Error: ${err}`,
+          } satisfies ProgressAnnotation);
+        }
+      }
+
+      const staticIssues = result.errors.filter((e) => e.startsWith("[static]"));
+      if (staticIssues.length > 0) {
+        writeDataPart(res, {
+          type: "progress",
+          label: "migration-static-validation",
+          status: "complete",
+          order: progressCounter++,
+          message: `Static validation found ${staticIssues.length} issue(s): ${staticIssues.slice(0, 3).join("; ")}`,
+        } satisfies ProgressAnnotation);
+      } else {
+        writeDataPart(res, {
+          type: "progress",
+          label: "migration-static-validation",
+          status: "complete",
+          order: progressCounter++,
+          message: "Static validation passed — no field injection, XML reference, or missing @SpringBootApplication issues found",
+        } satisfies ProgressAnnotation);
+      }
+
+      if (result.rolledBack) {
+        writeDataPart(res, {
+          type: "progress",
+          label: "migration-rollback",
+          status: "complete",
+          order: progressCounter++,
+          message: "Migration ROLLED BACK: execution failed and all changes were reverted to pre-migration state.",
+        } satisfies ProgressAnnotation);
+      }
 
       const summary = result.success
-        ? `Migration complete: ${result.filesModified} modified, ${result.filesCreated} created, ${result.filesDeleted} deleted`
-        : `Migration completed with ${result.errors.length} error(s)`;
+        ? `Migration complete: ${result.filesModified} modified, ${result.filesCreated} created, ${result.filesDeleted} deleted${result.frameworkWarning ? ` — WARNING: ${result.frameworkWarning}` : ""}`
+        : `Migration finished with ${result.errors.length} error(s). Check error messages above.`;
 
       writeDataPart(res, {
         type: "progress",
-        label: "migration-execute",
+        label: "migration-runner-done",
         status: "complete",
         order: progressCounter++,
         message: summary,
@@ -333,18 +500,20 @@ export class ChatMigrationHandler {
           createdFiles,
           deletedFiles,
           errors: result.errors,
+          rolledBack: result.rolledBack ?? false,
+          frameworkWarning: result.frameworkWarning,
         },
       } as ContextAnnotation);
 
       logger.info(
-        `Execution complete: ${result.filesModified} modified, ${result.filesCreated} created, ${result.filesDeleted} deleted`,
+        `Runner execution complete: ${result.filesModified} modified, ${result.filesCreated} created, ${result.filesDeleted} deleted, success=${result.success}`,
       );
     } catch (error) {
-      logger.error(`Execution failed: ${(error as Error).message}`);
+      logger.error(`Runner execution failed: ${(error as Error).message}`);
 
       writeDataPart(res, {
         type: "progress",
-        label: "migration-execute",
+        label: "migration-runner-error",
         status: "complete",
         order: progressCounter++,
         message: `Execution failed: ${(error as Error).message}`,

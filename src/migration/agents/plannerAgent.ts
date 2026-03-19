@@ -10,6 +10,7 @@ import { MigrationPlanVerifierAgent } from "./migrationPlanVerifierAgent";
 import { createScopedLogger } from "../../utils/logger";
 
 const MAX_VERIFY_FIX_ATTEMPTS = 2;
+const MAX_CYCLE_RETRY_ATTEMPTS = 2;
 
 const logger = createScopedLogger("planner-agent");
 
@@ -55,35 +56,63 @@ export class PlannerAgent {
 
     const fileList = Object.keys(files);
 
-    const prompt = PromptBuilder.buildMigrationDocumentPrompt(
-      analysis,
-      userRequest,
-      fileList,
-      {},
-      intelligence
-    );
+    for (let cycleAttempt = 1; cycleAttempt <= MAX_CYCLE_RETRY_ATTEMPTS + 1; cycleAttempt++) {
+      const cycleHint = cycleAttempt > 1
+        ? `\n\nIMPORTANT: A previous generation attempt produced a task graph with circular dependencies. You MUST ensure every dependsOn reference is strictly forward-only (a task may only depend on tasks with a lower index). Do NOT create any circular dependency chains.`
+        : "";
 
-    logger.info(`Migration document prompt built: ${prompt.length} chars`);
+      const prompt = PromptBuilder.buildMigrationDocumentPrompt(
+        analysis,
+        userRequest,
+        fileList,
+        {},
+        intelligence
+      ) + cycleHint;
 
-    const result = await generateText({
-      model: getTachyonModel(),
-      messages: [{ role: "user", content: prompt }],
-      maxTokens: 8192,
-    });
+      if (cycleAttempt > 1) {
+        logger.warn(`Cycle-retry attempt ${cycleAttempt}/${MAX_CYCLE_RETRY_ATTEMPTS + 1}: regenerating plan with anti-cycle hint`);
+      }
 
-    let { markdownContent, plan } = this.parseDualOutput(result.text.trim(), fileList);
+      logger.info(`Migration document prompt built: ${prompt.length} chars`);
 
-    logger.info(
-      `Migration.md generated: ${markdownContent.length} chars, ${plan.tasks.length} tasks`
-    );
+      const result = await generateText({
+        model: getTachyonModel(),
+        messages: [{ role: "user", content: prompt }],
+        maxTokens: 8192,
+      });
 
-    ({ markdownContent, plan } = await this.verifyAndFix(
-      intelligence,
-      markdownContent,
-      plan
-    ));
+      let markdownContent: string;
+      let plan: MigrationPlan;
 
-    return { markdownContent, plan };
+      try {
+        ({ markdownContent, plan } = this.parseDualOutput(result.text.trim(), fileList));
+      } catch (parseErr: any) {
+        if (parseErr.message?.startsWith("CYCLE_DETECTED") && cycleAttempt <= MAX_CYCLE_RETRY_ATTEMPTS) {
+          logger.warn(`Cycle detected in generated plan (attempt ${cycleAttempt}), retrying...`);
+          continue;
+        }
+        throw parseErr;
+      }
+
+      logger.info(
+        `Migration.md generated: ${markdownContent.length} chars, ${plan.tasks.length} tasks`
+      );
+
+      let fixed: { markdownContent: string; plan: MigrationPlan };
+      try {
+        fixed = await this.verifyAndFix(intelligence, markdownContent, plan);
+      } catch (fixErr: any) {
+        if (fixErr.message?.startsWith("CYCLE_DETECTED") && cycleAttempt <= MAX_CYCLE_RETRY_ATTEMPTS) {
+          logger.warn(`Cycle detected after verify/fix (attempt ${cycleAttempt}), retrying full generation...`);
+          continue;
+        }
+        throw fixErr;
+      }
+
+      return { markdownContent: fixed.markdownContent, plan: fixed.plan };
+    }
+
+    throw new Error("Failed to generate a cycle-free migration plan after maximum retry attempts");
   }
 
   private async verifyAndFix(
@@ -212,7 +241,10 @@ export class PlannerAgent {
       logger.info(`Parsed dual-output: ${parsed.markdown.length} chars markdown, ${tasks.length} tasks`);
 
       return { markdownContent: parsed.markdown, plan };
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.message?.startsWith("CYCLE_DETECTED")) {
+        throw err;
+      }
       logger.warn(`Failed to parse dual-output JSON: ${err}. Falling back to markdown extraction.`);
       return this.fallbackExtract(text, fileList);
     }
@@ -261,8 +293,6 @@ export class PlannerAgent {
   }
 
   private validateTaskGraph(tasks: MigrationTask[]): void {
-    const idSet = new Set(tasks.map((t) => t.id));
-
     const uniqueIds = new Set<string>();
     for (const task of tasks) {
       if (uniqueIds.has(task.id)) {
@@ -278,9 +308,13 @@ export class PlannerAgent {
 
     const visited = new Set<string>();
     const inStack = new Set<string>();
+    let cycleNode: string | null = null;
 
     const hasCycle = (id: string): boolean => {
-      if (inStack.has(id)) return true;
+      if (inStack.has(id)) {
+        cycleNode = id;
+        return true;
+      }
       if (visited.has(id)) return false;
       visited.add(id);
       inStack.add(id);
@@ -293,8 +327,9 @@ export class PlannerAgent {
 
     for (const id of Object.keys(adjacency)) {
       if (hasCycle(id)) {
-        logger.warn(`Circular dependency detected in task graph at: ${id}`);
-        break;
+        const err = `Circular dependency detected in task graph at task: ${cycleNode}`;
+        logger.warn(err);
+        throw new Error(`CYCLE_DETECTED: ${err}`);
       }
     }
   }
