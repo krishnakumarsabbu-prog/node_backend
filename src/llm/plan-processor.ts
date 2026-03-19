@@ -12,6 +12,11 @@ import type { DesignScheme } from "../types/design-scheme";
 import type { ProgressAnnotation } from "../types/context";
 import { searchWithGraph, patchIndex, type PatchEntry } from "../modules/ai_engine/agent";
 import { selectFilesForBuild } from "./batch/batch-planner";
+import { validateStep } from "./agents/step-validator";
+import { injectMissingDependencies, extractPackageJson } from "./agents/dependency-injector";
+import { scoreExecution, PASS_THRESHOLD } from "./agents/execution-scorer";
+import { repairStep, SELF_HEAL_MAX_ATTEMPTS } from "./agents/self-healing-loop";
+import { buildParallelExecutionPlan } from "./agents/parallel-planner";
 
 const TEST_INTENT_PATTERNS = [
   /\b(write|add|create|generate|run|fix|update)\s+(a\s+)?(unit\s+)?tests?\b/i,
@@ -96,15 +101,27 @@ You are a world-class software architect with 30+ years of experience. Your job:
 Return ONLY a valid JSON array — no prose, no markdown fences. Each element must have:
 "index"   : number  (1-based sequential integer)
 "heading" : string  (concise action-oriented title ≤ 80 chars, starting with a verb: "Implement", "Build", "Add", "Wire", "Integrate", "Create", "Update", "Extend")
-"details" : string  (comprehensive implementation guidance: exact files to create/modify, specific functions/components/types, data shapes, API contracts, UI behavior, dependency wiring, and integration points with adjacent steps)
+"details" : string  (comprehensive implementation guidance: exact files to create/modify, specific functions/components/types, data shapes, API contracts, UI behavior, dependency wiring, integration points — must include inputs, processing logic, outputs, and dependency declarations)
 
 CRITICAL — EXISTING FILE AWARENESS:
 When referencing files in "details", use the exact file paths from the project. Never invent a path that does not exist. For new files, follow the project's established directory and naming conventions.
 
-DESIGN FIRST — Before splitting into steps, mentally answer:
-1. What are the complete features or capabilities to deliver? What does "done" look like for each one?
-2. How can each step deliver a fully working, testable slice of functionality — not just isolated code?
-3. What dependencies and integrations are required between layers?
+FEATURE EXTRACTION LAYER — Before producing steps, do this mental decomposition:
+1. Identify all FEATURE-LEVEL modules in the plan (e.g., Authentication, Dashboard, Orders — NOT atomic tasks)
+2. For each feature, define:
+   - Inputs: what API endpoints, forms, or user actions trigger it
+   - Processing: what services, business rules, or transformations it applies
+   - Outputs: what UI renders, what API response is returned, what state changes
+   - Dependencies: what libraries, frameworks, external services it needs
+3. Map each feature to 1-N steps — each step = one complete, usable capability
+4. Do NOT break a feature into micro-tasks (e.g., "create file", "add method", "wire import")
+5. Group related tasks that only make sense together into a SINGLE step
+
+ARCHITECTURE DESIGN FIRST — Before splitting into steps, mentally answer:
+1. What are the complete FEATURE-LEVEL capabilities? What does "done" look like for each?
+2. How can each step deliver a fully working, testable vertical slice — not just isolated code?
+3. What is the dependency order? Foundation layers (types, auth, config) before features that use them?
+4. Which files will multiple features need to touch? (router, sidebar, app config — plan for incremental updates)
 
 PRIMARY RULE:
 Each step MUST produce fully working, integrated, and usable functionality. Avoid partial implementations. Prefer vertical slices (feature-complete) over horizontal slices (layer-only). A step that creates a service without wiring it to anything is NOT acceptable.
@@ -205,16 +222,28 @@ You are a world-class software architect with 30+ years of experience. Your job:
 Return ONLY a valid JSON array — no prose, no markdown fences. Each element must have:
 "index"   : number  (1-based sequential integer)
 "heading" : string  (concise action-oriented title ≤ 80 chars, starting with a verb: "Implement", "Build", "Add", "Wire", "Integrate", "Create", "Update", "Extend")
-"details" : string  (comprehensive implementation guidance: exact files to create/modify, specific functions/components/types, data shapes, API contracts, UI behavior, dependency wiring, integration points with adjacent steps, and all UI states: loading/empty/error/success)
+"details" : string  (comprehensive implementation guidance: exact files to create/modify, specific functions/components/types, data shapes, API contracts, UI behavior, dependency wiring, integration points — must include inputs, processing logic, outputs, dependency declarations, and all UI states: loading/empty/error/success)
 
 CRITICAL — EXISTING FILE AWARENESS:
 When referencing files in "details", use the exact file paths from the project. If the request involves an existing file, reference that exact path — never invent a different name. For new files, follow the project's established directory and naming conventions.
 
-THINK BEFORE YOU PLAN — run this mental checklist:
-1. What are the complete features or capabilities to deliver? What does "done" look like for each?
-2. How can each step deliver a fully working, usable slice of functionality — not just isolated code?
-3. What is the correct dependency order? Only write a file after all files it imports from are produced by an earlier (or the same) step.
-4. Is the feature fully covered? Every user-facing behavior, every data flow, every UI state must be handled.
+FEATURE EXTRACTION LAYER — Before producing steps, do this mental decomposition:
+1. Identify all FEATURE-LEVEL modules the request implies (complete capabilities, not atomic tasks)
+2. For each feature, define:
+   - Inputs: what API endpoints, forms, or user actions trigger it
+   - Processing: what services, business rules, or transformations it applies
+   - Outputs: what UI renders, what API response is returned, what state changes
+   - Dependencies: what libraries, frameworks, external services it needs
+3. Map each feature to 1-N steps — each step = one complete, usable capability
+4. Do NOT break a feature into micro-tasks (e.g., "create file", "add method", "wire import")
+5. Group related tasks that only make sense together into a SINGLE step
+
+ARCHITECTURE DESIGN FIRST — run this mental checklist:
+1. What are the complete FEATURE-LEVEL capabilities? What does "done" look like for each?
+2. How can each step deliver a fully working, usable vertical slice — not just isolated code?
+3. What is the correct dependency order? Foundation types, auth, config before features that use them.
+4. Which files will multiple features touch? (router, sidebar, app config — plan for incremental updates)
+5. Is the feature fully covered? Every user-facing behavior, data flow, and UI state must be handled.
 
 PRIMARY RULE:
 Each step MUST produce fully working, integrated, and usable functionality. Avoid partial implementations. Prefer vertical slices (feature-complete) over horizontal slices (layer-only). A step that creates a service without wiring it to anything is NOT acceptable.
@@ -1496,6 +1525,34 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       message: `Step ${step.index}/${steps.length}: ${step.heading}`,
     } satisfies ProgressAnnotation);
 
+    if (executionMode !== "files") {
+      const validation = await validateStep(step, steps, accumulatedFiles);
+      if (!validation.valid) {
+        if (validation.fixedStep) {
+          logger.info(`${stepTag} [validator] step auto-fixed — applying corrected spec`);
+          step = validation.fixedStep;
+        } else {
+          logger.warn(`${stepTag} [validator] step rejected (unfixable): ${validation.issues.join("; ")}`);
+          writer.writeData({
+            type: "progress",
+            label: `plan-step${step.index}-warn`,
+            status: "complete",
+            order: progressCounter.value++,
+            message: `Step ${step.index} was rejected by validator: ${validation.issues[0] ?? "invalid step"}. Skipping.`,
+          } satisfies ProgressAnnotation);
+          silentFailedSteps++;
+          return;
+        }
+      }
+
+      const packageJson = extractPackageJson(accumulatedFiles);
+      const depResult = await injectMissingDependencies(step, packageJson);
+      if (depResult.injected) {
+        logger.info(`${stepTag} [dep-injector] injected missing deps into step: ${depResult.missingDeps.join(", ")}`);
+        step = depResult.enrichedStep;
+      }
+    }
+
     const stepMessages =
       executionMode === "files"
         ? buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles)
@@ -1576,11 +1633,11 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       logger.info(`${stepTag}   ↳ ${fp} (${chars} chars)`);
     }
 
-    try {
-      const { stepText, succeeded } = await streamStep({
+    const runStreamStep = async (activeStep: PlanStep, activeMessages: ReturnType<typeof buildTopicStepMessages>) => {
+      return streamStep({
         requestId,
         res,
-        stepMessages,
+        stepMessages: activeMessages,
         filesToUse,
         allFiles: accumulatedFiles,
         streamingOptions,
@@ -1589,11 +1646,15 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         chatMode,
         designScheme,
         summary,
-        stepIndex: step.index,
+        stepIndex: activeStep.index,
         cumulativeUsage,
         clientAbortSignal,
         promptId: isTestRequest ? "plan-test" : "plan",
       });
+    };
+
+    try {
+      const { stepText, succeeded } = await runStreamStep(step, stepMessages);
 
       if (!succeeded) {
         logger.warn(`${stepTag} ✗ FAILED (all retries exhausted), skipping file extraction`);
@@ -1608,7 +1669,73 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         return;
       }
 
-      const generatedFiles = extractGeneratedFiles(stepText, accumulatedFiles);
+      let finalStepText = stepText;
+      let finalStep = step;
+
+      if (executionMode !== "files") {
+        const score = await scoreExecution(step, stepText);
+
+        if (!score.passed) {
+          logger.warn(`${stepTag} [scorer] score=${score.score}/${100} below threshold=${PASS_THRESHOLD} — entering self-heal loop`);
+
+          for (let healAttempt = 1; healAttempt <= SELF_HEAL_MAX_ATTEMPTS; healAttempt++) {
+            if (clientAbortSignal?.aborted || !writer.isAlive()) break;
+
+            writer.writeData({
+              type: "progress",
+              label: `plan-step${step.index}-heal`,
+              status: "in-progress",
+              order: progressCounter.value++,
+              message: `Step ${step.index} quality below threshold (score ${score.score}/100) — self-healing attempt ${healAttempt}/${SELF_HEAL_MAX_ATTEMPTS}`,
+            } satisfies ProgressAnnotation);
+
+            const { repairedStep } = await repairStep(finalStep, finalStepText, score);
+            finalStep = repairedStep;
+
+            const repairedMessages = buildTopicStepMessages(
+              messages, steps, finalStep, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory,
+            );
+
+            const healResult = await runStreamStep(finalStep, repairedMessages);
+
+            if (!healResult.succeeded) {
+              logger.warn(`${stepTag} [self-heal] attempt ${healAttempt} stream failed — stopping heal loop`);
+              break;
+            }
+
+            finalStepText = healResult.stepText;
+
+            const reScore = await scoreExecution(finalStep, finalStepText);
+            logger.info(`${stepTag} [self-heal] attempt ${healAttempt} re-score=${reScore.score}/100 passed=${reScore.passed}`);
+
+            if (reScore.passed) {
+              writer.writeData({
+                type: "progress",
+                label: `plan-step${step.index}-heal`,
+                status: "complete",
+                order: progressCounter.value++,
+                message: `Step ${step.index} self-healed successfully (score ${reScore.score}/100)`,
+              } satisfies ProgressAnnotation);
+              break;
+            }
+
+            if (healAttempt === SELF_HEAL_MAX_ATTEMPTS) {
+              logger.warn(`${stepTag} [self-heal] max attempts reached, proceeding with best available output (score=${reScore.score}/100)`);
+              writer.writeData({
+                type: "progress",
+                label: `plan-step${step.index}-heal`,
+                status: "complete",
+                order: progressCounter.value++,
+                message: `Step ${step.index} self-heal exhausted — proceeding with best output (score ${reScore.score}/100)`,
+              } satisfies ProgressAnnotation);
+            }
+          }
+        } else {
+          logger.info(`${stepTag} [scorer] score=${score.score}/100 ✓ passed threshold`);
+        }
+      }
+
+      const generatedFiles = extractGeneratedFiles(finalStepText, accumulatedFiles);
       const generatedCount = Object.keys(generatedFiles).length;
       if (generatedCount > 0) {
         Object.assign(accumulatedFiles, generatedFiles);
@@ -1697,9 +1824,53 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     }
   };
 
-  for (const step of steps) {
-    if (!writer.isAlive() || circuitBroken) break;
-    await executeStep(step);
+  if (executionMode !== "files" && steps.length > 2) {
+    const parallelPlan = await buildParallelExecutionPlan(steps);
+    logger.info(
+      `[${requestId}] [parallel-planner] ${parallelPlan.totalGroups} group(s), parallelizable=${parallelPlan.parallelizable}`,
+    );
+
+    const stepByIndex = new Map(steps.map((s) => [s.index, s]));
+
+    for (const group of parallelPlan.groups) {
+      if (!writer.isAlive() || circuitBroken) break;
+
+      const groupSteps = group.steps
+        .map((idx) => stepByIndex.get(idx))
+        .filter((s): s is PlanStep => s !== undefined);
+
+      if (groupSteps.length === 0) continue;
+
+      if (groupSteps.length === 1) {
+        await executeStep(groupSteps[0]);
+      } else {
+        logger.info(
+          `[${requestId}] [parallel-planner] executing group ${group.group} in parallel: [${groupSteps.map((s) => s.index).join(", ")}]`,
+        );
+        writer.writeData({
+          type: "progress",
+          label: `plan-group${group.group}`,
+          status: "in-progress",
+          order: progressCounter.value++,
+          message: `Executing group ${group.group}: ${groupSteps.map((s) => s.heading).join(", ")}`,
+        } satisfies ProgressAnnotation);
+
+        await Promise.all(groupSteps.map((s) => executeStep(s)));
+
+        writer.writeData({
+          type: "progress",
+          label: `plan-group${group.group}`,
+          status: "complete",
+          order: progressCounter.value++,
+          message: `Group ${group.group} complete`,
+        } satisfies ProgressAnnotation);
+      }
+    }
+  } else {
+    for (const step of steps) {
+      if (!writer.isAlive() || circuitBroken) break;
+      await executeStep(step);
+    }
   }
 
   logger.info(
