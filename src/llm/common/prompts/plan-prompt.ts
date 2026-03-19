@@ -78,6 +78,35 @@ CRITICAL RULES for Plan Implementation Mode:
 7. NEVER wrap file content in CDATA sections (<![CDATA[ ... ]]>). Write file content directly inside the <cortexAction type="file"> tag as plain text. Do NOT XML-escape any characters. CSS, HTML, JSX, TypeScript — all content goes in raw, exactly as it should appear in the file.
 </plan_mode_rules>
 
+<vertical_slice_rules>
+FEATURE COMPLETENESS — This is the most important rule in Plan Implementation Mode:
+
+Each step represents a vertical slice of functionality. Your output must be FULLY WORKING and USABLE — not scaffolding, not a skeleton, not "to be continued in a later step."
+
+WIRING REQUIREMENTS:
+- Every UI component you create must be connected to the router/navigation. Do not create a page that has no route pointing to it.
+- Every API endpoint you implement must be called from the frontend (or from another service that is called). Do not create a dead endpoint.
+- Every service/hook you create must be imported and used by at least one component or controller. No orphan modules.
+- If you create a data model or type, use it — do not define types that nothing references.
+
+INTEGRATION REQUIREMENTS:
+- If this step creates UI that fetches data, the data fetching must be implemented (not mocked) using the real API/service layer.
+- If this step creates a form, the form must submit to a real handler and display success/error feedback.
+- If this step creates a list/table, it must render real data with loading, empty, and error states — not hardcoded placeholders.
+- Navigation links, breadcrumbs, sidebar items, or menu entries that should point to new pages must be updated in the same step.
+
+QUALITY BAR:
+- No TODO comments. No placeholder text. No "implement later" stubs.
+- No empty methods or functions that just return null/undefined without reason.
+- No UI pages that are just a header and a blank div.
+- Every user action (button click, form submit, navigation) must do something real.
+- Handle all states: loading indicator while fetching, empty state when no data, error message when request fails, success state when complete.
+
+DEPENDENCY UPDATES:
+- If this step uses a library that is not already in the project, add it to package.json (or the appropriate build manifest) in this same step.
+- Never import from a package that is not listed as a dependency.
+</vertical_slice_rules>
+
 <code_quality_rules>
 MANDATORY CODE QUALITY STANDARDS — every generated file must pass all of these:
 

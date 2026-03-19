@@ -85,40 +85,52 @@ export async function parsePlanIntoSteps(
   const resp = await generateText({
     model: getTachyonModel(),
     system: `
-You are a world-class software architect with 30+ years of experience decomposing projects into precise, executable implementation steps.
-
-Your job: read a project plan and produce a clean, ordered list of CODE CHANGE STEPS only.
+You are a world-class software architect with 30+ years of experience. Your job: read a project plan and produce a lean, ordered list of CODE CHANGE STEPS that deliver fully working, integrated functionality.
 
 Return ONLY a valid JSON array — no prose, no markdown fences. Each element must have:
 "index"   : number  (1-based sequential integer)
-"heading" : string  (concise action-oriented title ≤ 80 chars, starting with a verb: "Add", "Create", "Update", "Implement", "Refactor", "Wire", "Integrate")
-"details" : string  (precise implementation guidance covering: what to create/modify, which functions/components/interfaces to write, which patterns to follow, and how this step connects to adjacent steps)
+"heading" : string  (concise action-oriented title ≤ 80 chars, starting with a verb: "Implement", "Build", "Add", "Wire", "Integrate", "Create", "Update", "Extend")
+"details" : string  (comprehensive implementation guidance: exact files to create/modify, specific functions/components/types, data shapes, API contracts, UI behavior, dependency wiring, and integration points with adjacent steps)
 
 CRITICAL — EXISTING FILE AWARENESS:
-When you reference files in "details", you MUST use the exact file paths from the project. Never invent a path that doesn't exist. If you are creating a new file, follow the project's established directory and naming conventions.
+When referencing files in "details", use the exact file paths from the project. Never invent a path that does not exist. For new files, follow the project's established directory and naming conventions.
 
 DESIGN FIRST — Before splitting into steps, mentally answer:
-1. What is the optimal architecture for this feature? (data flow, component boundaries, service layers)
-2. What is the correct execution order to avoid rework? (types/interfaces → data layer → business logic → API/routes → UI)
-3. Where are the natural seams between steps that produce zero overlap?
+1. What are the complete features or capabilities to deliver? What does "done" look like for each one?
+2. How can each step deliver a fully working, testable slice of functionality — not just isolated code?
+3. What dependencies and integrations are required between layers?
+
+PRIMARY RULE:
+Each step MUST produce fully working, integrated, and usable functionality. Avoid partial implementations. Prefer vertical slices (feature-complete) over horizontal slices (layer-only). A step that creates a service without wiring it to anything is NOT acceptable.
 
 STEP RULES:
-- Include ONLY source code change steps — no documentation steps, no test steps, no README updates
-- Each step must produce shippable, compilable file changes
-- Order steps so each one builds directly on the previous (dependency order)
+- Include ONLY source code change steps — no documentation, no tests, no README updates
+- Each step must produce complete, compilable, runnable code with no missing imports or undefined references
+- Order steps in strict dependency order so each one builds directly on the previous
 - Zero overlap between steps — if two steps touch the same file, merge them into one
-- Split by concern: types, data layer, business logic, API integration, UI components are separate steps
-- If a step would touch more than 5 files, split it further
-- Steps must be granular enough that each one is a focused, reviewable unit of work
-- Never create a "Setup" or "Boilerplate" catch-all step — be specific about what is created
-- Never combine frontend + backend changes in one step unless they are tightly coupled (e.g. a single hook + its API endpoint)
+- Prefer feature-based (vertical) steps: a step may include data model + service + API + UI component + routing if they together implement one coherent feature
+- Avoid splitting steps purely by technical layer (service alone, controller alone, UI alone) when those pieces only make sense together
+- Every UI component created must be wired to routing/navigation in the same step or an explicit wiring step immediately after
+- Every API endpoint created must be connected to its service layer in the same step
+- Every service must be consumed by at least one upstream component — no orphan services
+- If a step introduces new dependencies (library, framework, plugin), it MUST update the build manifest (package.json / pom.xml / build.gradle) in the same step
+- Avoid skeleton, stub, or placeholder implementations — every file must be complete and functional
 
-FORBIDDEN steps (never include):
-- Documentation / README / comments
-- Test files / unit tests / integration tests / e2e tests
-- Linting / formatting / code style cleanup
-- Deployment / CI/CD configuration
-- Version bumps / changelog entries
+DEFINITION OF DONE (each step must satisfy ALL of these):
+- Code compiles with no errors
+- All imports are resolved — no references to files that don't exist yet
+- No unused or unreachable components
+- Every created component is wired and reachable from the application entry point
+- Feature is usable end-to-end, not just scaffolded
+
+FORBIDDEN:
+- Skeleton code or empty method bodies
+- Placeholder UI (headers only, "coming soon" content)
+- TODO comments in generated code
+- Orphan components that are created but never used
+- Documentation / README / JSDoc / comments steps
+- Test files / unit tests / integration tests / e2e tests steps
+- Linting / formatting / deployment / CI/CD steps
 
 OUTPUT: JSON array only. No explanation. No fences.
 `,
@@ -129,7 +141,7 @@ ${existingFileSummary ? `${existingFileSummary}\n\n` : ""}Here is the project pl
 ${planContent}
 </plan>
 
-Use the exact file paths from the project where applicable. Think through the best architecture and zero-overlap execution order, then return the JSON array of code change steps.
+Think through what each feature needs to be complete and usable end-to-end. Use the exact file paths from the project where applicable. Return the JSON array of code change steps.
 `,
   });
 
@@ -158,41 +170,54 @@ export async function generateStepsFromQuestion(
   const resp = await generateText({
     model: getTachyonModel(),
     system: `
-You are a world-class software architect with 30+ years of experience. You have an exceptional ability to decompose any feature request into a precise, deeply complete set of code change steps — covering every layer of the stack needed to fully implement the functionality.
-
-Your job: take a user's feature request and produce the optimal ordered list of CODE CHANGE STEPS that will fully implement it, end-to-end, with zero gaps.
+You are a world-class software architect with 30+ years of experience. Your job: take a user's feature request and produce the optimal ordered list of CODE CHANGE STEPS that deliver fully working, integrated functionality — end-to-end, with zero gaps.
 
 Return ONLY a valid JSON array — no prose, no markdown fences. Each element must have:
 "index"   : number  (1-based sequential integer)
-"heading" : string  (concise action-oriented title ≤ 80 chars, starting with a verb: "Add", "Create", "Update", "Implement", "Refactor", "Wire", "Integrate", "Extend", "Build")
-"details" : string  (precise implementation guidance: exact files to create/modify, specific functions/components/types to write, data shapes, API contracts, UI behavior, and how this step integrates with the previous and next steps)
+"heading" : string  (concise action-oriented title ≤ 80 chars, starting with a verb: "Implement", "Build", "Add", "Wire", "Integrate", "Create", "Update", "Extend")
+"details" : string  (comprehensive implementation guidance: exact files to create/modify, specific functions/components/types, data shapes, API contracts, UI behavior, dependency wiring, integration points with adjacent steps, and all UI states: loading/empty/error/success)
 
 CRITICAL — EXISTING FILE AWARENESS:
-When you reference files in "details", you MUST use the exact file paths from the project. If the user asks about a feature that involves an existing file, reference that exact path — never invent a different name. For example, if the project has "src/pages/PhotosPage.tsx" and the user asks to modify the gallery, your step must reference "src/pages/PhotosPage.tsx", NOT "src/pages/GalleryPage.tsx".
+When referencing files in "details", use the exact file paths from the project. If the request involves an existing file, reference that exact path — never invent a different name. For new files, follow the project's established directory and naming conventions.
 
 THINK BEFORE YOU PLAN — run this mental checklist:
-1. What is the ideal architecture for this feature? (consider: data model, service layer, API shape, state management, UI components)
-2. What is the correct dependency order? Standard order: shared types/interfaces → database/schema → data access layer → business logic/services → API routes/hooks → UI components → wiring/integration
-3. Where are the natural seams with zero overlap? Each step must own distinct files.
-4. Is the feature fully covered? Every user-facing behavior, every data flow, every UI state (loading, empty, error, success) must be handled by some step.
+1. What are the complete features or capabilities to deliver? What does "done" look like for each?
+2. How can each step deliver a fully working, usable slice of functionality — not just isolated code?
+3. What is the correct dependency order? Only write a file after all files it imports from are produced by an earlier (or the same) step.
+4. Is the feature fully covered? Every user-facing behavior, every data flow, every UI state must be handled.
+
+PRIMARY RULE:
+Each step MUST produce fully working, integrated, and usable functionality. Avoid partial implementations. Prefer vertical slices (feature-complete) over horizontal slices (layer-only). A step that creates a service without wiring it to anything is NOT acceptable.
 
 STEP RULES:
-- Create AS MANY STEPS AS NEEDED to implement the functionality completely and deeply — do not compress unrelated concerns into one step to save count
-- Each step must produce shippable, compilable code that compiles without errors
+- Include ONLY source code change steps — no documentation, no tests, no README updates
+- Each step must produce complete, compilable, runnable code with no missing imports or undefined references
 - Order steps in strict dependency order — no step should require code from a later step
-- Zero overlap between steps — if two steps would modify the same file, merge them into one step
-- Split by architectural layer: types, db schema, data access, business logic, API/routing, UI components, state/hooks, integration/wiring
-- Each step should be focused and reviewable — a senior developer should be able to implement it in one sitting
-- Steps for data-heavy features must include: schema/model → repository/query layer → service/transformer → UI data binding
-- Steps for UI-heavy features must include: component structure → state management → data fetching → interaction handlers → visual polish
-- Steps for API features must include: request/response types → validation → handler logic → error handling → client integration
+- Zero overlap between steps — if two steps touch the same file, merge them into one
+- Prefer feature-based (vertical) steps: a step may span data model + service + API + UI + routing if they together implement one coherent feature
+- Avoid splitting steps purely by technical layer (service alone, controller alone, UI alone) when those pieces only make sense together
+- Every UI component created must be wired to routing/navigation in the same step or an explicit wiring step immediately after
+- Every API endpoint created must be connected to its service layer in the same step
+- Every service must be consumed by at least one upstream component — no orphan services
+- If a step introduces new dependencies (library, framework, plugin), it MUST update the build manifest (package.json / pom.xml / build.gradle) in the same step
+- All UI states must be handled: loading, empty, error, success
+- Avoid skeleton, stub, or placeholder implementations — every file must be complete and functional
 
-FORBIDDEN steps (never include any of these):
-- Documentation / README / JSDoc / inline comments
-- Test files / unit tests / integration tests / e2e tests / test utilities
-- Linting / formatting / Prettier / ESLint configuration
-- Deployment scripts / CI/CD / Docker / environment configs
-- Version bumps / changelog / release notes
+DEFINITION OF DONE (each step must satisfy ALL of these):
+- Code compiles with no errors
+- All imports are resolved — no references to files that don't exist yet
+- No unused or unreachable components
+- Every created component is wired and reachable from the application entry point
+- Feature is usable end-to-end, not just scaffolded
+
+FORBIDDEN:
+- Skeleton code or empty method bodies
+- Placeholder UI (headers only, "coming soon" content)
+- TODO comments in generated code
+- Orphan components that are created but never used
+- Documentation / README / JSDoc / comments steps
+- Test files / unit tests / integration tests / e2e tests steps
+- Linting / formatting / deployment / CI/CD steps
 
 OUTPUT: JSON array only. No explanation text. No markdown fences. No preamble.
 `,
@@ -203,7 +228,7 @@ User's request:
 ${userQuestion}
 </request>
 ${existingFileSummary ? `\n${existingFileSummary}\n` : ""}
-Think through the optimal architecture and zero-overlap step order that fully implements this request end-to-end. Use the exact file names from the project where applicable. Then return the JSON array of code change steps.
+Think through what each feature needs to be complete and usable end-to-end. Use the exact file names from the project where applicable. Return the JSON array of code change steps.
 `,
   });
 
