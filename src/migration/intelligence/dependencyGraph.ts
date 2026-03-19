@@ -1,6 +1,7 @@
 import type { FileSummary, FileRole } from "./semanticExtractor";
+import type { XmlFileSummary } from "./xmlConfigParser";
 
-export type EdgeType = "calls" | "injects" | "extends" | "uses" | "imports";
+export type EdgeType = "calls" | "injects" | "extends" | "uses" | "imports" | "xml-ref";
 
 export interface GraphNode {
   id: string;
@@ -56,7 +57,7 @@ function classToPath(className: string, allPaths: string[]): string | null {
   return null;
 }
 
-export function buildDependencyGraph(summaries: FileSummary[]): DependencyGraph {
+export function buildDependencyGraph(summaries: FileSummary[], xmlConfigs?: XmlFileSummary[]): DependencyGraph {
   const nodes: GraphNode[] = summaries.map((s) => ({
     id: s.path,
     type: s.role,
@@ -67,6 +68,13 @@ export function buildDependencyGraph(summaries: FileSummary[]): DependencyGraph 
   const edges: GraphEdge[] = [];
   const allPaths = summaries.map((s) => s.path);
   const pathSet = new Set(allPaths);
+
+  const classNameToPath = new Map<string, string>();
+  for (const s of summaries) {
+    for (const cn of s.classNames) {
+      classNameToPath.set(cn, s.path);
+    }
+  }
 
   for (const summary of summaries) {
     for (const imp of summary.imports) {
@@ -92,6 +100,29 @@ export function buildDependencyGraph(summaries: FileSummary[]): DependencyGraph 
       if (targetPath && targetPath !== summary.path) {
         const edgeType: EdgeType = summary.usesAutowired ? "injects" : "uses";
         edges.push({ from: summary.path, to: targetPath, type: edgeType });
+      }
+    }
+
+    if (summary.injectedFields && summary.injectedFields.length > 0) {
+      for (const field of summary.injectedFields) {
+        const targetPath = classNameToPath.get(field.type) ?? classToPath(field.type, allPaths);
+        if (targetPath && targetPath !== summary.path) {
+          if (!edges.some((e) => e.from === summary.path && e.to === targetPath && e.type === "injects")) {
+            edges.push({ from: summary.path, to: targetPath, type: "injects" });
+          }
+        }
+      }
+    }
+  }
+
+  if (xmlConfigs) {
+    for (const xml of xmlConfigs) {
+      for (const bean of xml.beans) {
+        const simpleClass = bean.className.split(".").pop() ?? bean.className;
+        const targetPath = classNameToPath.get(simpleClass) ?? classToPath(simpleClass, allPaths);
+        if (targetPath) {
+          edges.push({ from: xml.file, to: targetPath, type: "xml-ref" });
+        }
       }
     }
   }

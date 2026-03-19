@@ -8,6 +8,7 @@ import type { ProgressAnnotation } from "../../types/context";
 import type { MigrationPlan, MigrationTask, FileOperation } from "../types/migrationTypes";
 import type { CodebaseIntelligence } from "../intelligence/contextBuilder";
 import { buildTaskGraph } from "./taskGraph";
+import { normalizeTasks } from "./taskNormalizer";
 import { runStaticValidation } from "./staticValidator";
 import {
   createMigrationState,
@@ -25,6 +26,14 @@ const logger = createScopedLogger("streaming-task-executor");
 const MIGRATION_FRAME_RE = /^([0-9a-z]+):(.+)\n?$/;
 const MAX_TASK_RETRIES = 2;
 const MAX_STATIC_FIX_ATTEMPTS = 3;
+const QUALITY_FIX_WARNING_THRESHOLD = 3;
+
+const APPROX_CHARS_PER_TOKEN = 4;
+const MAX_CONTEXT_TOKENS = 6000;
+const MAX_DEP_FILE_CHARS = 1200;
+const MAX_CURRENT_FILE_CHARS = 2000;
+const MAX_GUIDANCE_CHARS = 1500;
+const MAX_DEP_FILES = 5;
 
 export interface StreamingTaskExecutorOptions {
   res: Response;
@@ -40,6 +49,15 @@ export interface StreamingTaskExecutorOptions {
   clientAbortSignal?: AbortSignal;
 }
 
+export interface ConfidenceScore {
+  taskSuccessRate: number;
+  staticErrorCount: number;
+  staticWarningCount: number;
+  autoFixAttempts: number;
+  qualityFixApplied: boolean;
+  overallScore: number;
+}
+
 export interface StreamingTaskResult {
   success: boolean;
   filesCreated: number;
@@ -49,6 +67,7 @@ export interface StreamingTaskResult {
   errors: string[];
   staticIssues: string[];
   taskResults: Array<{ taskId: string; file: string; success: boolean; error?: string }>;
+  confidence: ConfidenceScore;
 }
 
 function writeProgress(
@@ -74,6 +93,33 @@ function writeAnnotation(res: Response, data: unknown): void {
   res.write(`8:[${JSON.stringify(data)}]\n`);
 }
 
+function computeConfidence(
+  taskResults: StreamingTaskResult["taskResults"],
+  staticResult: ReturnType<typeof runStaticValidation>,
+  autoFixAttempts: number,
+  qualityFixApplied: boolean,
+): ConfidenceScore {
+  const successCount = taskResults.filter((t) => t.success).length;
+  const taskSuccessRate = taskResults.length > 0 ? successCount / taskResults.length : 0;
+  const staticErrorCount = staticResult.issues.filter((i) => i.severity === "error").length;
+  const staticWarningCount = staticResult.issues.filter((i) => i.severity === "warning").length;
+
+  let score = taskSuccessRate * 60;
+  score += staticErrorCount === 0 ? 20 : Math.max(0, 20 - staticErrorCount * 5);
+  score += staticWarningCount === 0 ? 10 : Math.max(0, 10 - staticWarningCount * 2);
+  score += staticResult.hasMainClass ? 5 : 0;
+  score += qualityFixApplied ? 5 : 0;
+
+  return {
+    taskSuccessRate: Math.round(taskSuccessRate * 100),
+    staticErrorCount,
+    staticWarningCount,
+    autoFixAttempts,
+    qualityFixApplied,
+    overallScore: Math.round(Math.min(100, score)),
+  };
+}
+
 export async function executeTaskGraphStreaming(
   opts: StreamingTaskExecutorOptions,
 ): Promise<StreamingTaskResult> {
@@ -91,7 +137,19 @@ export async function executeTaskGraphStreaming(
     clientAbortSignal,
   } = opts;
 
-  const tasks = plan.tasks ?? [];
+  const rawTasks = plan.tasks ?? [];
+  const tasks = normalizeTasks(rawTasks);
+
+  if (tasks.length !== rawTasks.length) {
+    writeProgress(
+      res,
+      progressCounter,
+      "task-normalization",
+      "complete",
+      `Task normalization: ${rawTasks.length} tasks → ${tasks.length} per-file tasks`,
+    );
+  }
+
   const llmClient = new LLMClient();
 
   const sourceFiles = new Map<string, string>();
@@ -121,13 +179,13 @@ export async function executeTaskGraphStreaming(
 
   const cumulativeUsage = { completionTokens: 0, promptTokens: 0, totalTokens: 0 };
   const taskResults: StreamingTaskResult["taskResults"] = [];
-  let circuitBroken = false;
+  let autoFixAttempts = 0;
 
   for (const wave of taskGraph.executionWaves) {
-    if (circuitBroken || clientAbortSignal?.aborted || res.writableEnded || res.destroyed) break;
+    if (clientAbortSignal?.aborted || res.writableEnded || res.destroyed) break;
 
     for (const task of wave.tasks) {
-      if (circuitBroken || clientAbortSignal?.aborted || res.writableEnded || res.destroyed) break;
+      if (clientAbortSignal?.aborted || res.writableEnded || res.destroyed) break;
 
       const taskResult = await executeTaskStreaming({
         task,
@@ -163,7 +221,7 @@ export async function executeTaskGraphStreaming(
 
   let staticFixErrors: string[] = [];
   if (!staticResult.passed && staticResult.issues.some((i) => i.severity === "error")) {
-    staticFixErrors = await runStaticAutoFixLoop({
+    const fixResult = await runStaticAutoFixLoop({
       state,
       intelligence,
       llmClient,
@@ -171,18 +229,42 @@ export async function executeTaskGraphStreaming(
       res,
       maxAttempts: MAX_STATIC_FIX_ATTEMPTS,
     });
+    staticFixErrors = fixResult.errors;
+    autoFixAttempts = fixResult.attempts;
   }
+
+  const warningCount = staticResult.issues.filter((i) => i.severity === "warning").length;
+  let qualityFixApplied = false;
+  if (warningCount >= QUALITY_FIX_WARNING_THRESHOLD && staticFixErrors.length === 0) {
+    qualityFixApplied = await runQualityImprovementPass({
+      state,
+      llmClient,
+      progressCounter,
+      res,
+    });
+  }
+
+  const finalStaticResult = qualityFixApplied
+    ? runPostExecutionStaticValidation(state, progressCounter, res)
+    : staticResult;
 
   const failedTasks = taskResults.filter((t) => !t.success);
   const success = failedTasks.length === 0 && staticFixErrors.length === 0;
+
+  const confidence = computeConfidence(taskResults, finalStaticResult, autoFixAttempts, qualityFixApplied);
 
   writeProgress(
     res,
     progressCounter,
     "migration-done",
     "complete",
-    `Migration complete: ${taskResults.filter((t) => t.success).length}/${tasks.length} tasks succeeded, tokens=${cumulativeUsage.totalTokens}, static=${staticResult.passed ? "PASSED" : "FAILED"}`,
+    `Migration complete: ${taskResults.filter((t) => t.success).length}/${tasks.length} tasks succeeded, tokens=${cumulativeUsage.totalTokens}, static=${finalStaticResult.passed ? "PASSED" : "FAILED"}, confidence=${confidence.overallScore}/100`,
   );
+
+  writeAnnotation(res, {
+    type: "migration_confidence",
+    confidence,
+  });
 
   return {
     success,
@@ -194,8 +276,9 @@ export async function executeTaskGraphStreaming(
       ...failedTasks.map((t) => `[${t.taskId}] ${t.error}`),
       ...staticFixErrors,
     ],
-    staticIssues: staticResult.issues.map((i) => `[${i.severity.toUpperCase()}] ${i.type}: ${i.message}`),
+    staticIssues: finalStaticResult.issues.map((i) => `[${i.severity.toUpperCase()}] ${i.type}: ${i.message}`),
     taskResults,
+    confidence,
   };
 }
 
@@ -245,7 +328,8 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
     return { taskId: task.id, file: task.file, success: true };
   }
 
-  const taskMessages = buildTaskMessages(opts);
+  const resolvedAction = resolveTaskAction(task, state);
+  let lastError: string | undefined;
 
   for (let attempt = 0; attempt <= MAX_TASK_RETRIES; attempt++) {
     if (attempt > 0) {
@@ -256,11 +340,16 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
         progressCounter,
         `migration-task-${task.id}`,
         "in-progress",
-        `Task ${taskIndex}/${totalTasks} retry ${attempt}/${MAX_TASK_RETRIES}: ${task.file}`,
+        `Task ${taskIndex}/${totalTasks} retry ${attempt}/${MAX_TASK_RETRIES}: ${task.file}${lastError ? ` (prev: ${lastError.slice(0, 80)})` : ""}`,
       );
     }
 
+    const taskMessages = buildTaskMessages(opts, resolvedAction, lastError);
+
     try {
+      const startMs = Date.now();
+      const filesUsed = Array.from(collectDependencyFilesFromGraph(task, state, opts.intelligence).keys());
+
       const result = await streamText({
         messages: taskMessages,
         env: undefined as any,
@@ -304,11 +393,13 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
       }
 
       const extractedFiles = extractGeneratedFiles(stepText ?? "");
-      if (Object.keys(extractedFiles).length > 0) {
+      const outputFiles = Object.keys(extractedFiles);
+
+      if (outputFiles.length > 0) {
         for (const [filePath, content] of Object.entries(extractedFiles)) {
           const op: FileOperation = {
             file: filePath,
-            action: task.action ?? "create",
+            action: resolvedAction,
             content: (content as any).content,
           };
           applyFileOperation(state, op);
@@ -318,16 +409,23 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
         logger.warn(`Task ${task.id} produced 0 extractable files from response`);
       }
 
+      logger.info(
+        `[obs] task=${task.id} file=${task.file} action=${resolvedAction} ` +
+        `deps=[${filesUsed.join(",")}] out=[${outputFiles.join(",")}] ` +
+        `tokens=${usage?.totalTokens ?? 0} ms=${Date.now() - startMs} attempt=${attempt}`,
+      );
+
       writeProgress(
         res,
         progressCounter,
         `migration-task-${task.id}`,
         "complete",
-        `Task ${taskIndex}/${totalTasks} done [${task.type ?? "code"}]: ${task.file}`,
+        `Task ${taskIndex}/${totalTasks} done [${task.type ?? "code"}]: ${task.file}${outputFiles.length > 0 ? ` (${outputFiles.length} file${outputFiles.length !== 1 ? "s" : ""})` : ""}`,
       );
 
       return { taskId: task.id, file: task.file, success: true };
     } catch (err: any) {
+      lastError = err?.message ?? "unknown error";
       const isRetryable =
         err?.name === "AbortError" ||
         err?.message?.includes("timeout") ||
@@ -335,35 +433,43 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
         err?.message?.includes("socket hang up");
 
       if (!isRetryable || attempt >= MAX_TASK_RETRIES) {
-        const errMsg = err?.message ?? "unknown error";
-        logger.error(`Task ${task.id} failed: ${errMsg}`);
+        logger.error(`Task ${task.id} failed permanently: ${lastError}`);
         writeProgress(
           res,
           progressCounter,
           `migration-task-${task.id}`,
           "complete",
-          `Task ${taskIndex}/${totalTasks} FAILED: ${task.file} — ${errMsg}`,
+          `Task ${taskIndex}/${totalTasks} FAILED: ${task.file} — ${lastError}`,
         );
-        return { taskId: task.id, file: task.file, success: false, error: errMsg };
+        return { taskId: task.id, file: task.file, success: false, error: lastError };
       }
     }
   }
 
-  return { taskId: task.id, file: task.file, success: false, error: "max retries exceeded" };
+  return { taskId: task.id, file: task.file, success: false, error: lastError ?? "max retries exceeded" };
 }
 
-function buildTaskMessages(opts: TaskStreamingOpts): Messages {
+function resolveTaskAction(task: MigrationTask, state: MigrationState): "create" | "modify" {
+  if (task.action === "modify") return "modify";
+  if (task.action === "create" && state.fileMap.has(task.file)) {
+    logger.warn(`Idempotency: task ${task.id} create on existing ${task.file} — upgraded to modify`);
+    return "modify";
+  }
+  return "create";
+}
+
+function buildTaskMessages(opts: TaskStreamingOpts, resolvedAction: string, lastError?: string): Messages {
   const { task, state, intelligence, markdownContent } = opts;
 
   const currentContent = state.fileMap.get(task.file);
-
   const dependencyFiles = collectDependencyFilesFromGraph(task, state, intelligence);
+  const trimmedDeps = trimDependencyFilesToBudget(dependencyFiles, currentContent);
 
   const sections: string[] = [];
   sections.push(`You are migrating a Spring MVC project to Spring Boot.`);
   sections.push(`\n## TASK`);
   sections.push(`File: ${task.file}`);
-  sections.push(`Action: ${task.action ?? "create"}`);
+  sections.push(`Action: ${resolvedAction}`);
   sections.push(`Type: ${task.type ?? "code"}`);
   sections.push(`Description: ${task.description}`);
 
@@ -371,15 +477,21 @@ function buildTaskMessages(opts: TaskStreamingOpts): Messages {
     sections.push(`Related files: ${task.files.join(", ")}`);
   }
 
+  if (lastError) {
+    sections.push(`\n## PREVIOUS ATTEMPT FAILED`);
+    sections.push(`Error: ${lastError}`);
+    sections.push(`Fix this specific issue. Do not repeat the same mistake.`);
+  }
+
   sections.push(`\n## MIGRATION STATE`);
   sections.push(serializeGlobalDecisions(state));
 
-  if (dependencyFiles.size > 0) {
-    sections.push(`\n## DEPENDENCY FILES (classes this file directly depends on — from dependency graph)`);
-    for (const [path, content] of dependencyFiles) {
+  if (trimmedDeps.size > 0) {
+    sections.push(`\n## DEPENDENCY FILES (classes this file depends on — from dependency graph)`);
+    for (const [path, content] of trimmedDeps) {
       sections.push(`\n### ${path}`);
       sections.push("```java");
-      sections.push(content.slice(0, 1200) + (content.length > 1200 ? "\n...[truncated]" : ""));
+      sections.push(content);
       sections.push("```");
     }
   }
@@ -387,7 +499,7 @@ function buildTaskMessages(opts: TaskStreamingOpts): Messages {
   if (currentContent) {
     sections.push(`\n## CURRENT FILE CONTENT (before migration)`);
     sections.push("```java");
-    sections.push(currentContent.slice(0, 2000) + (currentContent.length > 2000 ? "\n...[truncated]" : ""));
+    sections.push(currentContent.slice(0, MAX_CURRENT_FILE_CHARS) + (currentContent.length > MAX_CURRENT_FILE_CHARS ? "\n...[truncated]" : ""));
     sections.push("```");
   }
 
@@ -395,7 +507,7 @@ function buildTaskMessages(opts: TaskStreamingOpts): Messages {
     const guidance = extractMarkdownGuidanceForTask(task, markdownContent);
     if (guidance) {
       sections.push(`\n## MIGRATION GUIDANCE (from Migration.md)`);
-      sections.push(guidance.slice(0, 1500));
+      sections.push(guidance.slice(0, MAX_GUIDANCE_CHARS));
     }
   }
 
@@ -413,6 +525,28 @@ function buildTaskMessages(opts: TaskStreamingOpts): Messages {
   ];
 }
 
+function trimDependencyFilesToBudget(
+  depFiles: Map<string, string>,
+  currentContent: string | undefined,
+): Map<string, string> {
+  const result = new Map<string, string>();
+  let usedChars = currentContent ? Math.min(currentContent.length, MAX_CURRENT_FILE_CHARS) : 0;
+  const budgetChars = MAX_CONTEXT_TOKENS * APPROX_CHARS_PER_TOKEN;
+
+  for (const [path, content] of depFiles) {
+    if (result.size >= MAX_DEP_FILES) break;
+    const charsToUse = Math.min(content.length, MAX_DEP_FILE_CHARS);
+    if (usedChars + charsToUse > budgetChars) {
+      logger.info(`Context budget (${budgetChars} chars) reached at ${result.size} dep files — trimming`);
+      break;
+    }
+    result.set(path, content.slice(0, charsToUse) + (content.length > charsToUse ? "\n...[truncated]" : ""));
+    usedChars += charsToUse;
+  }
+
+  return result;
+}
+
 function collectDependencyFilesFromGraph(
   task: MigrationTask,
   state: MigrationState,
@@ -427,8 +561,17 @@ function collectDependencyFilesFromGraph(
   );
 
   if (taskNode) {
-    const outgoingEdges = intelligence.dependencyGraph.edges.filter((e) => e.from === taskNode.filePath);
-    for (const edge of outgoingEdges.slice(0, 5)) {
+    const outgoingEdges = intelligence.dependencyGraph.edges.filter(
+      (e) => e.from === taskNode.filePath && (e.type === "imports" || (e as any).type === "injects" || (e as any).type === "xml-ref"),
+    );
+
+    const prioritized = [
+      ...outgoingEdges.filter((e) => (e as any).type === "injects"),
+      ...outgoingEdges.filter((e) => (e as any).type === "xml-ref"),
+      ...outgoingEdges.filter((e) => e.type === "imports"),
+    ];
+
+    for (const edge of prioritized.slice(0, MAX_DEP_FILES)) {
       const content = state.fileMap.get(edge.to);
       if (content) {
         result.set(edge.to, content);
@@ -438,7 +581,7 @@ function collectDependencyFilesFromGraph(
 
   for (const depId of task.dependsOn ?? []) {
     const depOp = state.operations.find((op) => (op as any).taskId === depId);
-    if (depOp?.content && result.size < 5) {
+    if (depOp?.content && result.size < MAX_DEP_FILES) {
       result.set(depOp.file, depOp.content);
     }
   }
@@ -492,42 +635,46 @@ function buildTaskFileContext(
 function appendStageRules(sections: string[], type: string, state: MigrationState): void {
   const existingBeans = Array.from(state.globalDecisions.beanNames.keys());
 
-  sections.push(`\n## RULES (MANDATORY)`);
-  sections.push(`1. Use CONSTRUCTOR INJECTION ONLY — no @Autowired on fields`);
-  sections.push(`2. Remove ALL XML references (ClassPathXmlApplicationContext, web.xml, etc.)`);
-  sections.push(`3. Add correct stereotype annotation`);
-  sections.push(`4. Do NOT duplicate beans: ${existingBeans.join(", ") || "(none yet)"}`);
-  sections.push(`5. Preserve 100% of business logic`);
-  sections.push(`6. ALL output files under migrate/`);
-  sections.push(`7. Return ONLY complete file content — no markdown, no explanations`);
+  sections.push(`\n## RULES (MANDATORY — NEVER violate)`);
+  sections.push(`1. ALWAYS use CONSTRUCTOR INJECTION — NEVER @Autowired/@Inject/@Resource on fields`);
+  sections.push(`2. NEVER reference XML files (ClassPathXmlApplicationContext, web.xml, applicationContext.xml, dispatcher-servlet.xml)`);
+  sections.push(`3. ALWAYS add the correct stereotype (@Service, @Repository, @Controller, @RestController, @Configuration)`);
+  sections.push(`4. NEVER define a bean already registered: ${existingBeans.join(", ") || "(none yet)"}`);
+  sections.push(`5. ALWAYS preserve 100% of business logic — NEVER drop methods or fields`);
+  sections.push(`6. ALWAYS output files under migrate/`);
+  sections.push(`7. ALWAYS return ONLY complete file content — NEVER markdown fences, NEVER explanations`);
+  sections.push(`8. NEVER mix XML config with annotation config in the same file`);
+  sections.push(`9. NEVER use deprecated Spring APIs (XmlBeanFactory, SimpleFormController, etc.)`);
 
   switch (type) {
     case "build":
       sections.push(`\n## BUILD RULES`);
-      sections.push(`- spring-boot-starter-parent as parent POM`);
-      sections.push(`- Include spring-boot-starter-web, spring-boot-starter-data-jpa (if needed)`);
-      sections.push(`- Add spring-boot-maven-plugin`);
-      sections.push(`- Remove servlet-api, spring-webmvc standalone dependencies`);
+      sections.push(`- ALWAYS use spring-boot-starter-parent as parent POM`);
+      sections.push(`- ALWAYS include spring-boot-starter-web`);
+      sections.push(`- Include spring-boot-starter-data-jpa ONLY if JPA/Hibernate is used`);
+      sections.push(`- ALWAYS add spring-boot-maven-plugin`);
+      sections.push(`- NEVER include standalone servlet-api or spring-webmvc — covered by starters`);
       break;
     case "config":
       sections.push(`\n## CONFIG RULES`);
-      sections.push(`- @Configuration class`);
-      sections.push(`- Replace every <bean> with a @Bean method`);
-      sections.push(`- Replace context:component-scan with @SpringBootApplication or @ComponentScan`);
-      sections.push(`- Replace property-placeholder with @Value or @ConfigurationProperties`);
-      sections.push(`- If replacing web.xml: create @SpringBootApplication main class`);
+      sections.push(`- ALWAYS annotate configuration classes with @Configuration`);
+      sections.push(`- ALWAYS replace every <bean> element with a @Bean method`);
+      sections.push(`- ALWAYS replace context:component-scan with @SpringBootApplication or @ComponentScan`);
+      sections.push(`- ALWAYS replace property-placeholder with @Value or @ConfigurationProperties`);
+      sections.push(`- If replacing web.xml: ALWAYS create @SpringBootApplication main class`);
+      sections.push(`- NEVER copy XML into the target project — convert it to Java`);
       break;
     case "code":
       sections.push(`\n## CODE RULES`);
-      sections.push(`- @Service / @Repository / @Controller / @RestController as appropriate`);
-      sections.push(`- Constructor injection only`);
-      sections.push(`- Remove Spring XML configuration references`);
+      sections.push(`- ALWAYS use appropriate stereotype: @Service, @Repository, @Controller, @RestController`);
+      sections.push(`- ALWAYS convert field injection to constructor injection`);
+      sections.push(`- NEVER reference Spring XML configuration`);
       break;
     case "resource":
       sections.push(`\n## RESOURCE RULES`);
-      sections.push(`- Place in migrate/src/main/resources/`);
-      sections.push(`- Use Spring Boot property keys`);
-      sections.push(`- Remove legacy servlet/container config`);
+      sections.push(`- ALWAYS place in migrate/src/main/resources/`);
+      sections.push(`- ALWAYS use Spring Boot property key conventions`);
+      sections.push(`- NEVER include legacy servlet or container configuration`);
       break;
   }
 }
@@ -626,7 +773,7 @@ function runStageValidation(
         progressCounter,
         `stage-validate-${waveIndex}`,
         "complete",
-        `Stage validation [${stage}]: wave ${waveIndex} complete — ${waveTasks.filter((t) => state.completedTasks.has(t.id)).length}/${waveTasks.length} tasks succeeded, beans=${state.globalDecisions.beanNames.size}`,
+        `Stage validation [${stage}]: wave ${waveIndex} — ${waveTasks.filter((t) => state.completedTasks.has(t.id)).length}/${waveTasks.length} tasks succeeded, beans=${state.globalDecisions.beanNames.size}`,
       );
     }
   }
@@ -636,7 +783,7 @@ function runPostExecutionStaticValidation(
   state: MigrationState,
   progressCounter: { value: number },
   res: Response,
-) {
+): ReturnType<typeof runStaticValidation> {
   const migratedFiles = new Map<string, string>();
   for (const [path, content] of state.fileMap) {
     if (path.includes("migrate/")) {
@@ -694,11 +841,13 @@ interface StaticAutoFixOpts {
   maxAttempts: number;
 }
 
-async function runStaticAutoFixLoop(opts: StaticAutoFixOpts): Promise<string[]> {
+async function runStaticAutoFixLoop(opts: StaticAutoFixOpts): Promise<{ errors: string[]; attempts: number }> {
   const { state, llmClient, progressCounter, res, maxAttempts } = opts;
   const errors: string[] = [];
+  let attemptsUsed = 0;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    attemptsUsed = attempt;
     const migratedFiles = new Map<string, string>();
     for (const [path, content] of state.fileMap) {
       if (path.includes("migrate/")) migratedFiles.set(path, content);
@@ -709,7 +858,7 @@ async function runStaticAutoFixLoop(opts: StaticAutoFixOpts): Promise<string[]> 
 
     if (errorIssues.length === 0) {
       writeProgress(res, progressCounter, "static-autofix", "complete", `Static auto-fix: all errors resolved after ${attempt - 1} attempt(s)`);
-      return [];
+      return { errors: [], attempts: attemptsUsed };
     }
 
     writeProgress(
@@ -732,20 +881,28 @@ async function runStaticAutoFixLoop(opts: StaticAutoFixOpts): Promise<string[]> 
 ERRORS:
 ${fileErrors.map((e) => `- [${e.type}] ${e.message}`).join("\n")}
 
+RULES:
+- NEVER use field injection — ALWAYS constructor injection
+- NEVER reference XML files — ALWAYS Spring Boot annotations
+- ALWAYS include SpringApplication.run() if @SpringBootApplication is present
+- NEVER change business logic
+
 FILE: ${filePath}
 \`\`\`java
 ${content.slice(0, 3000)}
 \`\`\`
 
-Attempt ${attempt}/${maxAttempts}.
 Return ONLY the complete corrected file content — no markdown, no explanation.`;
 
-      const resp = await llmClient.generateText(prompt, { maxRetries: 1, systemPrompt: "You are a Spring Boot expert. Fix only the reported errors. Return complete file content only, no markdown." });
+      const resp = await llmClient.generateText(prompt, {
+        maxRetries: 1,
+        systemPrompt: "You are a Spring Boot expert. Fix only the reported errors. Return complete file content only, no markdown.",
+      });
       if (resp.success && resp.data) {
         const fixed = resp.data.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
         state.fileMap.set(filePath, fixed);
         applyFileOperation(state, { file: filePath, action: "modify", content: fixed });
-        logger.info(`Static auto-fix applied to ${filePath}`);
+        logger.info(`Static auto-fix applied to ${filePath} (attempt ${attempt})`);
       }
     }
   }
@@ -768,7 +925,95 @@ Return ONLY the complete corrected file content — no markdown, no explanation.
     errors.push(...remaining.map((i) => `[static] ${i.message}`));
   }
 
-  return errors;
+  return { errors, attempts: attemptsUsed };
+}
+
+interface QualityFixOpts {
+  state: MigrationState;
+  llmClient: LLMClient;
+  progressCounter: { value: number };
+  res: Response;
+}
+
+async function runQualityImprovementPass(opts: QualityFixOpts): Promise<boolean> {
+  const { state, llmClient, progressCounter, res } = opts;
+
+  const migratedFiles = new Map<string, string>();
+  for (const [path, content] of state.fileMap) {
+    if (path.includes("migrate/") && path.endsWith(".java")) {
+      migratedFiles.set(path, content);
+    }
+  }
+
+  const result = runStaticValidation(migratedFiles);
+  const warningIssues = result.issues.filter((i) => i.severity === "warning");
+
+  const fileWarningMap = new Map<string, string[]>();
+  for (const issue of warningIssues) {
+    if (issue.file === "project") continue;
+    const existing = fileWarningMap.get(issue.file) ?? [];
+    existing.push(issue.message);
+    fileWarningMap.set(issue.file, existing);
+  }
+
+  if (fileWarningMap.size === 0) return false;
+
+  writeProgress(
+    res,
+    progressCounter,
+    "quality-pass",
+    "in-progress",
+    `Quality improvement pass: ${fileWarningMap.size} file(s) with ${warningIssues.length} warning(s)`,
+  );
+
+  let anyFixed = false;
+  for (const [path, warnings] of Array.from(fileWarningMap.entries()).slice(0, 5)) {
+    const content = state.fileMap.get(path);
+    if (!content) continue;
+
+    const prompt = `Improve this Spring Boot file by fixing all quality warnings. NEVER change business logic.
+
+WARNINGS:
+${warnings.map((w) => `- ${w}`).join("\n")}
+
+RULES:
+- ALWAYS use constructor injection — NEVER field injection
+- ALWAYS remove XML context references
+- NEVER change business logic
+- NEVER add or remove methods unrelated to the warnings
+
+FILE: ${path}
+\`\`\`java
+${content.slice(0, 3000)}
+\`\`\`
+
+Return ONLY the improved file content — no markdown, no explanation.`;
+
+    const resp = await llmClient.generateText(prompt, {
+      maxRetries: 1,
+      systemPrompt: "You are a Spring Boot code quality expert. Fix quality warnings only. Return complete file content only.",
+    });
+
+    if (resp.success && resp.data) {
+      const improved = resp.data.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
+      state.fileMap.set(path, improved);
+      applyFileOperation(state, { file: path, action: "modify", content: improved });
+      logger.info(`Quality improvement applied to ${path}`);
+      anyFixed = true;
+    }
+  }
+
+  if (anyFixed) {
+    writeProgress(
+      res,
+      progressCounter,
+      "quality-pass",
+      "complete",
+      `Quality improvement pass complete: ${fileWarningMap.size} file(s) processed`,
+    );
+  }
+
+  return anyFixed;
 }
 
 async function pipeMigrationStream(

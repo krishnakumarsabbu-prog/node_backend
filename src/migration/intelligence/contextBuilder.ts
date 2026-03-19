@@ -166,11 +166,11 @@ export function buildCodebaseIntelligence(files: FileMap, analysis: ProjectAnaly
   const fileSummaries = extractFileSummaries(files);
   logger.info(`Extracted ${fileSummaries.length} file summaries`);
 
-  const dependencyGraph = buildDependencyGraph(fileSummaries);
-  logger.info(`Built dependency graph: ${dependencyGraph.nodes.length} nodes, ${dependencyGraph.edges.length} edges, ${dependencyGraph.summary.circularDependencies} cycles`);
-
   const xmlConfigs = parseXmlConfigs(files);
   logger.info(`Parsed ${xmlConfigs.length} XML config files`);
+
+  const dependencyGraph = buildDependencyGraph(fileSummaries, xmlConfigs);
+  logger.info(`Built dependency graph: ${dependencyGraph.nodes.length} nodes, ${dependencyGraph.edges.length} edges, ${dependencyGraph.summary.circularDependencies} cycles`);
 
   const buildSummary = analyzeBuildFile(files);
   logger.info(`Analyzed build file: type=${buildSummary.type}`);
