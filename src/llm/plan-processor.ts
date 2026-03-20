@@ -21,6 +21,7 @@ import { runPlanSanityCheck, injectSymbolWarningsIntoSteps } from "./agents/plan
 import { buildStepSymbolSummaries, buildSymbolContextBlock } from "./agents/symbol-extractor";
 import { checkCompleteness } from "./agents/completeness-checker";
 import type { ProjectArchitecture } from "./architecture/detector";
+import { bootstrapArchitectureFromText } from "./architecture/detector";
 import { formatArchitectureBlock, formatArchitectureConstraintRule } from "./architecture/formatter";
 
 const TEST_INTENT_PATTERNS = [
@@ -345,6 +346,12 @@ DEFINITION OF DONE (each step must satisfy ALL of these):
 - Every created component is wired and reachable from the application entry point
 - Feature is usable end-to-end, not just scaffolded
 
+STEP GRANULARITY ENFORCEMENT (HARD RULE — checked after planning):
+- If the request mentions 2 or more distinct pages, tabs, routes, features, or modules: produce AT LEAST 2 steps
+- If the request implies changes across 3+ layers (data + logic + UI + routing + navigation): produce AT LEAST 3 steps
+- NEVER collapse the entire request into 1 step unless it is genuinely a single atomic change (e.g., "fix this typo", "change this colour")
+- When a request adds new pages/tabs: Step 1 = create page components, Step 2 = wire routes and navigation (if routing + navigation both exist in the project)
+
 FORBIDDEN:
 - Skeleton code or empty method bodies
 - Placeholder UI (headers only, "coming soon" content)
@@ -373,12 +380,59 @@ Think through what each feature needs to be complete and usable end-to-end. Each
   try {
     const cleaned = resp.text.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "");
     const parsed = JSON.parse(cleaned) as PlanStep[];
-    logger.info(`Generated ${parsed.length} steps from user question`);
-    return parsed;
+
+    const enforced = enforceStepGranularity(parsed, userQuestion, architectureBlock ?? "");
+    logger.info(`Generated ${parsed.length} steps from user question (after granularity enforcement: ${enforced.length})`);
+    return enforced;
   } catch (err: any) {
     logger.error("Failed to parse LLM step response as JSON, falling back to single step", err);
     return [{ index: 1, heading: "Implement Request", details: userQuestion }];
   }
+}
+
+function enforceStepGranularity(
+  steps: PlanStep[],
+  userQuestion: string,
+  architectureBlock: string,
+): PlanStep[] {
+  if (steps.length !== 1) return steps;
+
+  const q = userQuestion.toLowerCase();
+  const hasMultipleFeatures =
+    /\b(and|,)\b/.test(q) &&
+    /\b(page|tab|route|feature|module|section|component|screen|view)\b/.test(q);
+
+  const hasRoutingAndNav =
+    /routing.*true/i.test(architectureBlock) &&
+    /navigation.*true/i.test(architectureBlock);
+
+  if (!hasMultipleFeatures) return steps;
+
+  const singleStep = steps[0];
+
+  if (hasRoutingAndNav) {
+    const step1: PlanStep = {
+      index: 1,
+      heading: singleStep.heading.replace(/^(Add|Create|Implement|Build)\s+/i, "Create page components for ") || `Create page components: ${singleStep.heading}`,
+      details: singleStep.details +
+        `\n\nFOCUS FOR THIS STEP: Create only the page/component files. Do NOT yet update the router or navigation bar — that is handled in the next step.`,
+    };
+    const step2: PlanStep = {
+      index: 2,
+      heading: `Wire routes and navigation for: ${singleStep.heading}`,
+      details: `Update the router configuration to add routes for the new pages created in Step 1.\nUpdate the navigation bar/header component to include links to the new pages.\nEnsure all routes are accessible from the main navigation and the app entry point.\n\nOriginal context:\n${singleStep.details}`,
+    };
+    logger.info(`[enforceStepGranularity] Split 1 step into 2 (pages + routing/nav): "${singleStep.heading}"`);
+    return [step1, step2];
+  }
+
+  const step1: PlanStep = {
+    index: 1,
+    heading: singleStep.heading,
+    details: singleStep.details +
+      `\n\nSPLIT NOTE: This step covers the primary implementation. Create all page/component files and connect them to the application.`,
+  };
+  return [step1];
 }
 
 type ProjectEcosystem =
@@ -1161,6 +1215,8 @@ function buildFileStepMessages(
   step: PlanStep,
   userQuestion: string,
   files: FileMap,
+  architectureBlock?: string | null,
+  architectureConstraints?: string | null,
 ): Messages {
   const stepMessages: Messages = [...messages];
 
@@ -1233,6 +1289,8 @@ function buildFileStepMessages(
     id: generateId(),
     role: "user",
     content: [
+      architectureBlock ?? "",
+      architectureConstraints ?? "",
       `You are processing files one by one to fulfill this request: "${userQuestion}"`,
       ``,
       `## All files to be processed (${steps.length} total):`,
@@ -1392,8 +1450,22 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     clientAbortSignal,
   } = opts;
 
-  const archBlock = architecture ? formatArchitectureBlock(architecture) : null;
-  const archConstraints = architecture ? formatArchitectureConstraintRule(architecture) : null;
+  const isEmpty = Object.keys(files).filter((k) => (files[k] as any)?.type === "file").length === 0;
+  let resolvedArchitecture = architecture ?? null;
+
+  if (isEmpty && (!resolvedArchitecture || resolvedArchitecture.framework === "unknown")) {
+    const inferText = (implementPlan ? extractPlanContent(files) : null) ?? userQuestion ?? "";
+    if (inferText) {
+      const bootstrapped = bootstrapArchitectureFromText(inferText);
+      if (bootstrapped) {
+        resolvedArchitecture = bootstrapped;
+        logger.info(`[${requestId}] Empty project — bootstrapped architecture from text: framework=${bootstrapped.framework} lang=${bootstrapped.language} type=${bootstrapped.projectType}`);
+      }
+    }
+  }
+
+  const archBlock = resolvedArchitecture ? formatArchitectureBlock(resolvedArchitecture) : null;
+  const archConstraints = resolvedArchitecture ? formatArchitectureConstraintRule(resolvedArchitecture) : null;
 
   // ── Mode resolution ────────────────────────────────────────────────────────
   //
@@ -1629,7 +1701,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
 
     const stepMessages =
       executionMode === "files"
-        ? buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles)
+        ? buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles, archBlock, archConstraints)
         : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints);
 
     let filesToUse: FileMap = accumulatedFiles;

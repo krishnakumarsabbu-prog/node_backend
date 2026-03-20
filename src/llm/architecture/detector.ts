@@ -100,6 +100,68 @@ function stripProjectPrefix(path: string): string {
   return path.replace(/^\/home\/project\//, "");
 }
 
+export function bootstrapArchitectureFromText(text: string): ProjectArchitecture | null {
+  const lower = text.toLowerCase();
+
+  let framework: Framework = "unknown";
+  let language: Language = "unknown";
+  let projectType: ProjectType = "frontend";
+
+  if (/\bnext\.?js\b/.test(lower)) { framework = "nextjs"; language = "typescript"; projectType = "fullstack"; }
+  else if (/\bsvelte\b/.test(lower)) { framework = "svelte"; language = "typescript"; projectType = "frontend"; }
+  else if (/\bvue\b/.test(lower)) { framework = "vue"; language = "typescript"; projectType = "frontend"; }
+  else if (/\bangular\b/.test(lower)) { framework = "angular"; language = "typescript"; projectType = "frontend"; }
+  else if (/\breact\b/.test(lower)) { framework = "react"; language = "typescript"; projectType = "frontend"; }
+  else if (/\bfastapi\b/.test(lower)) { framework = "fastapi"; language = "python"; projectType = "backend"; }
+  else if (/\bdjango\b/.test(lower)) { framework = "django"; language = "python"; projectType = "backend"; }
+  else if (/\bflask\b/.test(lower)) { framework = "flask"; language = "python"; projectType = "backend"; }
+  else if (/\bspring[\s-]boot\b/.test(lower)) { framework = "spring-boot"; language = "java"; projectType = "backend"; }
+  else if (/\bnestjs\b/.test(lower)) { framework = "nestjs"; language = "typescript"; projectType = "backend"; }
+  else if (/\bhono\b/.test(lower)) { framework = "hono"; language = "typescript"; projectType = "backend"; }
+  else if (/\bexpress\b/.test(lower)) { framework = "express"; language = "typescript"; projectType = "backend"; }
+  else if (/\brails\b/.test(lower)) { framework = "rails"; language = "ruby"; projectType = "backend"; }
+  else if (/\blaravel\b/.test(lower)) { framework = "laravel"; language = "php"; projectType = "backend"; }
+  else if (/\bgin\b/.test(lower)) { framework = "gin"; language = "go"; projectType = "backend"; }
+  else if (/\bfiber\b/.test(lower)) { framework = "fiber"; language = "go"; projectType = "backend"; }
+  else if (/\b(web\s*app|portal|dashboard|ecommerce|e-commerce|frontend|ui)\b/.test(lower)) {
+    framework = "react"; language = "typescript"; projectType = "frontend";
+  } else if (/\b(api|rest|graphql|backend|server|service|microservice)\b/.test(lower)) {
+    framework = "express"; language = "typescript"; projectType = "backend";
+  }
+
+  if (framework === "unknown") return null;
+
+  const isFrontend = ["react", "nextjs", "angular", "vue", "svelte", "solid"].includes(framework);
+  const isBackend = ["spring-boot", "express", "fastapi", "django", "flask", "rails", "laravel", "gin", "fiber", "nestjs", "hono"].includes(framework);
+
+  return {
+    language,
+    framework,
+    projectType,
+    entryPoints: [],
+    capabilities: {
+      routing: isFrontend || framework === "nextjs",
+      navigation: isFrontend,
+      api: isBackend || framework === "nextjs",
+      database: /\b(database|db|postgres|mysql|sqlite|mongodb|prisma|supabase|drizzle)\b/.test(lower),
+      stateManagement: /\b(redux|zustand|jotai|recoil|mobx|pinia|ngrx)\b/.test(lower),
+      auth: /\b(auth|login|signup|sign[\s-]in|jwt|session|oauth)\b/.test(lower),
+      testing: false,
+    },
+    layers: {
+      entry: [],
+      routing: [],
+      controller: [],
+      service: [],
+      data: [],
+      ui: isFrontend ? ["src/components", "src/pages"] : [],
+      config: [],
+    },
+    packageManager: isBackend && language === "java" ? "maven" : language === "python" ? "pip" : language === "go" ? "go" : "npm",
+    testFramework: null,
+  };
+}
+
 export function detectArchitecture(files: FileMap): ProjectArchitecture {
   const paths = getFilePaths(files);
   const shortPaths = paths.map(stripProjectPrefix);
