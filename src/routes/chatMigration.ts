@@ -17,8 +17,6 @@ export interface MigrationRequest {
   messages: Messages;
   workDir: string;
   migrationAction?: "plan" | "implement";
-  migrationPlan?: any;
-  migrationDocument?: string;
 }
 
 export class ChatMigrationHandler {
@@ -115,24 +113,12 @@ export class ChatMigrationHandler {
         label: "migration-plan",
         status: "in-progress",
         order: progressCounter++,
-        message: "Step 3/4 — Generating migration plan (LLM streaming: document + task graph)...",
+        message: "Step 3/4 — Generating migration plan (LLM call: document + task graph)...",
       } satisfies ProgressAnnotation);
-
-      const planMessageId = generateId();
-      res.write(`f:${JSON.stringify({ messageId: planMessageId })}\n`);
 
       const { markdownContent, plan } = await this.runner.generateMigrationDocument(
         request.files,
         userRequest,
-        (token: string) => {
-          if (!res.writableEnded && !res.destroyed) {
-            res.write(`0:${JSON.stringify(token)}\n`);
-          }
-        },
-      );
-
-      res.write(
-        `e:${JSON.stringify({ finishReason: "stop", usage: { promptTokens: 0, completionTokens: 0 } })}\n`,
       );
 
       writeDataPart(res, {
@@ -148,16 +134,18 @@ export class ChatMigrationHandler {
         label: "migration-stream",
         status: "in-progress",
         order: progressCounter++,
-        message: "Step 4/4 — Writing migration.md to project...",
+        message: "Step 4/4 — Writing migration.md and tasks.json to project...",
       } satisfies ProgressAnnotation);
 
       const messageId = generateId();
       res.write(`f:${JSON.stringify({ messageId })}\n`);
 
-      const migrationFilePath = "/home/project/migration.md";
-      const fileBlock = `<cortexAction type="file" filePath="${migrationFilePath}">${markdownContent}</cortexAction>`;
+      const tasksJson = JSON.stringify(plan.tasks, null, 2);
+      const mdBlock = `<cortexArtifact id="migration-md" type="file" filePath="/home/project/migration.md" title="Migration Plan">\n${markdownContent}\n</cortexArtifact>`;
+      const tasksBlock = `<cortexArtifact id="migration-tasks" type="file" filePath="/home/project/tasks.json" title="Migration Tasks">\n${tasksJson}\n</cortexArtifact>`;
+      const combined = `${mdBlock}\n\n${tasksBlock}`;
 
-      const chunks = fileBlock.match(/.{1,500}/gs) ?? [fileBlock];
+      const chunks = combined.match(/.{1,500}/gs) ?? [combined];
       for (const chunk of chunks) {
         if (!res.writableEnded && !res.destroyed) {
           res.write(`0:${JSON.stringify(chunk)}\n`);
@@ -168,7 +156,7 @@ export class ChatMigrationHandler {
         `e:${JSON.stringify({ finishReason: "stop", usage: { promptTokens: 0, completionTokens: 0 } })}\n`,
       );
 
-      logger.info(`[migration-plan] Streamed migration.md (${markdownContent.length} chars) as cortexAction file block`);
+      logger.info(`[migration-plan] Wrote migration.md (${markdownContent.length} chars) and tasks.json (${plan.tasks.length} tasks) as cortexArtifact blocks`);
 
       writeMessageAnnotationPart(res, {
         type: "migration_plan",
@@ -192,7 +180,7 @@ export class ChatMigrationHandler {
         label: "migration-stream",
         status: "complete",
         order: progressCounter++,
-        message: `Step 4/4 — Done. migration.md ready (${markdownContent.length} chars). Tasks: ${taskBreakdown}. Complexity: ${plan.estimatedComplexity || "medium"}. Review migration.md then click Implement Migration to proceed.`,
+        message: `Step 4/4 — Done. migration.md and tasks.json written. Tasks: ${taskBreakdown}. Complexity: ${plan.estimatedComplexity || "medium"}. Review migration.md then click Implement Migration to proceed.`,
       } satisfies ProgressAnnotation);
 
       logger.info(`Migration plan generated for ${plan.migrationType} migration`);
@@ -225,12 +213,33 @@ export class ChatMigrationHandler {
   ): Promise<number> {
     logger.info("Handling migration plan execution");
 
-    if (!request.migrationPlan) {
-      throw new Error("Migration plan is required for execution");
+    const tasksFile = request.files["/home/project/tasks.json"];
+    const markdownFile = request.files["/home/project/migration.md"];
+
+    if (!tasksFile || !("content" in tasksFile)) {
+      throw new Error("tasks.json not found in project files — run Plan Migration first");
     }
 
-    const plan: MigrationPlan = request.migrationPlan;
-    const migrationDocument: string | undefined = request.migrationDocument;
+    let plan: MigrationPlan;
+    try {
+      const rawTasks = JSON.parse((tasksFile as any).content as string);
+      plan = {
+        migrationType: "spring-mvc-to-boot",
+        estimatedComplexity: rawTasks.length > 20 ? "high" : rawTasks.length > 8 ? "medium" : "low",
+        summary: {
+          filesToModify: rawTasks.filter((t: any) => t.action === "modify").length,
+          filesToCreate: rawTasks.filter((t: any) => t.action === "create").length,
+          filesToDelete: rawTasks.filter((t: any) => t.action === "delete").length,
+        },
+        tasks: rawTasks,
+      };
+    } catch {
+      throw new Error("tasks.json is not valid JSON — re-run Plan Migration to regenerate");
+    }
+
+    const migrationDocument: string | undefined =
+      markdownFile && "content" in markdownFile ? (markdownFile as any).content as string : undefined;
+
     const tasks = plan.tasks || [];
 
     writeDataPart(res, {

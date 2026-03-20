@@ -31,8 +31,6 @@ export async function handleMigrate(
     apiKeys,
     providerSettings,
     migrationAction,
-    migrationPlan,
-    migrationDocument,
   } = body;
 
   logger.info(`[${requestId}] Migration mode: action=${migrationAction || "plan"}`);
@@ -41,7 +39,7 @@ export async function handleMigrate(
   const migrationMcpService = MCPService.getInstance();
 
   try {
-    if (migrationAction === "implement" && migrationPlan) {
+    if (migrationAction === "implement") {
       const migrationStreamingOptions: StreamingOptions = {
         toolChoice: "auto" as const,
         tools: migrationMcpService.toolsWithoutExecute,
@@ -55,8 +53,6 @@ export async function handleMigrate(
           messages,
           workDir: WORK_DIR,
           migrationAction,
-          migrationPlan,
-          migrationDocument,
         },
         writeDataPart,
         writeMessageAnnotationPart,
