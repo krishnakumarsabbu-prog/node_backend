@@ -81,10 +81,17 @@ export async function handleMigrate(
     }
 
     ctx.progressCounter = progressCounter;
+
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(`d:${JSON.stringify({ finishReason: "stop", usage: { promptTokens: 0, completionTokens: 0 } })}\n`);
+    }
     res.end();
     logger.info(`[${requestId}] Migration complete elapsedMs=${Date.now() - startedAt}`);
   } catch (error) {
     logger.error(`[${requestId}] Migration failed: ${(error as Error).message}`);
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(`d:${JSON.stringify({ finishReason: "error", usage: { promptTokens: 0, completionTokens: 0 } })}\n`);
+    }
     res.end();
   }
 }

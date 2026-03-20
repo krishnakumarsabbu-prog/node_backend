@@ -334,6 +334,9 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
 
   if (task.action === "delete") {
     applyFileOperation(state, { file: task.file, action: "delete" }, task.id);
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(`2:[${JSON.stringify({ type: "file-deleted", filePath: task.file, taskId: task.id })}]\n`);
+    }
     writeProgress(
       res,
       progressCounter,
@@ -420,6 +423,11 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
           };
           applyFileOperation(state, op, task.id);
           updateGlobalStateFromContent(state, filePath, (content as any).content);
+
+          if (!res.writableEnded && !res.destroyed) {
+            const eventType = resolvedAction === "create" ? "file-created" : "file-modified";
+            res.write(`2:[${JSON.stringify({ type: eventType, filePath, taskId: task.id })}]\n`);
+          }
         }
       } else {
         logger.warn(`Task ${task.id} produced 0 extractable files from response`);

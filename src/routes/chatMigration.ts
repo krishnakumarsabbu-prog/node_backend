@@ -115,12 +115,24 @@ export class ChatMigrationHandler {
         label: "migration-plan",
         status: "in-progress",
         order: progressCounter++,
-        message: "Step 3/4 — Generating migration plan (LLM call: document + task graph generation)...",
+        message: "Step 3/4 — Generating migration plan (LLM streaming: document + task graph)...",
       } satisfies ProgressAnnotation);
+
+      const planMessageId = generateId();
+      res.write(`f:${JSON.stringify({ messageId: planMessageId })}\n`);
 
       const { markdownContent, plan } = await this.runner.generateMigrationDocument(
         request.files,
         userRequest,
+        (token: string) => {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write(`0:${JSON.stringify(token)}\n`);
+          }
+        },
+      );
+
+      res.write(
+        `e:${JSON.stringify({ finishReason: "stop", usage: { promptTokens: 0, completionTokens: 0 } })}\n`,
       );
 
       writeDataPart(res, {
@@ -136,7 +148,7 @@ export class ChatMigrationHandler {
         label: "migration-stream",
         status: "in-progress",
         order: progressCounter++,
-        message: "Step 4/4 — Streaming migration.md to project...",
+        message: "Step 4/4 — Writing migration.md to project...",
       } satisfies ProgressAnnotation);
 
       const messageId = generateId();
@@ -145,9 +157,11 @@ export class ChatMigrationHandler {
       const migrationFilePath = "/home/project/migration.md";
       const fileBlock = `<cortexAction type="file" filePath="${migrationFilePath}">${markdownContent}</cortexAction>`;
 
-      const chunks = fileBlock.match(/.{1,1000}/gs) ?? [fileBlock];
+      const chunks = fileBlock.match(/.{1,500}/gs) ?? [fileBlock];
       for (const chunk of chunks) {
-        res.write(`0:${JSON.stringify(chunk)}\n`);
+        if (!res.writableEnded && !res.destroyed) {
+          res.write(`0:${JSON.stringify(chunk)}\n`);
+        }
       }
 
       res.write(
@@ -166,6 +180,11 @@ export class ChatMigrationHandler {
         },
         migrationDocument: markdownContent,
       } as ContextAnnotation);
+
+      writeMessageAnnotationPart(res, {
+        type: "usage",
+        value: { completionTokens: 0, promptTokens: 0, totalTokens: 0 },
+      });
 
       const taskBreakdown = `modify=${plan.summary.filesToModify}, create=${plan.summary.filesToCreate}, delete=${plan.summary.filesToDelete}`;
       writeDataPart(res, {
@@ -317,6 +336,11 @@ export class ChatMigrationHandler {
             : `Execution finished with ${execResult.errors.length} error(s). Review errors above.`,
         },
       } as ContextAnnotation);
+
+      writeMessageAnnotationPart(res, {
+        type: "usage",
+        value: { completionTokens: execResult.totalTokens, promptTokens: 0, totalTokens: execResult.totalTokens },
+      });
     } else {
       const progressRef = { value: progressCounter };
       progressRef.value = await this.executeWithRunner(

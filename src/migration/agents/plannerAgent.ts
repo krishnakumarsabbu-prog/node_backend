@@ -1,4 +1,4 @@
-import { generateText } from "ai";
+import { generateText, streamText } from "ai";
 import type { ProjectAnalysis, MigrationPlan, MigrationTask, MigrationTaskCategory } from "../types/migrationTypes";
 import type { FileMap } from "../../llm/constants";
 import { MigrationPlanSchema } from "../schemas/migrationSchema";
@@ -41,7 +41,8 @@ export class PlannerAgent {
   async generateMigrationDocument(
     files: FileMap,
     analysis: ProjectAnalysis,
-    userRequest: string
+    userRequest: string,
+    onToken?: (token: string) => void,
   ): Promise<MigrationDocument> {
     logger.info("Building codebase intelligence for migration document generation");
 
@@ -75,11 +76,30 @@ export class PlannerAgent {
 
       logger.info(`Migration document prompt built: ${prompt.length} chars`);
 
-      const result = await generateText({
-        model: getTachyonModel(),
-        messages: [{ role: "user", content: prompt }],
-        maxTokens: 8192,
-      });
+      let resultText: string;
+
+      if (onToken) {
+        const streamResult = streamText({
+          model: getTachyonModel(),
+          messages: [{ role: "user", content: prompt }],
+          maxTokens: 8192,
+        });
+        const chunks: string[] = [];
+        for await (const chunk of streamResult.textStream) {
+          onToken(chunk);
+          chunks.push(chunk);
+        }
+        resultText = chunks.join("");
+      } else {
+        const result = await generateText({
+          model: getTachyonModel(),
+          messages: [{ role: "user", content: prompt }],
+          maxTokens: 8192,
+        });
+        resultText = result.text.trim();
+      }
+
+      const result = { text: resultText };
 
       let markdownContent: string;
       let plan: MigrationPlan;
