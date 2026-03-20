@@ -4,6 +4,8 @@ import { extractFileSummaries, serializeFileSummary, type FileSummary } from "./
 import { buildDependencyGraph, serializeDependencyGraph, type DependencyGraph, type GraphSummary } from "./dependencyGraph";
 import { parseXmlConfigs, serializeAllXmlSummaries, type XmlFileSummary } from "./xmlConfigParser";
 import { analyzeBuildFile, serializeBuildSummary, type BuildFileSummary } from "./dependencyAnalyzer";
+import { buildIR, serializeIR } from "../ir/irBuilder";
+import type { IrProjectModel } from "../ir/irTypes";
 import { createScopedLogger } from "../../utils/logger";
 
 const logger = createScopedLogger("context-builder");
@@ -52,8 +54,11 @@ export interface CodebaseIntelligence {
   dependencyGraph: DependencyGraph;
   xmlConfigs: XmlFileSummary[];
   buildSummary: BuildFileSummary;
+  buildConfig?: { hasBootParent: boolean; hasBootPlugin: boolean };
 
   migrationPatterns: MigrationPattern[];
+
+  ir: IrProjectModel;
 
   serialized: {
     fileSummaries: string;
@@ -62,6 +67,7 @@ export interface CodebaseIntelligence {
     buildSummary: string;
     patterns: string;
     detectedPatterns: string;
+    ir: string;
   };
 }
 
@@ -213,21 +219,30 @@ export function buildCodebaseIntelligence(files: FileMap, analysis: ProjectAnaly
     models,
   };
 
-  const intelligence: CodebaseIntelligence = {
+  const partialIntelligence = {
     framework: analysis.framework,
     buildTool: analysis.buildTool,
-
     stats,
     patterns: detectedPatterns,
     graphSummary,
     keyFiles,
-
     fileSummaries,
     dependencyGraph,
     xmlConfigs,
     buildSummary,
     migrationPatterns,
+    buildConfig: {
+      hasBootParent: buildSummary.hasSpringBootParent ?? false,
+      hasBootPlugin: buildSummary.hasSpringBootPlugin ?? false,
+    },
+  } as Omit<CodebaseIntelligence, "ir" | "serialized">;
 
+  const ir = buildIR(partialIntelligence as CodebaseIntelligence);
+  logger.info(`IR built: ${ir.components.length} components, ${ir.requiredTransformations.length} transformations`);
+
+  const intelligence: CodebaseIntelligence = {
+    ...partialIntelligence,
+    ir,
     serialized: {
       fileSummaries: fileSummaries.map(serializeFileSummary).join("\n\n"),
       dependencyGraph: serializeDependencyGraph(dependencyGraph),
@@ -235,6 +250,7 @@ export function buildCodebaseIntelligence(files: FileMap, analysis: ProjectAnaly
       buildSummary: serializeBuildSummary(buildSummary),
       patterns: serializeMigrationPatterns(migrationPatterns),
       detectedPatterns: serializeDetectedPatterns(detectedPatterns),
+      ir: serializeIR(ir),
     },
   };
 
@@ -305,6 +321,9 @@ export function buildMigrationContextPrompt(intelligence: CodebaseIntelligence, 
   ].slice(0, MAX_PROMPT_FILES);
 
   sections.push(prioritizedSummaries.map(serializeFileSummary).join("\n\n"));
+
+  sections.push(`\n## INTERMEDIATE REPRESENTATION (IR)`);
+  sections.push(intelligence.serialized.ir);
 
   sections.push(`\n## REQUIRED MIGRATION ACTIONS`);
   sections.push(intelligence.serialized.patterns);

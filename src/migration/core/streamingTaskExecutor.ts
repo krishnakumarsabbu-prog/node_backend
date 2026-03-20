@@ -17,8 +17,10 @@ import {
   markTaskFailed,
   registerBean,
   serializeGlobalDecisions,
+  getChangeSet,
   type MigrationState,
 } from "./migrationState";
+import { serializeChangeSet, type ChangeSet } from "./diffTracker";
 import { LLMClient } from "../llm/llmClient";
 
 const logger = createScopedLogger("streaming-task-executor");
@@ -68,6 +70,7 @@ export interface StreamingTaskResult {
   staticIssues: string[];
   taskResults: Array<{ taskId: string; file: string; success: boolean; error?: string }>;
   confidence: ConfidenceScore;
+  changeSet: ChangeSet;
 }
 
 function writeProgress(
@@ -261,9 +264,21 @@ export async function executeTaskGraphStreaming(
     `Migration complete: ${taskResults.filter((t) => t.success).length}/${tasks.length} tasks succeeded, tokens=${cumulativeUsage.totalTokens}, static=${finalStaticResult.passed ? "PASSED" : "FAILED"}, confidence=${confidence.overallScore}/100`,
   );
 
+  const changeSet = getChangeSet(state);
+
   writeAnnotation(res, {
     type: "migration_confidence",
     confidence,
+  });
+
+  writeAnnotation(res, {
+    type: "migration_changeset",
+    summary: serializeChangeSet(changeSet),
+    createdFiles: changeSet.createdFiles,
+    modifiedFiles: changeSet.modifiedFiles,
+    deletedFiles: changeSet.deletedFiles,
+    totalLinesAdded: changeSet.totalLinesAdded,
+    totalLinesRemoved: changeSet.totalLinesRemoved,
   });
 
   return {
@@ -279,6 +294,7 @@ export async function executeTaskGraphStreaming(
     staticIssues: finalStaticResult.issues.map((i) => `[${i.severity.toUpperCase()}] ${i.type}: ${i.message}`),
     taskResults,
     confidence,
+    changeSet,
   };
 }
 
@@ -317,7 +333,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
   );
 
   if (task.action === "delete") {
-    applyFileOperation(state, { file: task.file, action: "delete" });
+    applyFileOperation(state, { file: task.file, action: "delete" }, task.id);
     writeProgress(
       res,
       progressCounter,
@@ -402,7 +418,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
             action: resolvedAction,
             content: (content as any).content,
           };
-          applyFileOperation(state, op);
+          applyFileOperation(state, op, task.id);
           updateGlobalStateFromContent(state, filePath, (content as any).content);
         }
       } else {
@@ -870,39 +886,55 @@ async function runStaticAutoFixLoop(opts: StaticAutoFixOpts): Promise<{ errors: 
     );
 
     const affectedFiles = [...new Set(errorIssues.map((i) => i.file))].filter((f) => f !== "project");
+    const batchFiles = affectedFiles.slice(0, 5);
 
-    for (const filePath of affectedFiles.slice(0, 3)) {
+    const batchSections: string[] = [];
+    batchSections.push(`Fix the following static validation errors across ${batchFiles.length} Spring Boot file(s).`);
+    batchSections.push(`\nRULES (MANDATORY):`);
+    batchSections.push(`- NEVER use field injection — ALWAYS constructor injection`);
+    batchSections.push(`- NEVER reference XML files — ALWAYS Spring Boot annotations`);
+    batchSections.push(`- ALWAYS include SpringApplication.run() if @SpringBootApplication is present`);
+    batchSections.push(`- NEVER change business logic`);
+    batchSections.push(`\nReturn a JSON object where each key is the exact file path and the value is the complete corrected file content.`);
+    batchSections.push(`Format: { "path/to/File.java": "...complete file content...", ... }`);
+    batchSections.push(`Return ONLY valid JSON — no markdown fences, no explanation.\n`);
+
+    for (const filePath of batchFiles) {
       const content = state.fileMap.get(filePath);
       if (!content) continue;
-
       const fileErrors = errorIssues.filter((i) => i.file === filePath);
-      const prompt = `Fix the following static validation errors in this Spring Boot file.
+      batchSections.push(`FILE: ${filePath}`);
+      batchSections.push(`ERRORS:`);
+      batchSections.push(fileErrors.map((e) => `  - [${e.type}] ${e.message}`).join("\n"));
+      batchSections.push("```java");
+      batchSections.push(content.slice(0, 2000) + (content.length > 2000 ? "\n...[truncated]" : ""));
+      batchSections.push("```\n");
+    }
 
-ERRORS:
-${fileErrors.map((e) => `- [${e.type}] ${e.message}`).join("\n")}
+    const batchPrompt = batchSections.join("\n");
+    const resp = await llmClient.generateText(batchPrompt, {
+      maxRetries: 1,
+      systemPrompt: "You are a Spring Boot expert. Fix reported errors across multiple files. Return a single JSON object mapping file paths to complete corrected content. No markdown, no explanation.",
+    });
 
-RULES:
-- NEVER use field injection — ALWAYS constructor injection
-- NEVER reference XML files — ALWAYS Spring Boot annotations
-- ALWAYS include SpringApplication.run() if @SpringBootApplication is present
-- NEVER change business logic
-
-FILE: ${filePath}
-\`\`\`java
-${content.slice(0, 3000)}
-\`\`\`
-
-Return ONLY the complete corrected file content — no markdown, no explanation.`;
-
-      const resp = await llmClient.generateText(prompt, {
-        maxRetries: 1,
-        systemPrompt: "You are a Spring Boot expert. Fix only the reported errors. Return complete file content only, no markdown.",
-      });
-      if (resp.success && resp.data) {
-        const fixed = resp.data.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
-        state.fileMap.set(filePath, fixed);
-        applyFileOperation(state, { file: filePath, action: "modify", content: fixed });
-        logger.info(`Static auto-fix applied to ${filePath} (attempt ${attempt})`);
+    if (resp.success && resp.data) {
+      let jsonText = resp.data.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
+      try {
+        const fixes: Record<string, string> = JSON.parse(jsonText);
+        for (const [filePath, fixedContent] of Object.entries(fixes)) {
+          if (typeof fixedContent !== "string" || !fixedContent.trim()) continue;
+          state.fileMap.set(filePath, fixedContent);
+          applyFileOperation(state, { file: filePath, action: "modify", content: fixedContent });
+          logger.info(`Batch static auto-fix applied to ${filePath} (attempt ${attempt})`);
+        }
+      } catch {
+        logger.warn(`Batch static fix response was not valid JSON — falling back to per-file strip`);
+        const singleFixed = jsonText.replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
+        if (batchFiles.length === 1) {
+          const singlePath = batchFiles[0];
+          state.fileMap.set(singlePath, singleFixed);
+          applyFileOperation(state, { file: singlePath, action: "modify", content: singleFixed });
+        }
       }
     }
   }

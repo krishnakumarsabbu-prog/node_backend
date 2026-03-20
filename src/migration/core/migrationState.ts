@@ -1,5 +1,6 @@
 import type { FileOperation } from "../types/migrationTypes";
 import { createScopedLogger } from "../../utils/logger";
+import { computeDiff, buildChangeSet, type FileDiff, type ChangeSet } from "./diffTracker";
 
 const logger = createScopedLogger("migration-state");
 
@@ -26,6 +27,11 @@ export interface MigrationState {
   operations: FileOperation[];
   errors: ErrorLog[];
   globalDecisions: GlobalDecisions;
+  diffs: FileDiff[];
+}
+
+export function getChangeSet(state: MigrationState): ChangeSet {
+  return buildChangeSet(state.diffs);
 }
 
 export function createMigrationState(sourceFiles: Map<string, string>): MigrationState {
@@ -39,6 +45,7 @@ export function createMigrationState(sourceFiles: Map<string, string>): Migratio
     fileMap,
     operations: [],
     errors: [],
+    diffs: [],
     globalDecisions: {
       beanNames: new Map(),
       packageRoot: "",
@@ -64,7 +71,9 @@ export function markTaskFailed(state: MigrationState, taskId: string, reason: st
   });
 }
 
-export function applyFileOperation(state: MigrationState, op: FileOperation): void {
+export function applyFileOperation(state: MigrationState, op: FileOperation, taskId?: string): void {
+  const previousContent = state.fileMap.get(op.file);
+
   if (op.action === "delete") {
     state.fileMap.delete(op.file);
     logger.info(`Deleted: ${op.file}`);
@@ -72,7 +81,12 @@ export function applyFileOperation(state: MigrationState, op: FileOperation): vo
     state.fileMap.set(op.file, op.content);
     logger.info(`${op.action === "create" ? "Created" : "Updated"}: ${op.file}`);
   }
-  state.operations.push(op);
+
+  const enrichedOp: FileOperation = { ...op, previousContent };
+  state.operations.push(enrichedOp);
+
+  const diff = computeDiff(op.file, previousContent, op.content, op.action, taskId);
+  state.diffs.push(diff);
 }
 
 export function registerBean(state: MigrationState, beanName: string, sourceFile: string): void {
@@ -94,5 +108,7 @@ export function serializeGlobalDecisions(state: MigrationState): string {
   lines.push(`Removed XML Files: ${state.globalDecisions.removedXmlFiles.join(", ") || "(none)"}`);
   lines.push(`Completed Tasks: ${state.completedTasks.size}`);
   lines.push(`Failed Tasks: ${state.failedTasks.size}`);
+  const changeSet = buildChangeSet(state.diffs);
+  lines.push(`Files Changed So Far: created=${changeSet.createdFiles.length} modified=${changeSet.modifiedFiles.length} deleted=${changeSet.deletedFiles.length} (+${changeSet.totalLinesAdded}/-${changeSet.totalLinesRemoved} lines)`);
   return lines.join("\n");
 }
