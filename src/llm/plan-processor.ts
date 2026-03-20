@@ -24,7 +24,7 @@ import { validateTestFileOutput } from "./agents/test-file-validator";
 import type { ProjectArchitecture } from "./architecture/detector";
 import { bootstrapArchitectureFromText, extractArchitectureSchema, mergeSchemaIntoArchitecture } from "./architecture/detector";
 import { formatArchitectureBlock, formatArchitectureConstraintRule } from "./architecture/formatter";
-import { buildIRFromPlan, formatIRBlock } from "./ir/ir-builder";
+import { buildIRFromPlan, buildIRFromFiles, formatIRBlock, compressedIRSummary } from "./ir/ir-builder";
 import type { ProjectIR } from "./ir/ir-types";
 
 const TEST_INTENT_PATTERNS = [
@@ -1072,6 +1072,7 @@ function buildTopicStepMessages(
   architectureBlock?: string | null,
   architectureConstraints?: string | null,
   irBlock?: string | null,
+  irSummaryLine?: string | null,
 ): Messages {
   const stepMessages: Messages = [...messages];
 
@@ -1107,6 +1108,7 @@ function buildTopicStepMessages(
       content: [
         architectureBlock ?? "",
         architectureConstraints ?? "",
+        irSummaryLine ? `<!-- ${irSummaryLine} -->` : "",
         `## Plan Progress`,
         allStepsList,
         createdFilesFeedback,
@@ -1653,6 +1655,18 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     logger.info(`[${requestId}] ► Prepended mandatory package.json step (total steps now: ${steps.length})`);
   }
 
+  if (!usePlanMd && !projectIR) {
+    const nonEmptyFileCount = Object.keys(files).filter((k) => (files[k] as any)?.type === "file").length;
+    if (nonEmptyFileCount > 0) {
+      try {
+        projectIR = await buildIRFromFiles(files);
+        logger.info(`[${requestId}] [IR] question-mode IR from files: components=${projectIR.components.length} routes=${projectIR.routes.length}`);
+      } catch (irErr: any) {
+        logger.warn(`[${requestId}] [IR] buildIRFromFiles failed (non-fatal): ${irErr?.message}`);
+      }
+    }
+  }
+
   writer.writeData({
     type: "progress",
     label: "plan-parse",
@@ -1737,7 +1751,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     const stepMessages =
       executionMode === "files"
         ? buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles, archBlock, archConstraints)
-        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints, projectIR ? formatIRBlock(projectIR) : null);
+        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints, projectIR ? formatIRBlock(projectIR) : null, projectIR ? compressedIRSummary(projectIR) : null);
 
     let filesToUse: FileMap = accumulatedFiles;
     let contextSource = "full-accumulated";
@@ -1879,7 +1893,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
             }
 
             const repairedMessages = buildTopicStepMessages(
-              messages, steps, finalStep, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints, projectIR ? formatIRBlock(projectIR) : null,
+              messages, steps, finalStep, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints, projectIR ? formatIRBlock(projectIR) : null, projectIR ? compressedIRSummary(projectIR) : null,
             );
 
             const healResult = await runStreamStep(finalStep, repairedMessages);
@@ -1931,6 +1945,17 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
           logger.info(`${stepTag}   ↳ ${fp} (${chars} chars)`);
         }
 
+        if (projectIR) {
+          try {
+            const updatedIR = await buildIRFromFiles(accumulatedFiles);
+            const hadComponents = projectIR.components.length;
+            projectIR = updatedIR;
+            logger.info(`${stepTag} [IR] updated after step: components=${updatedIR.components.length} (was ${hadComponents}) routes=${updatedIR.routes.length}`);
+          } catch (irUpdateErr: any) {
+            logger.warn(`${stepTag} [IR] incremental update failed (non-fatal): ${irUpdateErr?.message}`);
+          }
+        }
+
         if (executionMode === "files" && isTestFile(step.heading)) {
           const testValidation = validateTestFileOutput(
             step.heading,
@@ -1941,13 +1966,64 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
             logger.warn(
               `${stepTag} [test-validator] score=${testValidation.score}/100 issues=${testValidation.issues.join("; ")}`,
             );
-            writer.writeData({
-              type: "progress",
-              label: `plan-step${step.index}-test-warn`,
-              status: "complete",
-              order: progressCounter.value++,
-              message: `Test file warning (step ${step.index}): ${testValidation.issues.join(" | ")}`,
-            } satisfies ProgressAnnotation);
+
+            const criticalIssues = testValidation.issues.filter(
+              (i) => i.startsWith("MISSING_DESCRIBE") || i.startsWith("MISSING_TEST_BLOCK") || i.startsWith("MISSING_ASSERTION"),
+            );
+
+            if (criticalIssues.length > 0) {
+              logger.info(`${stepTag} [test-validator] retrying test file generation (critical issues: ${criticalIssues.join("; ")})`);
+              writer.writeData({
+                type: "progress",
+                label: `plan-step${step.index}-test-retry`,
+                status: "in-progress",
+                order: progressCounter.value++,
+                message: `Step ${step.index}: test file incomplete (${criticalIssues[0]?.split(":")[0]}) — retrying...`,
+              } satisfies ProgressAnnotation);
+
+              const retryMessages = buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles, archBlock, archConstraints);
+              const retryResult = await runStreamStep(step, retryMessages);
+
+              if (retryResult.succeeded) {
+                const retryFiles = extractGeneratedFiles(retryResult.stepText, accumulatedFiles);
+                const retryValidation = validateTestFileOutput(
+                  step.heading,
+                  retryResult.stepText,
+                  resolvedArchitecture?.testFramework ?? null,
+                );
+                logger.info(`${stepTag} [test-validator] retry score=${retryValidation.score}/100 valid=${retryValidation.valid}`);
+                if (Object.keys(retryFiles).length > 0) {
+                  Object.assign(accumulatedFiles, retryFiles);
+                  finalStepText = retryResult.stepText;
+                }
+                writer.writeData({
+                  type: "progress",
+                  label: `plan-step${step.index}-test-retry`,
+                  status: "complete",
+                  order: progressCounter.value++,
+                  message: retryValidation.valid
+                    ? `Step ${step.index}: test file repaired (score ${retryValidation.score}/100)`
+                    : `Step ${step.index}: test file retry completed (score ${retryValidation.score}/100)`,
+                } satisfies ProgressAnnotation);
+              } else {
+                logger.warn(`${stepTag} [test-validator] retry stream failed — keeping original output`);
+                writer.writeData({
+                  type: "progress",
+                  label: `plan-step${step.index}-test-retry`,
+                  status: "complete",
+                  order: progressCounter.value++,
+                  message: `Step ${step.index}: test retry stream failed — original kept`,
+                } satisfies ProgressAnnotation);
+              }
+            } else {
+              writer.writeData({
+                type: "progress",
+                label: `plan-step${step.index}-test-warn`,
+                status: "complete",
+                order: progressCounter.value++,
+                message: `Test file warning (step ${step.index}): ${testValidation.issues.join(" | ")}`,
+              } satisfies ProgressAnnotation);
+            }
           } else {
             logger.info(`${stepTag} [test-validator] score=${testValidation.score}/100 ✓`);
           }
