@@ -141,8 +141,16 @@ export class ChatMigrationHandler {
       res.write(`f:${JSON.stringify({ messageId })}\n`);
 
       const tasksJson = JSON.stringify(plan.tasks, null, 2);
-      const mdBlock = `<cortexArtifact id="migration-md" type="file" filePath="/home/project/migration.md" title="Migration Plan">\n${markdownContent}\n</cortexArtifact>`;
-      const tasksBlock = `<cortexArtifact id="migration-tasks" type="file" filePath="/home/project/tasks.json" title="Migration Tasks">\n${tasksJson}\n</cortexArtifact>`;
+      const mdBlock = `<cortexArtifact id="migration-plan" title="Migration Plan">
+<cortexAction type="file" filePath="/home/project/migration.md" contentType="text/markdown">
+${markdownContent}
+</cortexAction>
+</cortexArtifact>`;
+      const tasksBlock = `<cortexArtifact id="migration-tasks" title="Migration Tasks">
+<cortexAction type="file" filePath="/home/project/tasks.json" contentType="application/json">
+${tasksJson}
+</cortexAction>
+</cortexArtifact>`;
       const combined = `${mdBlock}\n\n${tasksBlock}`;
 
       const chunks = combined.match(/.{1,500}/gs) ?? [combined];
