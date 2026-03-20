@@ -1,4 +1,9 @@
+import { generateText } from "ai";
+import { getTachyonModel } from "../../modules/llm/providers/tachyon";
+import { createScopedLogger } from "../../utils/logger";
 import type { FileMap } from "../constants";
+
+const logger = createScopedLogger("architecture-detector");
 
 export type Language =
   | "typescript"
@@ -599,4 +604,110 @@ function detectTestFramework(deps: Record<string, string>, paths: string[]): str
   if (short.some((p) => /vitest\.config/.test(p))) return "vitest";
   if (short.some((p) => /jest\.config/.test(p))) return "jest";
   return null;
+}
+
+export interface ArchitectureSchema {
+  frontend: string | null;
+  backend: string | null;
+  database: string | null;
+  mobile: string | null;
+  language: string | null;
+  testFramework: string | null;
+  stateManagement: string | null;
+  auth: string | null;
+  styling: string | null;
+  extras: string[];
+}
+
+const ARCH_SCHEMA_SYSTEM = `
+You are an expert software architect. Given a plan or description, extract the technology stack as a JSON object.
+
+Return ONLY valid JSON — no prose, no markdown fences.
+
+Schema:
+{
+  "frontend":       string | null,   // e.g. "react", "nextjs", "vue", "angular", "svelte", null
+  "backend":        string | null,   // e.g. "express", "nestjs", "fastapi", "django", "spring-boot", null
+  "database":       string | null,   // e.g. "postgres", "mysql", "sqlite", "mongodb", "supabase", null
+  "mobile":         string | null,   // e.g. "react-native", "expo", "flutter", null
+  "language":       string | null,   // primary: "typescript", "javascript", "python", "java", "go", etc.
+  "testFramework":  string | null,   // e.g. "vitest", "jest", "playwright", "cypress", null
+  "stateManagement":string | null,   // e.g. "redux", "zustand", "jotai", "pinia", null
+  "auth":           string | null,   // e.g. "supabase", "firebase", "jwt", "oauth", null
+  "styling":        string | null,   // e.g. "tailwind", "chakra", "mui", "scss", null
+  "extras":         string[]         // other notable libs, e.g. ["prisma", "stripe", "socket.io"]
+}
+
+Rules:
+- Infer from context even if not explicitly stated (e.g. "Next.js app" → frontend=nextjs, language=typescript)
+- Use null for anything not mentioned or not inferrable
+- extras must be an array (can be empty)
+- For ambiguous cases, prefer the more specific framework over "react"
+`;
+
+export async function extractArchitectureSchema(planText: string): Promise<ArchitectureSchema | null> {
+  try {
+    const resp = await generateText({
+      model: getTachyonModel(),
+      system: ARCH_SCHEMA_SYSTEM,
+      prompt: planText.slice(0, 3000),
+    });
+
+    const cleaned = resp.text.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "");
+    const parsed = JSON.parse(cleaned) as ArchitectureSchema;
+
+    logger.info(
+      `[arch-schema] extracted: frontend=${parsed.frontend} backend=${parsed.backend} db=${parsed.database} lang=${parsed.language}`,
+    );
+
+    return parsed;
+  } catch (err: any) {
+    logger.warn(`[arch-schema] LLM extraction failed (falling back to regex): ${err?.message}`);
+    return null;
+  }
+}
+
+export function mergeSchemaIntoArchitecture(
+  arch: ProjectArchitecture,
+  schema: ArchitectureSchema,
+): ProjectArchitecture {
+  const merged = { ...arch };
+
+  if (schema.language && merged.language === "unknown") {
+    merged.language = schema.language as Language;
+  }
+
+  if (schema.frontend) {
+    const fw = schema.frontend as Framework;
+    if (merged.framework === "unknown") merged.framework = fw;
+    if (merged.projectType === "backend") merged.projectType = schema.backend ? "fullstack" : "frontend";
+  }
+
+  if (schema.backend && !schema.frontend) {
+    if (merged.framework === "unknown") merged.framework = schema.backend as Framework;
+    if (merged.projectType === "frontend") merged.projectType = "backend";
+  }
+
+  if (schema.backend && schema.frontend) {
+    merged.projectType = "fullstack";
+    merged.capabilities = { ...merged.capabilities, api: true };
+  }
+
+  if (schema.database) {
+    merged.capabilities = { ...merged.capabilities, database: true };
+  }
+
+  if (schema.stateManagement) {
+    merged.capabilities = { ...merged.capabilities, stateManagement: true };
+  }
+
+  if (schema.auth) {
+    merged.capabilities = { ...merged.capabilities, auth: true };
+  }
+
+  if (schema.testFramework && !merged.testFramework) {
+    merged.testFramework = schema.testFramework;
+  }
+
+  return merged;
 }

@@ -20,9 +20,12 @@ import { buildSequentialExecutionPlan } from "./agents/sequential-executor";
 import { runPlanSanityCheck, injectSymbolWarningsIntoSteps } from "./agents/plan-sanity";
 import { buildStepSymbolSummaries, buildSymbolContextBlock } from "./agents/symbol-extractor";
 import { checkCompleteness } from "./agents/completeness-checker";
+import { validateTestFileOutput } from "./agents/test-file-validator";
 import type { ProjectArchitecture } from "./architecture/detector";
-import { bootstrapArchitectureFromText } from "./architecture/detector";
+import { bootstrapArchitectureFromText, extractArchitectureSchema, mergeSchemaIntoArchitecture } from "./architecture/detector";
 import { formatArchitectureBlock, formatArchitectureConstraintRule } from "./architecture/formatter";
+import { buildIRFromPlan, formatIRBlock } from "./ir/ir-builder";
+import type { ProjectIR } from "./ir/ir-types";
 
 const TEST_INTENT_PATTERNS = [
   /\b(write|add|create|generate|run|fix|update)\s+(a\s+)?(unit\s+)?tests?\b/i,
@@ -1068,6 +1071,7 @@ function buildTopicStepMessages(
   completedSteps?: CompletedStepMemory[],
   architectureBlock?: string | null,
   architectureConstraints?: string | null,
+  irBlock?: string | null,
 ): Messages {
   const stepMessages: Messages = [...messages];
 
@@ -1131,6 +1135,7 @@ function buildTopicStepMessages(
       content: [
         architectureBlock ?? "",
         architectureConstraints ?? "",
+        irBlock ?? "",
         `You are implementing a project plan step by step. There are ${steps.length} steps in total.`,
         ``,
         ...planContext,
@@ -1460,6 +1465,27 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
       if (bootstrapped) {
         resolvedArchitecture = bootstrapped;
         logger.info(`[${requestId}] Empty project — bootstrapped architecture from text: framework=${bootstrapped.framework} lang=${bootstrapped.language} type=${bootstrapped.projectType}`);
+      } else {
+        logger.info(`[${requestId}] Regex bootstrap returned null — running LLM schema extraction`);
+        try {
+          const schema = await extractArchitectureSchema(inferText);
+          if (schema) {
+            const baseArch: ProjectArchitecture = resolvedArchitecture ?? {
+              language: "unknown",
+              framework: "unknown",
+              projectType: "frontend",
+              entryPoints: [],
+              capabilities: { routing: false, navigation: false, api: false, database: false, stateManagement: false, auth: false, testing: false },
+              layers: { entry: [], routing: [], controller: [], service: [], data: [], ui: [], config: [] },
+              packageManager: "unknown",
+              testFramework: null,
+            };
+            resolvedArchitecture = mergeSchemaIntoArchitecture(baseArch, schema);
+            logger.info(`[${requestId}] LLM schema extraction complete: framework=${resolvedArchitecture.framework} lang=${resolvedArchitecture.language} type=${resolvedArchitecture.projectType}`);
+          }
+        } catch (schemaErr: any) {
+          logger.warn(`[${requestId}] LLM schema extraction failed (non-fatal): ${schemaErr?.message}`);
+        }
       }
     }
   }
@@ -1505,6 +1531,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
   let executionMode: ExecutionMode = "steps";
   let steps: PlanStep[] = [];
   let selectedFileList: Array<{ path: string; reason: string }> = [];
+  let projectIR: ProjectIR | null = null;
 
   // ── Branch A: implement plan.md ───────────────────────────────────────────
   if (usePlanMd) {
@@ -1535,6 +1562,14 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     logger.info(`[${requestId}] ► PLAN.MD parsed into ${steps.length} step(s) (context files: ${Object.keys(files).length})`);
     for (const s of steps) {
       logger.info(`[${requestId}]   step ${s.index}: ${s.heading}`);
+    }
+
+    try {
+      projectIR = await buildIRFromPlan(planContent!);
+      const irSummary = formatIRBlock(projectIR);
+      logger.info(`[${requestId}] [IR] ${irSummary.slice(0, 200)}`);
+    } catch (irErr: any) {
+      logger.warn(`[${requestId}] [IR] build failed (non-fatal): ${irErr?.message}`);
     }
 
   // ── Branch B: user question (plan.md irrelevant here) ─────────────────────
@@ -1702,7 +1737,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
     const stepMessages =
       executionMode === "files"
         ? buildFileStepMessages(messages, steps, step, userQuestion!, accumulatedFiles, archBlock, archConstraints)
-        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints);
+        : buildTopicStepMessages(messages, steps, step, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints, projectIR ? formatIRBlock(projectIR) : null);
 
     let filesToUse: FileMap = accumulatedFiles;
     let contextSource = "full-accumulated";
@@ -1844,7 +1879,7 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
             }
 
             const repairedMessages = buildTopicStepMessages(
-              messages, steps, finalStep, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints,
+              messages, steps, finalStep, usePlanMd, planContent, userQuestion ?? null, accumulatedFiles, originalFiles, completedStepMemory, archBlock, archConstraints, projectIR ? formatIRBlock(projectIR) : null,
             );
 
             const healResult = await runStreamStep(finalStep, repairedMessages);
@@ -1894,6 +1929,28 @@ export async function streamPlanResponse(opts: StreamPlanOptions): Promise<void>
         for (const [fp, entry] of Object.entries(generatedFiles)) {
           const chars = typeof (entry as any)?.content === "string" ? (entry as any).content.length : 0;
           logger.info(`${stepTag}   ↳ ${fp} (${chars} chars)`);
+        }
+
+        if (executionMode === "files" && isTestFile(step.heading)) {
+          const testValidation = validateTestFileOutput(
+            step.heading,
+            finalStepText,
+            resolvedArchitecture?.testFramework ?? null,
+          );
+          if (!testValidation.valid) {
+            logger.warn(
+              `${stepTag} [test-validator] score=${testValidation.score}/100 issues=${testValidation.issues.join("; ")}`,
+            );
+            writer.writeData({
+              type: "progress",
+              label: `plan-step${step.index}-test-warn`,
+              status: "complete",
+              order: progressCounter.value++,
+              message: `Test file warning (step ${step.index}): ${testValidation.issues.join(" | ")}`,
+            } satisfies ProgressAnnotation);
+          } else {
+            logger.info(`${stepTag} [test-validator] score=${testValidation.score}/100 ✓`);
+          }
         }
 
         const patches: PatchEntry[] = [];
