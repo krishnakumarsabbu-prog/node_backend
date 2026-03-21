@@ -177,6 +177,13 @@ export async function executeTaskGraphStreaming(
     `Task graph: ${tasks.length} tasks → ${taskGraph.executionWaves.length} execution wave${taskGraph.executionWaves.length !== 1 ? "s" : ""} (${taskGraph.executionWaves.map((w) => `wave${w.wave}:${w.tasks.length}t`).join(", ")})`,
   );
 
+  writeAnnotation(res, {
+    type: "planSteps",
+    steps: tasks.map((t, i) => ({ index: i + 1, heading: `[${t.type ?? "code"}] ${t.file.split("/").pop() ?? t.file}` })),
+    totalSteps: tasks.length,
+    executionMode: "steps",
+  });
+
   const sharedMessageId = generateId();
   res.write(`f:${JSON.stringify({ messageId: sharedMessageId })}\n`);
 
@@ -279,6 +286,18 @@ export async function executeTaskGraphStreaming(
     deletedFiles: changeSet.deletedFiles,
     totalLinesAdded: changeSet.totalLinesAdded,
     totalLinesRemoved: changeSet.totalLinesRemoved,
+  });
+
+  const succeededCount = taskResults.filter((t) => t.success).length;
+  const failedCount = taskResults.filter((t) => !t.success).length;
+  writeAnnotation(res, {
+    type: "planFileSummary",
+    createdFiles: changeSet.createdFiles,
+    modifiedFiles: changeSet.modifiedFiles,
+    succeededSteps: succeededCount,
+    failedSteps: failedCount,
+    silentFailedSteps: 0,
+    totalSteps: tasks.length,
   });
 
   return {
@@ -666,7 +685,7 @@ function appendStageRules(sections: string[], type: string, state: MigrationStat
   sections.push(`4. NEVER define a bean already registered: ${existingBeans.join(", ") || "(none yet)"}`);
   sections.push(`5. ALWAYS preserve 100% of business logic — NEVER drop methods or fields`);
   sections.push(`6. ALWAYS output files under migrate/`);
-  sections.push(`7. ALWAYS return ONLY complete file content — NEVER markdown fences, NEVER explanations`);
+  sections.push(`7. ALWAYS wrap output in a <cortexArtifact> with one <cortexAction type="file"> per file — RAW XML, never inside markdown fences`);
   sections.push(`8. NEVER mix XML config with annotation config in the same file`);
   sections.push(`9. NEVER use deprecated Spring APIs (XmlBeanFactory, SimpleFormController, etc.)`);
 

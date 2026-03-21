@@ -604,7 +604,7 @@ For EACH Java file:
 
 ---
 
-No explanations. No markdown. Output only this file.`;
+Output your response as a <cortexArtifact> containing one <cortexAction type="file"> per file — RAW XML, no markdown fences around the artifact.`;
 
 async function executeMigrationStep(opts: {
   requestId: string;
