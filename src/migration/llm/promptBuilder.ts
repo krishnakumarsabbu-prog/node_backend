@@ -117,20 +117,6 @@ ${PromptBuilder.getMigrationDocumentInstructions()}`;
       if (sa.validators.length) artifactLines.push(`Validators (${sa.validators.length}): ${sa.validators.map(base).join(", ")} — register via WebMvcConfigurer.getValidator()`);
     }
 
-    const sa = intelligence.springArtifacts;
-
-    const artifactLines: string[] = [];
-    if (sa) {
-      if (sa.filters.length) artifactLines.push(`Filters (${sa.filters.length}): ${sa.filters.map((f) => f.split("/").pop()).join(", ")} — convert to FilterRegistrationBean`);
-      if (sa.interceptors.length) artifactLines.push(`Interceptors (${sa.interceptors.length}): ${sa.interceptors.map((f) => f.split("/").pop()).join(", ")} — register via WebMvcConfigurer.addInterceptors()`);
-      if (sa.aspects.length) artifactLines.push(`AOP Aspects (${sa.aspects.length}): ${sa.aspects.map((f) => f.split("/").pop()).join(", ")} — add @EnableAspectJAutoProxy`);
-      if (sa.exceptionHandlers.length) artifactLines.push(`Exception Handlers (${sa.exceptionHandlers.length}): ${sa.exceptionHandlers.map((f) => f.split("/").pop()).join(", ")} — convert to @RestControllerAdvice`);
-      if (sa.scheduledTasks.length) artifactLines.push(`Scheduled Tasks (${sa.scheduledTasks.length}): ${sa.scheduledTasks.map((f) => f.split("/").pop()).join(", ")} — add @EnableScheduling`);
-      if (sa.converters.length) artifactLines.push(`Converters/MessageConverters (${sa.converters.length}): ${sa.converters.map((f) => f.split("/").pop()).join(", ")} — register via WebMvcConfigurer.addFormatters()`);
-      artifactLines.length ? `\nSPRING ARTIFACTS (ALL must have dedicated migration steps):\n${artifactLines.join("\n")}` : null,
-      if (sa.validators.length) artifactLines.push(`Validators (${sa.validators.length}): ${sa.validators.map((f) => f.split("/").pop()).join(", ")} — register via WebMvcConfigurer.getValidator()`);
-    }
-
     const context = [
       `Framework: ${intelligence.framework} | Build: ${intelligence.buildTool}`,
       `Controllers: ${intelligence.stats.controllers} | Services: ${intelligence.stats.services} | Repos: ${intelligence.stats.repositories} | XML configs: ${intelligence.stats.xmlConfigFiles}`,
@@ -149,7 +135,6 @@ ${PromptBuilder.getMigrationDocumentInstructions()}`;
     return `You are a senior Spring migration architect.
 
 USER REQUEST: ${userRequest}
-- Every Spring Artifact listed above MUST have explicit migration steps
 
 PROJECT INTELLIGENCE:
 ${context}
@@ -160,7 +145,6 @@ RULES:
 - Output ONLY the markdown text — no JSON, no code blocks wrapping the whole doc
 - Cover: Overview, Migration Strategy, Target Structure, Steps (one per logical group), XML→Boot Mapping, Dependency Changes, Key Differences
 - Every XML config file must have a dedicated mapping entry
-    const sa = intelligence.springArtifacts;
 - Reference actual class/file names from the intelligence above
 - Migration target goes under migrate/
 - If field injection is detected, mention constructor injection conversion
@@ -169,18 +153,6 @@ RULES:
 
 Start with: # Migration Plan: Spring Web MVC → Spring Boot`;
   }
-
-    const artifactTaskHints: string[] = [];
-    if (sa) {
-      const base = (f: string) => f.split("/").pop() ?? f;
-      if (sa.filters.length) artifactTaskHints.push(`- Filters: ${sa.filters.map(base).join(", ")} → each needs a "config" task creating FilterRegistrationBean`);
-      if (sa.interceptors.length) artifactTaskHints.push(`- Interceptors: ${sa.interceptors.map(base).join(", ")} → needs a "config" task for WebMvcConfigurer.addInterceptors()`);
-      if (sa.aspects.length) artifactTaskHints.push(`- AOP Aspects: ${sa.aspects.map(base).join(", ")} → needs @EnableAspectJAutoProxy in a "config" task`);
-      if (sa.exceptionHandlers.length) artifactTaskHints.push(`- Exception Handlers: ${sa.exceptionHandlers.map(base).join(", ")} → "code" tasks with @RestControllerAdvice`);
-      if (sa.scheduledTasks.length) artifactTaskHints.push(`- Scheduled Tasks: ${sa.scheduledTasks.map(base).join(", ")} → @EnableScheduling required in a "config" task`);
-      if (sa.converters.length) artifactTaskHints.push(`- Converters: ${sa.converters.map(base).join(", ")} → register in WebMvcConfigurer.addFormatters() "config" task`);
-      if (sa.validators.length) artifactTaskHints.push(`- Validators: ${sa.validators.map(base).join(", ")} → register in WebMvcConfigurer.getValidator() "config" task`);
-    }
 
   static buildTasksOnlyPrompt(
     intelligence: CodebaseIntelligence,
@@ -200,13 +172,14 @@ Start with: # Migration Plan: Spring Web MVC → Spring Boot`;
 
     const artifactTaskHints: string[] = [];
     if (sa) {
-      if (sa.filters.length) artifactTaskHints.push(`- Filters: ${sa.filters.map((f) => f.split("/").pop()).join(", ")} → each needs a "config" task creating FilterRegistrationBean`);
-      if (sa.interceptors.length) artifactTaskHints.push(`- Interceptors: ${sa.interceptors.map((f) => f.split("/").pop()).join(", ")} → needs a "config" task for WebMvcConfigurer.addInterceptors()`);
-      if (sa.aspects.length) artifactTaskHints.push(`- AOP Aspects: ${sa.aspects.map((f) => f.split("/").pop()).join(", ")} → needs @EnableAspectJAutoProxy in @Configuration`);
-      if (sa.exceptionHandlers.length) artifactTaskHints.push(`- Exception Handlers: ${sa.exceptionHandlers.map((f) => f.split("/").pop()).join(", ")} → "code" tasks with @RestControllerAdvice`);
-      if (sa.scheduledTasks.length) artifactTaskHints.push(`- Scheduled Tasks: ${sa.scheduledTasks.map((f) => f.split("/").pop()).join(", ")} → @EnableScheduling required in a "config" task`);
-      if (sa.converters.length) artifactTaskHints.push(`- Converters: ${sa.converters.map((f) => f.split("/").pop()).join(", ")} → register in WebMvcConfigurer.addFormatters() "config" task`);
-      if (sa.validators.length) artifactTaskHints.push(`- Validators: ${sa.validators.map((f) => f.split("/").pop()).join(", ")} → register in WebMvcConfigurer.getValidator() "config" task`);
+      const base = (f: string) => f.split("/").pop() ?? f;
+      if (sa.filters.length) artifactTaskHints.push(`- Filters: ${sa.filters.map(base).join(", ")} → each needs a "config" task creating FilterRegistrationBean`);
+      if (sa.interceptors.length) artifactTaskHints.push(`- Interceptors: ${sa.interceptors.map(base).join(", ")} → needs a "config" task for WebMvcConfigurer.addInterceptors()`);
+      if (sa.aspects.length) artifactTaskHints.push(`- AOP Aspects: ${sa.aspects.map(base).join(", ")} → needs @EnableAspectJAutoProxy in a "config" task`);
+      if (sa.exceptionHandlers.length) artifactTaskHints.push(`- Exception Handlers: ${sa.exceptionHandlers.map(base).join(", ")} → "code" tasks with @RestControllerAdvice`);
+      if (sa.scheduledTasks.length) artifactTaskHints.push(`- Scheduled Tasks: ${sa.scheduledTasks.map(base).join(", ")} → @EnableScheduling required in a "config" task`);
+      if (sa.converters.length) artifactTaskHints.push(`- Converters: ${sa.converters.map(base).join(", ")} → register in WebMvcConfigurer.addFormatters() "config" task`);
+      if (sa.validators.length) artifactTaskHints.push(`- Validators: ${sa.validators.map(base).join(", ")} → register in WebMvcConfigurer.getValidator() "config" task`);
     }
 
     const context = [
@@ -663,6 +636,19 @@ Score each dimension honestly — do not inflate scores.`;
     markdownContent: string,
     plan: MigrationPlan
   ): string {
+    const sa = intelligence.springArtifacts;
+    const artifactLines: string[] = [];
+    if (sa) {
+      const base = (f: string) => f.split("/").pop() ?? f;
+      if (sa.filters.length) artifactLines.push(`Filters: ${sa.filters.map(base).join(", ")}`);
+      if (sa.interceptors.length) artifactLines.push(`Interceptors: ${sa.interceptors.map(base).join(", ")}`);
+      if (sa.aspects.length) artifactLines.push(`AOP Aspects: ${sa.aspects.map(base).join(", ")}`);
+      if (sa.exceptionHandlers.length) artifactLines.push(`Exception Handlers: ${sa.exceptionHandlers.map(base).join(", ")}`);
+      if (sa.scheduledTasks.length) artifactLines.push(`Scheduled Tasks: ${sa.scheduledTasks.map(base).join(", ")}`);
+      if (sa.converters.length) artifactLines.push(`Converters: ${sa.converters.map(base).join(", ")}`);
+      if (sa.validators.length) artifactLines.push(`Validators: ${sa.validators.map(base).join(", ")}`);
+    }
+
     const contextSummary = [
       `Framework: ${intelligence.framework}`,
       `Build Tool: ${intelligence.buildTool}`,
@@ -683,7 +669,7 @@ Score each dimension honestly — do not inflate scores.`;
       `Services: ${intelligence.keyFiles.services.slice(0, 10).join(", ") || "(none)"}`,
       `Configs: ${intelligence.keyFiles.configs.slice(0, 10).join(", ") || "(none)"}`,
       `Entry Points: ${intelligence.keyFiles.entryPoints.join(", ") || "(none)"}`,
-      artifactTaskHints.length ? `\nSPRING ARTIFACTS requiring dedicated tasks:\n${artifactTaskHints.join("\n")}` : null,
+      artifactLines.length ? `\nSPRING ARTIFACTS (verify each has a dedicated migration task):\n${artifactLines.join("\n")}` : null,
     ].filter(Boolean).join("\n");
 
     const tasksJson = JSON.stringify(plan.tasks, null, 2);
@@ -705,7 +691,6 @@ ${contextSummary}
 
 ### Migration Document (first 6000 chars):
 ${markdownContent.slice(0, 6000)}${markdownContent.length > 6000 ? "\n...[truncated]" : ""}
-- MUST include tasks for every Spring artifact listed in "SPRING ARTIFACTS requiring dedicated tasks" above
 
 ---
 
@@ -724,6 +709,7 @@ ${tasksJson.slice(0, 4000)}${tasksJson.length > 4000 ? "\n...[truncated]" : ""}
   - Build file updates (Spring Boot dependencies)
   - Configuration migration (properties/yml)
   - Controller/service/repository updates
+  - Every Spring Artifact listed above has a dedicated task
 
 List missing areas.
 

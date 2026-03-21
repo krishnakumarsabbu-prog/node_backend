@@ -99,18 +99,6 @@ export interface SpringArtifacts {
   scheduledTasks: string[];
 }
 
-export interface SpringArtifacts {
-  filters: string[];
-  interceptors: string[];
-  listeners: string[];
-  aspects: string[];
-  validators: string[];
-  converters: string[];
-  exceptionHandlers: string[];
-  scheduledTasks: string[];
-}
-
-  springArtifacts?: SpringArtifacts;
 export interface ProjectAnalysis {
   framework: Framework;
   buildTool: BuildTool;
