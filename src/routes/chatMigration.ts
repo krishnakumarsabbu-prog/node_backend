@@ -154,7 +154,12 @@ export class ChatMigrationHandler {
       const messageId = generateId();
       res.write(`f:${JSON.stringify({ messageId })}\n`);
 
-      const tasksJson = JSON.stringify(plan.tasks, null, 2);
+      const tasksJson = JSON.stringify({
+        migrationType: plan.migrationType,
+        estimatedComplexity: plan.estimatedComplexity,
+        summary: plan.summary,
+        tasks: plan.tasks,
+      }, null, 2);
       const mdBlock = `<cortexArtifact id="migration-plan" title="Migration Plan">
 <cortexAction type="file" filePath="/home/project/migration.md" contentType="text/markdown">
 ${markdownContent}
@@ -244,15 +249,26 @@ ${tasksJson}
 
     let plan: MigrationPlan;
     try {
-      const rawTasks = JSON.parse((tasksFile as any).content as string);
+      const parsed = JSON.parse((tasksFile as any).content as string);
+      const rawTasks = Array.isArray(parsed) ? parsed : (parsed.tasks ?? []);
+      const migrationType = Array.isArray(parsed) ? "spring-mvc-to-boot" : (parsed.migrationType ?? "spring-mvc-to-boot");
+      const estimatedComplexity = Array.isArray(parsed)
+        ? (rawTasks.length > 20 ? "high" : rawTasks.length > 8 ? "medium" : "low")
+        : (parsed.estimatedComplexity ?? (rawTasks.length > 20 ? "high" : rawTasks.length > 8 ? "medium" : "low"));
       plan = {
-        migrationType: "spring-mvc-to-boot",
-        estimatedComplexity: rawTasks.length > 20 ? "high" : rawTasks.length > 8 ? "medium" : "low",
-        summary: {
-          filesToModify: rawTasks.filter((t: any) => t.action === "modify").length,
-          filesToCreate: rawTasks.filter((t: any) => t.action === "create").length,
-          filesToDelete: rawTasks.filter((t: any) => t.action === "delete").length,
-        },
+        migrationType,
+        estimatedComplexity,
+        summary: Array.isArray(parsed)
+          ? {
+              filesToModify: rawTasks.filter((t: any) => t.action === "modify").length,
+              filesToCreate: rawTasks.filter((t: any) => t.action === "create").length,
+              filesToDelete: rawTasks.filter((t: any) => t.action === "delete").length,
+            }
+          : (parsed.summary ?? {
+              filesToModify: rawTasks.filter((t: any) => t.action === "modify").length,
+              filesToCreate: rawTasks.filter((t: any) => t.action === "create").length,
+              filesToDelete: rawTasks.filter((t: any) => t.action === "delete").length,
+            }),
         tasks: rawTasks,
       };
     } catch {

@@ -165,7 +165,7 @@ export async function executeTaskGraphStreaming(
   const state = createMigrationState(sourceFiles);
   inferGlobalDecisions(state, plan, intelligence);
 
-  assertAllFilesCovered(tasks, progressCounter, res);
+  assertAllFilesCovered(tasks, sourceFiles, progressCounter, res);
 
   const taskGraph = buildTaskGraph(tasks);
 
@@ -469,13 +469,25 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
         }
       } else {
         logger.warn(`Task ${task.id} produced 0 extractable files from response`);
+        if (attempt < MAX_TASK_RETRIES) {
+          lastError = "no cortexAction blocks extracted from LLM response";
+          writeProgress(
+            res,
+            progressCounter,
+            `migration-task-${task.id}`,
+            "in-progress",
+            `Task ${taskIndex}/${totalTasks} WARNING: no output files — retrying (attempt ${attempt + 1}/${MAX_TASK_RETRIES})`,
+          );
+          continue;
+        }
         writeProgress(
           res,
           progressCounter,
           `migration-task-${task.id}`,
-          "in-progress",
-          `Task ${taskIndex}/${totalTasks} WARNING: no cortexAction blocks extracted from LLM response — ${task.file} may not have been generated`,
+          "complete",
+          `Task ${taskIndex}/${totalTasks} FAILED: no cortexAction blocks extracted after ${MAX_TASK_RETRIES + 1} attempts — ${task.file} was not generated`,
         );
+        return { taskId: task.id, file: task.file, success: false, error: "no cortexAction blocks extracted from LLM response" };
       }
 
       logger.info(
@@ -489,7 +501,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
         progressCounter,
         `migration-task-${task.id}`,
         "complete",
-        `Task ${taskIndex}/${totalTasks} done [${task.type ?? "code"}]: ${task.file}${outputFiles.length > 0 ? ` (${outputFiles.length} file${outputFiles.length !== 1 ? "s" : ""})` : ""}`,
+        `Task ${taskIndex}/${totalTasks} done [${task.type ?? "code"}]: ${task.file} (${outputFiles.length} file${outputFiles.length !== 1 ? "s" : ""})`,
       );
 
       return { taskId: task.id, file: task.file, success: true };
@@ -1308,7 +1320,7 @@ function extractGeneratedFiles(stepText: string): FileMap {
   while ((match = re.exec(stepText)) !== null) {
     const fullPath = sanitizeMigratePath(match[1]);
     if (!fullPath) {
-      logger.warn(`Skipping non-migrate/ path "${match[1]}"`);
+      logger.warn(`Dropping generated file with non-migrate/ path "${match[1]}" — LLM must output files under migrate/`);
       continue;
     }
     updated[fullPath] = { type: "file", content: match[2], isBinary: false } as any;
@@ -1363,6 +1375,7 @@ function inferGlobalDecisions(
 
 function assertAllFilesCovered(
   tasks: MigrationTask[],
+  sourceFiles: Map<string, string>,
   progressCounter: { value: number },
   res: Response,
 ): void {
@@ -1372,12 +1385,26 @@ function assertAllFilesCovered(
     for (const f of task.files ?? []) covered.add(f);
   }
 
+  const SKIP_EXTENSIONS = new Set([".json", ".md", ".txt", ".lock", ".gitignore", ".env"]);
+  const skipPaths = ["/home/project/tasks.json", "/home/project/migration.md"];
+  const uncovered: string[] = [];
+  for (const srcPath of sourceFiles.keys()) {
+    if (skipPaths.includes(srcPath)) continue;
+    const ext = srcPath.slice(srcPath.lastIndexOf("."));
+    if (SKIP_EXTENSIONS.has(ext)) continue;
+    if (!covered.has(srcPath)) uncovered.push(srcPath);
+  }
+
+  const uncoveredMsg = uncovered.length > 0
+    ? ` WARNING: ${uncovered.length} source file${uncovered.length !== 1 ? "s" : ""} not covered by any task: ${uncovered.slice(0, 5).join(", ")}${uncovered.length > 5 ? ` …+${uncovered.length - 5} more` : ""}`
+    : "";
+
   writeProgress(
     res,
     progressCounter,
     "coverage-check",
     "complete",
-    `Coverage check: ${covered.size} file${covered.size !== 1 ? "s" : ""} across ${tasks.length} task${tasks.length !== 1 ? "s" : ""}`,
+    `Coverage check: ${covered.size} file${covered.size !== 1 ? "s" : ""} across ${tasks.length} task${tasks.length !== 1 ? "s" : ""}${uncoveredMsg}`,
   );
 }
 
