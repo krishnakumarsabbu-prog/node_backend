@@ -133,6 +133,7 @@ export class ChatMigrationHandler {
       const { markdownContent, plan } = await this.runner.generateMigrationDocument(
         request.files,
         userRequest,
+        analysis,
       );
 
       writeDataPart(res, {

@@ -211,10 +211,11 @@ export class MigrationRunner {
   async generateMigrationDocument(
     files: FileMap,
     userRequest: string,
+    precomputedAnalysis?: Awaited<ReturnType<AnalyzerAgent["analyze"]>>,
   ): Promise<{ markdownContent: string; plan: MigrationPlan }> {
     logger.info("Generating Migration.md document");
 
-    const analysis = await this.analyzerAgent.analyze(files);
+    const analysis = precomputedAnalysis ?? await this.analyzerAgent.analyze(files);
     const doc = await this.plannerAgent.generateMigrationDocument(files, analysis, userRequest);
 
     logger.info("Migration.md generation complete");

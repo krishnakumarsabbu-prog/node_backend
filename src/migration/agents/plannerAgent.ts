@@ -229,12 +229,16 @@ export class PlannerAgent {
 
     const tasks = this.convertAndValidateTasks(rawTasks);
 
+    const createCount = tasks.filter((t) => t.action === "create").length;
+    const modifyCount = tasks.filter((t) => t.action === "modify").length;
+    const deleteCount = tasks.filter((t) => t.action === "delete").length;
+
     return {
       migrationType: "spring-mvc-to-boot",
       summary: {
-        filesToModify: 0,
-        filesToDelete: 0,
-        filesToCreate: tasks.filter((t) => t.action === "create").length,
+        filesToModify: modifyCount,
+        filesToDelete: deleteCount,
+        filesToCreate: createCount,
       },
       tasks,
       estimatedComplexity: tasks.length > 20 ? "high" : tasks.length > 8 ? "medium" : "low",
