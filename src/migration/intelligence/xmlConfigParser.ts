@@ -1,9 +1,30 @@
 import type { FileMap } from "../../llm/constants";
 
+export interface XmlBeanPropertyRef {
+  name: string;
+  ref: string;
+}
+
+export interface XmlBeanConstructorArg {
+  index?: number;
+  ref?: string;
+  value?: string;
+  type?: string;
+}
+
 export interface XmlBeanDefinition {
   id: string;
   className: string;
   scope?: string;
+  propertyRefs: XmlBeanPropertyRef[];
+  constructorArgs: XmlBeanConstructorArg[];
+  initMethod?: string;
+  destroyMethod?: string;
+  factoryBean?: string;
+  factoryMethod?: string;
+  parent?: string;
+  lazy?: boolean;
+  primary?: boolean;
 }
 
 export interface XmlFileSummary {
@@ -37,25 +58,133 @@ function detectXmlType(filename: string, content: string): XmlFileSummary["xmlTy
 
 function extractBeans(content: string): XmlBeanDefinition[] {
   const beans: XmlBeanDefinition[] = [];
-  const beanRe = /<bean\s+([^>]+)>/g;
+
+  const selfClosingBeanRe = /<bean\s+([^>]+)\/>/g;
+  const openBeanRe = /<bean\s+([^>]*?)>([\s\S]*?)<\/bean>/g;
+
+  function parseAttrs(attrs: string): Partial<XmlBeanDefinition> {
+    const idMatch = attrs.match(/(?:^|\s)id=["']([^"']+)["']/);
+    const classMatch = attrs.match(/(?:^|\s)class=["']([^"']+)["']/);
+    const scopeMatch = attrs.match(/(?:^|\s)scope=["']([^"']+)["']/);
+    const initMatch = attrs.match(/(?:^|\s)init-method=["']([^"']+)["']/);
+    const destroyMatch = attrs.match(/(?:^|\s)destroy-method=["']([^"']+)["']/);
+    const factoryBeanMatch = attrs.match(/(?:^|\s)factory-bean=["']([^"']+)["']/);
+    const factoryMethodMatch = attrs.match(/(?:^|\s)factory-method=["']([^"']+)["']/);
+    const parentMatch = attrs.match(/(?:^|\s)parent=["']([^"']+)["']/);
+    const lazyMatch = attrs.match(/(?:^|\s)lazy-init=["']([^"']+)["']/);
+    const primaryMatch = attrs.match(/(?:^|\s)primary=["']([^"']+)["']/);
+    return {
+      id: idMatch ? idMatch[1] : undefined,
+      className: classMatch ? classMatch[1] : undefined,
+      scope: scopeMatch ? scopeMatch[1] : "singleton",
+      initMethod: initMatch ? initMatch[1] : undefined,
+      destroyMethod: destroyMatch ? destroyMatch[1] : undefined,
+      factoryBean: factoryBeanMatch ? factoryBeanMatch[1] : undefined,
+      factoryMethod: factoryMethodMatch ? factoryMethodMatch[1] : undefined,
+      parent: parentMatch ? parentMatch[1] : undefined,
+      lazy: lazyMatch ? lazyMatch[1] === "true" : false,
+      primary: primaryMatch ? primaryMatch[1] === "true" : false,
+    };
+  }
+
+  function extractPropertyRefs(body: string): XmlBeanPropertyRef[] {
+    const refs: XmlBeanPropertyRef[] = [];
+    const propRe = /<property\s+([^>]+?)\/?>/g;
+    let m: RegExpExecArray | null;
+    while ((m = propRe.exec(body)) !== null) {
+      const attrs = m[1];
+      const nameMatch = attrs.match(/name=["']([^"']+)["']/);
+      const refMatch = attrs.match(/ref=["']([^"']+)["']/);
+      if (nameMatch && refMatch) {
+        refs.push({ name: nameMatch[1], ref: refMatch[1] });
+      }
+    }
+    const propBodyRe = /<property\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/property>/g;
+    while ((m = propBodyRe.exec(body)) !== null) {
+      const propName = m[1];
+      const propBody = m[2];
+      const innerRefMatch = propBody.match(/<ref\s+bean=["']([^"']+)["']/);
+      if (innerRefMatch && !refs.some((r) => r.name === propName)) {
+        refs.push({ name: propName, ref: innerRefMatch[1] });
+      }
+    }
+    return refs;
+  }
+
+  function extractConstructorArgs(body: string): XmlBeanConstructorArg[] {
+    const args: XmlBeanConstructorArg[] = [];
+    const argRe = /<constructor-arg\s+([^>]+?)\/?>/g;
+    let m: RegExpExecArray | null;
+    while ((m = argRe.exec(body)) !== null) {
+      const attrs = m[1];
+      const indexMatch = attrs.match(/index=["']([^"']+)["']/);
+      const refMatch = attrs.match(/ref=["']([^"']+)["']/);
+      const valueMatch = attrs.match(/value=["']([^"']+)["']/);
+      const typeMatch = attrs.match(/type=["']([^"']+)["']/);
+      args.push({
+        index: indexMatch ? parseInt(indexMatch[1], 10) : undefined,
+        ref: refMatch ? refMatch[1] : undefined,
+        value: valueMatch ? valueMatch[1] : undefined,
+        type: typeMatch ? typeMatch[1] : undefined,
+      });
+    }
+    const argBodyRe = /<constructor-arg(?:\s[^>]*)?>[\s\S]*?<ref\s+bean=["']([^"']+)["']/g;
+    while ((m = argBodyRe.exec(body)) !== null) {
+      if (!args.some((a) => a.ref === m![1])) {
+        args.push({ ref: m[1] });
+      }
+    }
+    return args;
+  }
+
   let m: RegExpExecArray | null;
 
-  while ((m = beanRe.exec(content)) !== null) {
-    const attrs = m[1];
-    const idMatch = attrs.match(/id=["']([^"']+)["']/);
-    const classMatch = attrs.match(/class=["']([^"']+)["']/);
-    const scopeMatch = attrs.match(/scope=["']([^"']+)["']/);
-
-    if (classMatch) {
+  selfClosingBeanRe.lastIndex = 0;
+  while ((m = selfClosingBeanRe.exec(content)) !== null) {
+    const parsed = parseAttrs(m[1]);
+    if (parsed.className) {
       beans.push({
-        id: idMatch ? idMatch[1] : "anonymous",
-        className: classMatch[1],
-        scope: scopeMatch ? scopeMatch[1] : "singleton",
+        id: parsed.id ?? "anonymous",
+        className: parsed.className,
+        scope: parsed.scope ?? "singleton",
+        propertyRefs: [],
+        constructorArgs: [],
+        ...parsed,
       });
     }
   }
 
-  return beans.slice(0, 20);
+  openBeanRe.lastIndex = 0;
+  while ((m = openBeanRe.exec(content)) !== null) {
+    const parsed = parseAttrs(m[1]);
+    const body = m[2];
+    if (parsed.className || parsed.id) {
+      const propertyRefs = extractPropertyRefs(body);
+      const constructorArgs = extractConstructorArgs(body);
+      beans.push({
+        id: parsed.id ?? "anonymous",
+        className: parsed.className ?? "(factory)",
+        scope: parsed.scope ?? "singleton",
+        propertyRefs,
+        constructorArgs,
+        initMethod: parsed.initMethod,
+        destroyMethod: parsed.destroyMethod,
+        factoryBean: parsed.factoryBean,
+        factoryMethod: parsed.factoryMethod,
+        parent: parsed.parent,
+        lazy: parsed.lazy,
+        primary: parsed.primary,
+      });
+    }
+  }
+
+  const seen = new Set<string>();
+  return beans.filter((b) => {
+    const key = `${b.id}::${b.className}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 40);
 }
 
 function extractServletMappings(content: string): string[] {
@@ -135,8 +264,27 @@ export function serializeXmlSummary(xml: XmlFileSummary): string {
   if (flags.length > 0) lines.push(`  Features: ${flags.join(", ")}`);
 
   if (xml.beans.length > 0) {
-    const beanStr = xml.beans.slice(0, 8).map((b) => `${b.id}(${b.className.split(".").pop()})`).join(", ");
-    lines.push(`  Key Beans: ${beanStr}`);
+    lines.push(`  Beans (${xml.beans.length}):`);
+    for (const b of xml.beans.slice(0, 20)) {
+      const shortClass = b.className.split(".").pop() ?? b.className;
+      const wirings: string[] = [];
+      for (const p of b.propertyRefs) {
+        wirings.push(`${p.name}→${p.ref}`);
+      }
+      for (const c of b.constructorArgs) {
+        if (c.ref) wirings.push(`ctor→${c.ref}`);
+        else if (c.value) wirings.push(`ctor="${c.value}"`);
+      }
+      const wiringStr = wirings.length > 0 ? ` [wires: ${wirings.join(", ")}]` : "";
+      const extras: string[] = [];
+      if (b.scope && b.scope !== "singleton") extras.push(`scope=${b.scope}`);
+      if (b.initMethod) extras.push(`init=${b.initMethod}`);
+      if (b.primary) extras.push("primary");
+      if (b.lazy) extras.push("lazy");
+      if (b.parent) extras.push(`parent=${b.parent}`);
+      const extraStr = extras.length > 0 ? ` (${extras.join(", ")})` : "";
+      lines.push(`    • ${b.id}: ${shortClass}${extraStr}${wiringStr}`);
+    }
   }
 
   if (xml.servletMappings.length > 0) {

@@ -554,6 +554,8 @@ function buildTaskMessages(opts: TaskStreamingOpts, resolvedAction: string, last
     }
   }
 
+  appendXmlBeanWiringContext(sections, task, opts.intelligence, opts.files);
+
   appendStageRules(sections, task.type ?? "code", state);
 
   const systemContent = sections.join("\n");
@@ -675,6 +677,74 @@ function buildTaskFileContext(
   return context;
 }
 
+function appendXmlBeanWiringContext(
+  sections: string[],
+  task: MigrationTask,
+  intelligence: CodebaseIntelligence,
+  files: FileMap,
+): void {
+  if (intelligence.xmlConfigs.length === 0) return;
+
+  const relevantXmlConfigs = intelligence.xmlConfigs.filter((xml) => {
+    if (task.type === "config") return true;
+    const taskFileBase = task.file.split("/").pop()?.replace(/\.[^.]+$/, "")?.toLowerCase() ?? "";
+    return xml.beans.some((b) =>
+      b.id.toLowerCase().includes(taskFileBase) ||
+      b.className.toLowerCase().includes(taskFileBase) ||
+      b.propertyRefs.some((p) => p.ref.toLowerCase().includes(taskFileBase)) ||
+      b.constructorArgs.some((c) => c.ref?.toLowerCase().includes(taskFileBase)),
+    );
+  });
+
+  if (relevantXmlConfigs.length === 0) return;
+
+  sections.push(`\n## XML BEAN DEFINITIONS (source of truth for wiring — convert ALL to @Bean methods)`);
+  for (const xml of relevantXmlConfigs.slice(0, 4)) {
+    const xmlFileContent = files[xml.file] && "content" in (files[xml.file] as any)
+      ? (files[xml.file] as any).content as string
+      : null;
+
+    sections.push(`\n### ${xml.file} [${xml.xmlType}] (${xml.beanCount} beans)`);
+
+    if (xml.beans.length > 0) {
+      sections.push(`Bean Definitions:`);
+      for (const b of xml.beans.slice(0, 20)) {
+        const shortClass = b.className.split(".").pop() ?? b.className;
+        sections.push(`  @Bean ${b.id}: ${b.className}`);
+        if (b.scope && b.scope !== "singleton") {
+          sections.push(`    scope: ${b.scope}`);
+        }
+        if (b.constructorArgs.length > 0) {
+          const ctorArgs = b.constructorArgs.map((c) => c.ref ? `@Autowired ${c.ref}` : `"${c.value ?? "?"}"`);
+          sections.push(`    constructor-args: ${ctorArgs.join(", ")} → inject as constructor params`);
+        }
+        if (b.propertyRefs.length > 0) {
+          for (const p of b.propertyRefs) {
+            sections.push(`    setProperty(${p.name}) = ref:${p.ref} → inject ${p.ref} as constructor param or setter`);
+          }
+        }
+        if (b.initMethod) sections.push(`    @Bean(initMethod="${b.initMethod}")`);
+        if (b.destroyMethod) sections.push(`    @Bean(destroyMethod="${b.destroyMethod}")`);
+        if (b.primary) sections.push(`    @Primary`);
+        if (b.factoryBean) sections.push(`    factory: ${b.factoryBean}.${b.factoryMethod ?? "create"}()`);
+        if (b.parent) {
+          const parentBean = xml.beans.find((pb) => pb.id === b.parent);
+          if (parentBean) sections.push(`    extends bean: ${b.parent} (${parentBean.className.split(".").pop()}) — class: ${shortClass}`);
+          else sections.push(`    extends bean: ${b.parent} — class: ${shortClass}`);
+        }
+      }
+    }
+
+    if (xmlFileContent && task.type === "config") {
+      const MAX_XML_CHARS = 2000;
+      sections.push(`\nRaw XML source (for complete conversion):`);
+      sections.push("```xml");
+      sections.push(xmlFileContent.slice(0, MAX_XML_CHARS) + (xmlFileContent.length > MAX_XML_CHARS ? "\n...[truncated]" : ""));
+      sections.push("```");
+    }
+  }
+}
+
 function appendStageRules(sections: string[], type: string, state: MigrationState): void {
   const existingBeans = Array.from(state.globalDecisions.beanNames.keys());
 
@@ -701,11 +771,20 @@ function appendStageRules(sections: string[], type: string, state: MigrationStat
     case "config":
       sections.push(`\n## CONFIG RULES`);
       sections.push(`- ALWAYS annotate configuration classes with @Configuration`);
-      sections.push(`- ALWAYS replace every <bean> element with a @Bean method`);
+      sections.push(`- ALWAYS replace every <bean> element with a @Bean method — see XML BEAN DEFINITIONS section above`);
+      sections.push(`- For <property name="x" ref="y"/>: add parameter "YType y" to the @Bean method and call setX(y)`);
+      sections.push(`- For <constructor-arg ref="y"/>: add parameter "YType y" to the @Bean method and pass to constructor`);
+      sections.push(`- For <constructor-arg value="x"/>: pass literal value to constructor`);
+      sections.push(`- For init-method="x": use @Bean(initMethod = "x")`);
+      sections.push(`- For destroy-method="x": use @Bean(destroyMethod = "x")`);
+      sections.push(`- For primary="true": annotate the @Bean method with @Primary`);
+      sections.push(`- For scope="prototype": annotate the @Bean method with @Scope("prototype")`);
+      sections.push(`- For factory-bean + factory-method: call the factory bean's method`);
       sections.push(`- ALWAYS replace context:component-scan with @SpringBootApplication or @ComponentScan`);
       sections.push(`- ALWAYS replace property-placeholder with @Value or @ConfigurationProperties`);
-      sections.push(`- If replacing web.xml: ALWAYS create @SpringBootApplication main class`);
+      sections.push(`- If replacing web.xml: ALWAYS create @SpringBootApplication main class with SpringApplication.run()`);
       sections.push(`- NEVER copy XML into the target project — convert it to Java`);
+      sections.push(`- NEVER leave any <bean> unconverted — every bean in the XML must have a corresponding @Bean method`);
       break;
     case "code":
       sections.push(`\n## CODE RULES`);
@@ -1164,7 +1243,28 @@ function inferGlobalDecisions(
     }
   }
 
-  logger.info(`Global decisions: packageRoot="${state.globalDecisions.packageRoot}", configs=${state.globalDecisions.configClasses.length}`);
+  for (const xmlConfig of intelligence.xmlConfigs) {
+    for (const bean of xmlConfig.beans ?? []) {
+      if (bean.id && bean.id !== "anonymous") {
+        registerBean(state, bean.id, xmlConfig.file);
+      }
+    }
+    if (xmlConfig.file.includes("migrate/")) {
+      state.globalDecisions.removedXmlFiles.push(xmlConfig.file);
+    }
+  }
+
+  for (const fs of intelligence.fileSummaries) {
+    if (!["service", "repository", "controller"].includes(fs.role)) continue;
+    const className = fs.classNames[0];
+    if (!className) continue;
+    const beanName = className.charAt(0).toLowerCase() + className.slice(1);
+    if (!state.globalDecisions.beanNames.has(beanName)) {
+      registerBean(state, beanName, fs.path);
+    }
+  }
+
+  logger.info(`Global decisions: packageRoot="${state.globalDecisions.packageRoot}", configs=${state.globalDecisions.configClasses.length}, pre-seeded beans=${state.globalDecisions.beanNames.size}`);
 }
 
 function assertAllFilesCovered(

@@ -149,13 +149,26 @@ function buildBeans(intelligence: CodebaseIntelligence): IrBeanDefinition[] {
 
   for (const xmlConfig of intelligence.xmlConfigs) {
     for (const bean of xmlConfig.beans ?? []) {
+      const properties: Record<string, string> = {};
+      for (const p of bean.propertyRefs ?? []) {
+        properties[p.name] = `ref:${p.ref}`;
+      }
+      for (const c of bean.constructorArgs ?? []) {
+        if (c.ref) {
+          const key = c.index !== undefined ? `constructor-arg[${c.index}]` : `constructor-arg`;
+          properties[key] = `ref:${c.ref}`;
+        } else if (c.value !== undefined) {
+          const key = c.index !== undefined ? `constructor-arg[${c.index}]` : `constructor-arg`;
+          properties[key] = `value:${c.value}`;
+        }
+      }
       beans.push({
         beanName: bean.id,
         beanClass: bean.className,
         scope: (bean.scope as any) ?? "singleton",
         sourceFile: xmlConfig.file,
         isXmlDefined: true,
-        properties: {},
+        properties,
       });
     }
   }
@@ -449,6 +462,21 @@ export function serializeIR(model: IrProjectModel): string {
       `beans=${x.beanCount} ` +
       `dataSource=${x.featureFlags.hasDataSource} security=${x.featureFlags.hasSecurity} txMgr=${x.featureFlags.hasTransactionManager}`,
     );
+  }
+
+  const xmlBeans = model.beans.filter((b) => b.isXmlDefined);
+  if (xmlBeans.length > 0) {
+    lines.push(``);
+    lines.push(`## XML BEAN WIRING (${xmlBeans.length} beans — must convert to @Bean methods)`);
+    for (const b of xmlBeans) {
+      const shortClass = b.beanClass.split(".").pop() ?? b.beanClass;
+      const wiringEntries = Object.entries(b.properties ?? {});
+      const wiringStr = wiringEntries.length > 0
+        ? ` → { ${wiringEntries.map(([k, v]) => `${k}: ${v}`).join(", ")} }`
+        : "";
+      const scopeStr = b.scope !== "singleton" ? ` @Scope("${b.scope}")` : "";
+      lines.push(`  @Bean${scopeStr} ${b.beanName}(): ${shortClass} [from ${b.sourceFile.split("/").pop()}]${wiringStr}`);
+    }
   }
 
   return lines.join("\n");

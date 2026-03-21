@@ -103,11 +103,25 @@ export function serializeGlobalDecisions(state: MigrationState): string {
   const lines: string[] = [];
   lines.push(`Package Root: ${state.globalDecisions.packageRoot || "(not yet determined)"}`);
   lines.push(`Main Class: ${state.globalDecisions.mainClass || "(not yet created)"}`);
-  lines.push(`Config Classes: ${state.globalDecisions.configClasses.join(", ") || "(none yet)"}`);
-  lines.push(`Registered Beans: ${state.globalDecisions.beanNames.size}`);
-  lines.push(`Removed XML Files: ${state.globalDecisions.removedXmlFiles.join(", ") || "(none)"}`);
+  lines.push(`Config Classes: ${state.globalDecisions.configClasses.map((f) => f.split("/").pop()).join(", ") || "(none yet)"}`);
+
+  if (state.globalDecisions.beanNames.size > 0) {
+    lines.push(`Registered Beans (${state.globalDecisions.beanNames.size}) — DO NOT re-define these:`);
+    for (const [beanName, sourceFile] of state.globalDecisions.beanNames) {
+      lines.push(`  • ${beanName} → ${sourceFile.split("/").pop() ?? sourceFile}`);
+    }
+  } else {
+    lines.push(`Registered Beans: (none yet — first tasks are running)`);
+  }
+
+  if (state.globalDecisions.removedXmlFiles.length > 0) {
+    lines.push(`Removed XML Files: ${state.globalDecisions.removedXmlFiles.join(", ")}`);
+  }
+
   lines.push(`Completed Tasks: ${state.completedTasks.size}`);
-  lines.push(`Failed Tasks: ${state.failedTasks.size}`);
+  if (state.failedTasks.size > 0) {
+    lines.push(`Failed Tasks: ${state.failedTasks.size} — ${Array.from(state.failedTasks.entries()).map(([id, err]) => `${id}: ${err.slice(0, 60)}`).join("; ")}`);
+  }
   const changeSet = buildChangeSet(state.diffs);
   lines.push(`Files Changed So Far: created=${changeSet.createdFiles.length} modified=${changeSet.modifiedFiles.length} deleted=${changeSet.deletedFiles.length} (+${changeSet.totalLinesAdded}/-${changeSet.totalLinesRemoved} lines)`);
   return lines.join("\n");
