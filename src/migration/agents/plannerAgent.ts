@@ -1,5 +1,5 @@
 import { generateText } from "ai";
-import type { ProjectAnalysis, MigrationPlan, MigrationTask, MigrationTaskCategory } from "../types/migrationTypes";
+import type { ProjectAnalysis, MigrationPlan, MigrationTask, MigrationTaskCategory, MigrationAction } from "../types/migrationTypes";
 import type { FileMap } from "../../llm/constants";
 import { MigrationPlanSchema } from "../schemas/migrationSchema";
 import { LLMClient } from "../llm/llmClient";
@@ -23,6 +23,7 @@ interface DualOutputTask {
   id: string;
   title: string;
   type: MigrationTaskCategory;
+  action?: "create" | "modify" | "delete";
   files: string[];
   dependsOn: string[];
   description: string;
@@ -294,7 +295,7 @@ export class PlannerAgent {
       return {
         id: t.id || `task-${String(i + 1).padStart(3, "0")}`,
         file: primaryFile,
-        action: "create" as const,
+        action: (t.action ?? "create") as MigrationAction,
         description: t.description || t.title,
         type: t.type,
         files: t.files || [],

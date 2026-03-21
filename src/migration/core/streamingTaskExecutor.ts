@@ -305,13 +305,17 @@ export async function executeTaskGraphStreaming(
 
   const succeededCount = taskResults.filter((t) => t.success).length;
   const failedCount = taskResults.filter((t) => !t.success).length;
+  const allChangedFiles = new Set([...changeSet.createdFiles, ...changeSet.modifiedFiles, ...changeSet.deletedFiles]);
+  const silentFailedSteps = taskResults.filter(
+    (t) => t.success && !allChangedFiles.has(t.file),
+  ).length;
   writeAnnotation(res, {
     type: "planFileSummary",
     createdFiles: changeSet.createdFiles,
     modifiedFiles: changeSet.modifiedFiles,
     succeededSteps: succeededCount,
     failedSteps: failedCount,
-    silentFailedSteps: 0,
+    silentFailedSteps,
     totalSteps: tasks.length,
   });
 
@@ -917,44 +921,6 @@ function updateGlobalStateFromContent(state: MigrationState, filePath: string, c
   if (content.includes("@Configuration") && !state.globalDecisions.configClasses.includes(filePath)) {
     state.globalDecisions.configClasses.push(filePath);
   }
-
-  if (content.includes("SecurityFilterChain") && content.includes("@Bean")) {
-    if (!state.globalDecisions.securityFilterChainBean) {
-      state.globalDecisions.securityFilterChainBean = filePath;
-    }
-    if (!state.globalDecisions.filterChainBeans.includes(filePath)) {
-      state.globalDecisions.filterChainBeans.push(filePath);
-    }
-  }
-
-  if (content.includes("implements WebMvcConfigurer") && !state.globalDecisions.webMvcConfigurerClass) {
-    state.globalDecisions.webMvcConfigurerClass = filePath;
-  }
-
-  if (content.includes("FilterRegistrationBean")) {
-    const filterBase = filePath.split("/").pop() ?? filePath;
-    if (!state.globalDecisions.migratedFilters.includes(filterBase)) {
-      state.globalDecisions.migratedFilters.push(filterBase);
-    }
-  }
-
-  if (content.includes("addInterceptors") || content.includes("implements HandlerInterceptor")) {
-    const intBase = filePath.split("/").pop() ?? filePath;
-    if (!state.globalDecisions.migratedInterceptors.includes(intBase)) {
-      state.globalDecisions.migratedInterceptors.push(intBase);
-    }
-  }
-
-  if (content.includes("@Aspect")) {
-    const aspectBase = filePath.split("/").pop() ?? filePath;
-    if (!state.globalDecisions.migratedAspects.includes(aspectBase)) {
-      state.globalDecisions.migratedAspects.push(aspectBase);
-    }
-  }
-
-  if (content.includes("@EnableAspectJAutoProxy")) state.globalDecisions.aopEnabled = true;
-  if (content.includes("@EnableScheduling")) state.globalDecisions.schedulingEnabled = true;
-  if (content.includes("@EnableAsync")) state.globalDecisions.asyncEnabled = true;
 }
 
 function runStageValidation(
