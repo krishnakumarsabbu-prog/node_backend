@@ -179,7 +179,16 @@ export async function executeTaskGraphStreaming(
 
   writeAnnotation(res, {
     type: "planSteps",
-    steps: tasks.map((t, i) => ({ index: i + 1, heading: `[${t.type ?? "code"}] ${t.file.split("/").pop() ?? t.file}` })),
+    steps: tasks.map((t, i) => ({
+      index: i + 1,
+      id: t.id,
+      heading: `[${t.type ?? "code"}] ${t.file.split("/").pop() ?? t.file}`,
+      type: t.type ?? "code",
+      file: t.file,
+      action: t.action,
+      description: t.description,
+      status: "pending",
+    })),
     totalSteps: tasks.length,
     executionMode: "steps",
   });
@@ -251,18 +260,6 @@ export async function executeTaskGraphStreaming(
         reason: `Static validation found ${criticalErrors.length} unresolvable error(s) after ${MAX_STATIC_FIX_ATTEMPTS} auto-fix attempts`,
         errors: criticalErrors.slice(0, 10),
         suggestion: "Review generated files manually or re-run migration with more context",
-      });
-    }
-
-    if (staticFixErrors.length > 0) {
-      const criticalErrors = staticResult.issues
-        .filter((i) => i.severity === "error")
-        .map((i) => `[${i.type}] ${i.message}`);
-      writeAnnotation(res, {
-        type: "migration_rollback_recommended",
-        reason: `Static validation found ${criticalErrors.length} unresolvable error(s) after ${MAX_STATIC_FIX_ATTEMPTS} auto-fix attempts`,
-        errors: criticalErrors.slice(0, 10),
-        suggestion: "Review the generated files manually or re-run the migration with additional context",
       });
     }
   }
@@ -431,7 +428,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
       const [stepText] = await Promise.all([
         result.text,
         response.body
-          ? pipeMigrationStream(res, response.body, task.id)
+          ? pipeMigrationStream(res, response.body, task.id, progressCounter)
           : Promise.resolve(),
       ]);
 
@@ -474,6 +471,13 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
         }
       } else {
         logger.warn(`Task ${task.id} produced 0 extractable files from response`);
+        writeProgress(
+          res,
+          progressCounter,
+          `migration-task-${task.id}`,
+          "in-progress",
+          `Task ${taskIndex}/${totalTasks} WARNING: no cortexAction blocks extracted from LLM response — ${task.file} may not have been generated`,
+        );
       }
 
       logger.info(
@@ -816,13 +820,6 @@ function appendStageRules(sections: string[], type: string, state: MigrationStat
       sections.push(`- If replacing web.xml: ALWAYS create @SpringBootApplication main class with SpringApplication.run()`);
       sections.push(`- NEVER copy XML into the target project — convert it to Java`);
       sections.push(`- NEVER leave any <bean> unconverted — every bean in the XML must have a corresponding @Bean method`);
-      sections.push(`- NEVER add @EnableWebMvc to the @SpringBootApplication class — use a separate @Configuration`);
-      sections.push(`- Servlet Filters → @Bean FilterRegistrationBean<YourFilter>; set order with setOrder()`);
-      sections.push(`- HandlerInterceptors → implement WebMvcConfigurer, override addInterceptors(); NEVER register as standalone @Bean`);
-      sections.push(`- AOP @Aspect → keep @Component @Aspect; add @EnableAspectJAutoProxy to a @Configuration`);
-      sections.push(`- Scheduling → @EnableScheduling on @Configuration; keep @Scheduled methods on the bean`);
-      sections.push(`- Async → @EnableAsync on @Configuration; keep @Async methods on the bean`);
-      sections.push(`- Security → SecurityFilterChain @Bean inside @Configuration @EnableWebSecurity class`);
       break;
     case "code":
       sections.push(`\n## CODE RULES`);
@@ -1068,6 +1065,20 @@ function runPostExecutionStaticValidation(
   return result;
 }
 
+function emitFixedFile(res: Response, filePath: string, content: string, label: string): void {
+  if (res.writableEnded || res.destroyed) return;
+  res.write(`2:[${JSON.stringify({ type: "file-modified", filePath, taskId: label })}]\n`);
+  const artifact =
+    `<cortexArtifact id="${label}-${filePath.split("/").pop()}" title="${filePath.split("/").pop()}">` +
+    `<cortexAction type="file" filePath="${filePath}">` +
+    content +
+    `</cortexAction></cortexArtifact>`;
+  const chunks = artifact.match(/.{1,500}/gs) ?? [artifact];
+  for (const chunk of chunks) {
+    if (!res.writableEnded && !res.destroyed) res.write(`0:${JSON.stringify(chunk)}\n`);
+  }
+}
+
 interface StaticAutoFixOpts {
   state: MigrationState;
   intelligence: CodebaseIntelligence;
@@ -1145,6 +1156,7 @@ async function runStaticAutoFixLoop(opts: StaticAutoFixOpts): Promise<{ errors: 
           if (typeof fixedContent !== "string" || !fixedContent.trim()) continue;
           state.fileMap.set(filePath, fixedContent);
           applyFileOperation(state, { file: filePath, action: "modify", content: fixedContent });
+          emitFixedFile(res, filePath, fixedContent, `autofix-${attempt}`);
           logger.info(`Batch static auto-fix applied to ${filePath} (attempt ${attempt})`);
         }
       } catch {
@@ -1154,6 +1166,7 @@ async function runStaticAutoFixLoop(opts: StaticAutoFixOpts): Promise<{ errors: 
           const singlePath = batchFiles[0];
           state.fileMap.set(singlePath, singleFixed);
           applyFileOperation(state, { file: singlePath, action: "modify", content: singleFixed });
+          emitFixedFile(res, singlePath, singleFixed, `autofix-${attempt}`);
         }
       }
     }
@@ -1250,6 +1263,7 @@ Return ONLY the improved file content — no markdown, no explanation.`;
       const improved = resp.data.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
       state.fileMap.set(path, improved);
       applyFileOperation(state, { file: path, action: "modify", content: improved });
+      emitFixedFile(res, path, improved, "quality-pass");
       logger.info(`Quality improvement applied to ${path}`);
       anyFixed = true;
     }
@@ -1272,6 +1286,7 @@ async function pipeMigrationStream(
   res: Response,
   webStream: ReadableStream,
   taskId: string,
+  progressCounter?: { value: number },
 ): Promise<void> {
   if (res.writableEnded || res.destroyed) return;
 
@@ -1287,6 +1302,11 @@ async function pipeMigrationStream(
       if (prefix === "f" || prefix === "e" || prefix === "d" || prefix === "g") return;
       if (prefix === "3") {
         logger.warn(`Task ${taskId} LLM error frame: ${m[2]}`);
+        if (progressCounter && !res.writableEnded && !res.destroyed) {
+          const errMsg = (() => { try { return JSON.parse(m[2]); } catch { return m[2]; } })();
+          const text = typeof errMsg === "string" ? errMsg : (errMsg?.message ?? JSON.stringify(errMsg));
+          res.write(`2:[${JSON.stringify({ type: "progress", label: `llm-error-${taskId}`, status: "complete", order: progressCounter.value++, message: `LLM error in task ${taskId}: ${text.slice(0, 200)}` })}]\n`);
+        }
         return;
       }
     }
