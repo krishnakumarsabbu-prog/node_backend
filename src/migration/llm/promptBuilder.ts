@@ -97,6 +97,105 @@ ${context}
 ${PromptBuilder.getMigrationDocumentInstructions()}`;
   }
 
+  static buildMarkdownOnlyPrompt(
+    intelligence: CodebaseIntelligence,
+    userRequest: string
+  ): string {
+    const p = intelligence.patterns;
+    const k = intelligence.keyFiles;
+    const context = [
+      `Framework: ${intelligence.framework} | Build: ${intelligence.buildTool}`,
+      `Controllers: ${intelligence.stats.controllers} | Services: ${intelligence.stats.services} | Repos: ${intelligence.stats.repositories} | XML configs: ${intelligence.stats.xmlConfigFiles}`,
+      `Patterns: fieldInjection=${p.usesFieldInjection}, xmlConfig=${p.usesXmlConfiguration}, legacyDispatcher=${p.hasLegacyDispatcher}, missingBootMain=${p.missingBootMain}, circularDeps=${intelligence.graphSummary.circularDependencies}`,
+      k.controllers.length ? `Controllers: ${k.controllers.slice(0, 8).join(", ")}` : null,
+      k.services.length ? `Services: ${k.services.slice(0, 8).join(", ")}` : null,
+      k.configs.length ? `Configs: ${k.configs.slice(0, 8).join(", ")}` : null,
+      intelligence.xmlConfigs.length
+        ? `XML files: ${intelligence.xmlConfigs.map((x) => x.file).join(", ")}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    return `You are a senior Spring migration architect.
+
+USER REQUEST: ${userRequest}
+
+PROJECT INTELLIGENCE:
+${context}
+
+Generate a complete Migration.md document for migrating Spring Web MVC → Spring Boot.
+
+RULES:
+- Output ONLY the markdown text — no JSON, no code blocks wrapping the whole doc
+- Cover: Overview, Migration Strategy, Target Structure, Steps (one per logical group), XML→Boot Mapping, Dependency Changes, Key Differences
+- Every XML config file must have a dedicated mapping entry
+- Reference actual class/file names from the intelligence above
+- Migration target goes under migrate/
+- If field injection is detected, mention constructor injection conversion
+- If circular deps exist (${intelligence.graphSummary.circularDependencies}), include a resolution step
+
+Start with: # Migration Plan: Spring Web MVC → Spring Boot`;
+  }
+
+  static buildTasksOnlyPrompt(
+    intelligence: CodebaseIntelligence,
+    userRequest: string,
+    markdownSummary: string
+  ): string {
+    const p = intelligence.patterns;
+    const allFiles = [
+      ...intelligence.keyFiles.controllers,
+      ...intelligence.keyFiles.services,
+      ...intelligence.keyFiles.repositories,
+      ...intelligence.keyFiles.configs,
+      ...intelligence.keyFiles.entryPoints,
+      ...intelligence.xmlConfigs.map((x) => x.file),
+    ].slice(0, 60);
+
+    const context = [
+      `Framework: ${intelligence.framework} | Build: ${intelligence.buildTool}`,
+      `Controllers: ${intelligence.stats.controllers} | Services: ${intelligence.stats.services} | Repos: ${intelligence.stats.repositories}`,
+      `Patterns: fieldInjection=${p.usesFieldInjection}, xmlConfig=${p.usesXmlConfiguration}, missingBootMain=${p.missingBootMain}`,
+      `Key source files: ${allFiles.join(", ")}`,
+    ].join("\n");
+
+    return `You are a senior Spring migration architect.
+
+USER REQUEST: ${userRequest}
+
+PROJECT INTELLIGENCE:
+${context}
+
+MIGRATION SUMMARY (from already-generated migration.md):
+${markdownSummary.slice(0, 1500)}${markdownSummary.length > 1500 ? "\n...[truncated]" : ""}
+
+Generate a structured JSON task list for the migration. Migration target: migrate/
+
+RULES:
+- Return ONLY a valid JSON array — no markdown, no explanation
+- Every task: id (task-001…), title, type (build|config|code|resource), files[], dependsOn[], description
+- Order: build tasks first, then config, then code, then resource
+- No circular dependencies in dependsOn
+- Files must be paths under migrate/
+- Cover ALL controllers, services, repositories, XML configs identified above
+
+\`\`\`json
+[
+  {
+    "id": "task-001",
+    "title": "Create Spring Boot main application class",
+    "type": "build",
+    "files": ["migrate/src/main/java/com/example/Application.java"],
+    "dependsOn": [],
+    "description": "Create @SpringBootApplication entry point"
+  }
+]
+\`\`\`
+
+Return ONLY the JSON array inside a \`\`\`json block.`;
+  }
+
   static getMigrationDocumentInstructions(): string {
     return `YOUR TASK:
 Generate a DUAL OUTPUT: (1) a complete Migration.md document AND (2) a structured task list JSON.

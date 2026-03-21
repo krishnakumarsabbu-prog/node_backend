@@ -56,56 +56,53 @@ export class PlannerAgent {
 
     const fileList = Object.keys(files);
 
+    // --- Call 1: Generate markdown document only ---
+    const mdPrompt = PromptBuilder.buildMarkdownOnlyPrompt(intelligence, userRequest);
+    logger.info(`Markdown-only prompt: ${mdPrompt.length} chars`);
+
+    const { text: mdText } = await generateText({
+      model: getTachyonModel(),
+      messages: [{ role: "user", content: mdPrompt }],
+      maxTokens: 6144,
+    });
+
+    const markdownContent = mdText.trim();
+    logger.info(`Migration.md generated: ${markdownContent.length} chars`);
+
+    // --- Call 2: Generate tasks JSON only, referencing the markdown summary ---
     for (let cycleAttempt = 1; cycleAttempt <= MAX_CYCLE_RETRY_ATTEMPTS + 1; cycleAttempt++) {
       const cycleHint = cycleAttempt > 1
-        ? `\n\nIMPORTANT: A previous generation attempt produced a task graph with circular dependencies. You MUST ensure every dependsOn reference is strictly forward-only (a task may only depend on tasks with a lower index). Do NOT create any circular dependency chains.`
+        ? `\n\nIMPORTANT: Previous attempt had circular dependencies. Ensure dependsOn is strictly forward-only — no cycles.`
         : "";
 
-      const prompt = PromptBuilder.buildMigrationDocumentPrompt(
-        analysis,
-        userRequest,
-        fileList,
-        {},
-        intelligence
-      ) + cycleHint;
+      const tasksPrompt = PromptBuilder.buildTasksOnlyPrompt(intelligence, userRequest, markdownContent) + cycleHint;
+      logger.info(`Tasks-only prompt: ${tasksPrompt.length} chars (attempt ${cycleAttempt})`);
 
-      if (cycleAttempt > 1) {
-        logger.warn(`Cycle-retry attempt ${cycleAttempt}/${MAX_CYCLE_RETRY_ATTEMPTS + 1}: regenerating plan with anti-cycle hint`);
-      }
-
-      logger.info(`Migration document prompt built: ${prompt.length} chars`);
-
-      const { text: rawText } = await generateText({
+      const { text: tasksText } = await generateText({
         model: getTachyonModel(),
-        messages: [{ role: "user", content: prompt }],
-        maxTokens: 8192,
+        messages: [{ role: "user", content: tasksPrompt }],
+        maxTokens: 4096,
       });
 
-      const result = { text: rawText.trim() };
-
-      let markdownContent: string;
       let plan: MigrationPlan;
-
       try {
-        ({ markdownContent, plan } = this.parseDualOutput(result.text.trim(), fileList));
+        plan = this.parseTasksOutput(tasksText.trim(), fileList);
       } catch (parseErr: any) {
         if (parseErr.message?.startsWith("CYCLE_DETECTED") && cycleAttempt <= MAX_CYCLE_RETRY_ATTEMPTS) {
-          logger.warn(`Cycle detected in generated plan (attempt ${cycleAttempt}), retrying...`);
+          logger.warn(`Cycle detected in tasks (attempt ${cycleAttempt}), retrying tasks call...`);
           continue;
         }
         throw parseErr;
       }
 
-      logger.info(
-        `Migration.md generated: ${markdownContent.length} chars, ${plan.tasks.length} tasks`
-      );
+      logger.info(`Tasks generated: ${plan.tasks.length} tasks`);
 
       let fixed: { markdownContent: string; plan: MigrationPlan };
       try {
         fixed = await this.verifyAndFix(intelligence, markdownContent, plan);
       } catch (fixErr: any) {
         if (fixErr.message?.startsWith("CYCLE_DETECTED") && cycleAttempt <= MAX_CYCLE_RETRY_ATTEMPTS) {
-          logger.warn(`Cycle detected after verify/fix (attempt ${cycleAttempt}), retrying full generation...`);
+          logger.warn(`Cycle detected after verify/fix (attempt ${cycleAttempt}), retrying tasks call...`);
           continue;
         }
         throw fixErr;
@@ -214,6 +211,33 @@ export class PlannerAgent {
     );
 
     return plan;
+  }
+
+  private parseTasksOutput(text: string, fileList: string[]): MigrationPlan {
+    const jsonMatch = text.match(/```json\s*([\s\S]*?)```/);
+    const rawJson = jsonMatch ? jsonMatch[1].trim() : text.trim();
+
+    let rawTasks: DualOutputTask[];
+    try {
+      const parsed = JSON.parse(rawJson);
+      rawTasks = Array.isArray(parsed) ? parsed : parsed.tasks ?? [];
+    } catch (err: any) {
+      logger.warn(`Failed to parse tasks JSON: ${err}. Falling back to empty task list.`);
+      rawTasks = [];
+    }
+
+    const tasks = this.convertAndValidateTasks(rawTasks);
+
+    return {
+      migrationType: "spring-mvc-to-boot",
+      summary: {
+        filesToModify: 0,
+        filesToDelete: 0,
+        filesToCreate: tasks.filter((t) => t.action === "create").length,
+      },
+      tasks,
+      estimatedComplexity: tasks.length > 20 ? "high" : tasks.length > 8 ? "medium" : "low",
+    };
   }
 
   private parseDualOutput(text: string, fileList: string[]): { markdownContent: string; plan: MigrationPlan } {
