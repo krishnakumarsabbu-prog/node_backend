@@ -1,17 +1,8 @@
-import type { ProjectAnalysis, Framework, BuildTool } from "../types/migrationTypes";
+import type { ProjectAnalysis, Framework, BuildTool, SpringArtifacts } from "../types/migrationTypes";
 import type { FileMap } from "../../llm/constants";
 import { createScopedLogger } from "../../utils/logger";
 
-export interface SpringArtifacts {
-  filters: string[];
-  interceptors: string[];
-  listeners: string[];
-  aspects: string[];
-  validators: string[];
-  converters: string[];
-  exceptionHandlers: string[];
-  scheduledTasks: string[];
-}
+export type { SpringArtifacts };
 
 const logger = createScopedLogger("analyzer-agent");
 
@@ -48,7 +39,7 @@ export class AnalyzerAgent {
         `listeners=${artifacts.listeners.length}, aspects=${artifacts.aspects.length}, ` +
         `exceptionHandlers=${artifacts.exceptionHandlers.length}, scheduledTasks=${artifacts.scheduledTasks.length}`
       );
-      (analysis as any).springArtifacts = artifacts;
+      analysis.springArtifacts = artifacts;
     }
 
     logger.info(

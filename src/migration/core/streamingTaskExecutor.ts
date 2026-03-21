@@ -241,6 +241,30 @@ export async function executeTaskGraphStreaming(
     });
     staticFixErrors = fixResult.errors;
     autoFixAttempts = fixResult.attempts;
+
+    if (staticFixErrors.length > 0) {
+      const criticalErrors = staticResult.issues
+        .filter((i) => i.severity === "error")
+        .map((i) => `[${i.type}] ${i.message}`);
+      writeAnnotation(res, {
+        type: "migration_rollback_recommended",
+        reason: `Static validation found ${criticalErrors.length} unresolvable error(s) after ${MAX_STATIC_FIX_ATTEMPTS} auto-fix attempts`,
+        errors: criticalErrors.slice(0, 10),
+        suggestion: "Review generated files manually or re-run migration with more context",
+      });
+    }
+
+    if (staticFixErrors.length > 0) {
+      const criticalErrors = staticResult.issues
+        .filter((i) => i.severity === "error")
+        .map((i) => `[${i.type}] ${i.message}`);
+      writeAnnotation(res, {
+        type: "migration_rollback_recommended",
+        reason: `Static validation found ${criticalErrors.length} unresolvable error(s) after ${MAX_STATIC_FIX_ATTEMPTS} auto-fix attempts`,
+        errors: criticalErrors.slice(0, 10),
+        suggestion: "Review the generated files manually or re-run the migration with additional context",
+      });
+    }
   }
 
   const warningCount = staticResult.issues.filter((i) => i.severity === "warning").length;
@@ -773,6 +797,13 @@ function appendStageRules(sections: string[], type: string, state: MigrationStat
       sections.push(`- ALWAYS annotate configuration classes with @Configuration`);
       sections.push(`- ALWAYS replace every <bean> element with a @Bean method — see XML BEAN DEFINITIONS section above`);
       sections.push(`- For <property name="x" ref="y"/>: add parameter "YType y" to the @Bean method and call setX(y)`);
+      sections.push(`- NEVER add @EnableWebMvc to the @SpringBootApplication class — use a separate @Configuration`);
+      sections.push(`- Servlet Filters → @Bean FilterRegistrationBean<YourFilter>; set order with setOrder()`);
+      sections.push(`- HandlerInterceptors → implement WebMvcConfigurer, override addInterceptors(); NEVER register as standalone @Bean`);
+      sections.push(`- AOP @Aspect → keep @Component @Aspect; add @EnableAspectJAutoProxy to a @Configuration`);
+      sections.push(`- Scheduling → @EnableScheduling on @Configuration; keep @Scheduled methods on the bean`);
+      sections.push(`- Async → @EnableAsync on @Configuration; keep @Async methods on the bean`);
+      sections.push(`- Security → SecurityFilterChain @Bean inside @Configuration @EnableWebSecurity class`);
       sections.push(`- For <constructor-arg ref="y"/>: add parameter "YType y" to the @Bean method and pass to constructor`);
       sections.push(`- For <constructor-arg value="x"/>: pass literal value to constructor`);
       sections.push(`- For init-method="x": use @Bean(initMethod = "x")`);
@@ -785,6 +816,13 @@ function appendStageRules(sections: string[], type: string, state: MigrationStat
       sections.push(`- If replacing web.xml: ALWAYS create @SpringBootApplication main class with SpringApplication.run()`);
       sections.push(`- NEVER copy XML into the target project — convert it to Java`);
       sections.push(`- NEVER leave any <bean> unconverted — every bean in the XML must have a corresponding @Bean method`);
+      sections.push(`- NEVER add @EnableWebMvc to the @SpringBootApplication class — use a separate @Configuration`);
+      sections.push(`- Servlet Filters → @Bean FilterRegistrationBean<YourFilter>; set order with setOrder()`);
+      sections.push(`- HandlerInterceptors → implement WebMvcConfigurer, override addInterceptors(); NEVER register as standalone @Bean`);
+      sections.push(`- AOP @Aspect → keep @Component @Aspect; add @EnableAspectJAutoProxy to a @Configuration`);
+      sections.push(`- Scheduling → @EnableScheduling on @Configuration; keep @Scheduled methods on the bean`);
+      sections.push(`- Async → @EnableAsync on @Configuration; keep @Async methods on the bean`);
+      sections.push(`- Security → SecurityFilterChain @Bean inside @Configuration @EnableWebSecurity class`);
       break;
     case "code":
       sections.push(`\n## CODE RULES`);
@@ -831,6 +869,44 @@ function updateGlobalStateFromContent(state: MigrationState, filePath: string, c
   if (!content) return;
 
   const beanMatches = content.matchAll(/@Bean\s*\n[^@]*?\s+(\w+)\s*\(/g);
+
+  if (content.includes("SecurityFilterChain") && content.includes("@Bean")) {
+    if (!state.globalDecisions.securityFilterChainBean) {
+      state.globalDecisions.securityFilterChainBean = filePath;
+    }
+    if (!state.globalDecisions.filterChainBeans.includes(filePath)) {
+      state.globalDecisions.filterChainBeans.push(filePath);
+    }
+  }
+
+  if (content.includes("implements WebMvcConfigurer") && !state.globalDecisions.webMvcConfigurerClass) {
+    state.globalDecisions.webMvcConfigurerClass = filePath;
+  }
+
+  if (content.includes("FilterRegistrationBean")) {
+    const base = filePath.split("/").pop() ?? filePath;
+    if (!state.globalDecisions.migratedFilters.includes(base)) {
+      state.globalDecisions.migratedFilters.push(base);
+    }
+  }
+
+  if (content.includes("addInterceptors") || content.includes("implements HandlerInterceptor")) {
+    const base = filePath.split("/").pop() ?? filePath;
+    if (!state.globalDecisions.migratedInterceptors.includes(base)) {
+      state.globalDecisions.migratedInterceptors.push(base);
+    }
+  }
+
+  if (content.includes("@Aspect")) {
+    const base = filePath.split("/").pop() ?? filePath;
+    if (!state.globalDecisions.migratedAspects.includes(base)) {
+      state.globalDecisions.migratedAspects.push(base);
+    }
+  }
+
+  if (content.includes("@EnableAspectJAutoProxy")) state.globalDecisions.aopEnabled = true;
+  if (content.includes("@EnableScheduling")) state.globalDecisions.schedulingEnabled = true;
+  if (content.includes("@EnableAsync")) state.globalDecisions.asyncEnabled = true;
   for (const match of beanMatches) {
     registerBean(state, match[1], filePath);
   }
@@ -850,6 +926,44 @@ function updateGlobalStateFromContent(state: MigrationState, filePath: string, c
   if (content.includes("@Configuration") && !state.globalDecisions.configClasses.includes(filePath)) {
     state.globalDecisions.configClasses.push(filePath);
   }
+
+  if (content.includes("SecurityFilterChain") && content.includes("@Bean")) {
+    if (!state.globalDecisions.securityFilterChainBean) {
+      state.globalDecisions.securityFilterChainBean = filePath;
+    }
+    if (!state.globalDecisions.filterChainBeans.includes(filePath)) {
+      state.globalDecisions.filterChainBeans.push(filePath);
+    }
+  }
+
+  if (content.includes("implements WebMvcConfigurer") && !state.globalDecisions.webMvcConfigurerClass) {
+    state.globalDecisions.webMvcConfigurerClass = filePath;
+  }
+
+  if (content.includes("FilterRegistrationBean")) {
+    const filterBase = filePath.split("/").pop() ?? filePath;
+    if (!state.globalDecisions.migratedFilters.includes(filterBase)) {
+      state.globalDecisions.migratedFilters.push(filterBase);
+    }
+  }
+
+  if (content.includes("addInterceptors") || content.includes("implements HandlerInterceptor")) {
+    const intBase = filePath.split("/").pop() ?? filePath;
+    if (!state.globalDecisions.migratedInterceptors.includes(intBase)) {
+      state.globalDecisions.migratedInterceptors.push(intBase);
+    }
+  }
+
+  if (content.includes("@Aspect")) {
+    const aspectBase = filePath.split("/").pop() ?? filePath;
+    if (!state.globalDecisions.migratedAspects.includes(aspectBase)) {
+      state.globalDecisions.migratedAspects.push(aspectBase);
+    }
+  }
+
+  if (content.includes("@EnableAspectJAutoProxy")) state.globalDecisions.aopEnabled = true;
+  if (content.includes("@EnableScheduling")) state.globalDecisions.schedulingEnabled = true;
+  if (content.includes("@EnableAsync")) state.globalDecisions.asyncEnabled = true;
 }
 
 function runStageValidation(

@@ -1,5 +1,5 @@
 import type { FileMap } from "../../llm/constants";
-import type { ProjectAnalysis, DetectedPatterns } from "../types/migrationTypes";
+import type { ProjectAnalysis, DetectedPatterns, SpringArtifacts } from "../types/migrationTypes";
 import { extractFileSummaries, serializeFileSummary, type FileSummary } from "./semanticExtractor";
 import { buildDependencyGraph, serializeDependencyGraph, type DependencyGraph, type GraphSummary } from "./dependencyGraph";
 import { parseXmlConfigs, serializeAllXmlSummaries, type XmlFileSummary } from "./xmlConfigParser";
@@ -68,6 +68,7 @@ export interface CodebaseIntelligence {
   buildConfig?: { hasBootParent: boolean; hasBootPlugin: boolean };
 
   migrationPatterns: MigrationPattern[];
+  springArtifacts?: SpringArtifacts;
 
   ir: IrProjectModel;
 
@@ -79,6 +80,7 @@ export interface CodebaseIntelligence {
     patterns: string;
     detectedPatterns: string;
     ir: string;
+    springArtifacts: string;
   };
 }
 
@@ -223,6 +225,49 @@ function serializeMigrationPatterns(patterns: MigrationPattern[]): string {
   return patterns.map((p) => `  → [${p}] ${descriptions[p]}`).join("\n");
 }
 
+function serializeSpringArtifacts(artifacts: SpringArtifacts | undefined): string {
+  if (!artifacts) return "(no Spring artifacts detected)";
+
+  const baseName = (p: string) => p.split("/").pop() ?? p;
+  const lines: string[] = [];
+
+  if (artifacts.filters.length > 0) {
+    lines.push(`Filters (${artifacts.filters.length}): ${artifacts.filters.map(baseName).join(", ")}`);
+    lines.push(`  → Must be converted to FilterRegistrationBean @Bean or Spring Security FilterChain`);
+  }
+  if (artifacts.interceptors.length > 0) {
+    lines.push(`Interceptors (${artifacts.interceptors.length}): ${artifacts.interceptors.map(baseName).join(", ")}`);
+    lines.push(`  → Must be registered via WebMvcConfigurer.addInterceptors()`);
+  }
+  if (artifacts.listeners.length > 0) {
+    lines.push(`Listeners (${artifacts.listeners.length}): ${artifacts.listeners.map(baseName).join(", ")}`);
+    lines.push(`  → ApplicationListeners are kept as-is; ServletContextListeners become @EventListener`);
+  }
+  if (artifacts.aspects.length > 0) {
+    lines.push(`AOP Aspects (${artifacts.aspects.length}): ${artifacts.aspects.map(baseName).join(", ")}`);
+    lines.push(`  → Annotate @Aspect @Component, enable with @EnableAspectJAutoProxy on @Configuration`);
+  }
+  if (artifacts.validators.length > 0) {
+    lines.push(`Validators (${artifacts.validators.length}): ${artifacts.validators.map(baseName).join(", ")}`);
+    lines.push(`  → Register via WebMvcConfigurer.getValidator() or keep as @Component`);
+  }
+  if (artifacts.converters.length > 0) {
+    lines.push(`Converters (${artifacts.converters.length}): ${artifacts.converters.map(baseName).join(", ")}`);
+    lines.push(`  → Register via WebMvcConfigurer.addFormatters() or ConversionServiceFactoryBean`);
+  }
+  if (artifacts.exceptionHandlers.length > 0) {
+    lines.push(`Exception Handlers (${artifacts.exceptionHandlers.length}): ${artifacts.exceptionHandlers.map(baseName).join(", ")}`);
+    lines.push(`  → Annotate with @RestControllerAdvice; keep @ExceptionHandler methods`);
+  }
+  if (artifacts.scheduledTasks.length > 0) {
+    lines.push(`Scheduled Tasks (${artifacts.scheduledTasks.length}): ${artifacts.scheduledTasks.map(baseName).join(", ")}`);
+    lines.push(`  → Add @EnableScheduling to @Configuration; keep @Scheduled/@Async methods`);
+  }
+
+  if (lines.length === 0) return "(no notable Spring artifacts)";
+  return lines.join("\n");
+}
+
 function serializeDetectedPatterns(patterns: DetectedPatterns): string {
   const lines: string[] = [];
   lines.push(`usesXmlConfiguration: ${patterns.usesXmlConfiguration}`);
@@ -300,6 +345,7 @@ export function buildCodebaseIntelligence(files: FileMap, analysis: ProjectAnaly
     xmlConfigs,
     buildSummary,
     migrationPatterns,
+    springArtifacts: analysis.springArtifacts,
     buildConfig: {
       hasBootParent: buildSummary.hasSpringBootParent ?? false,
       hasBootPlugin: buildSummary.hasSpringBootPlugin ?? false,
@@ -320,6 +366,7 @@ export function buildCodebaseIntelligence(files: FileMap, analysis: ProjectAnaly
       patterns: serializeMigrationPatterns(migrationPatterns),
       detectedPatterns: serializeDetectedPatterns(detectedPatterns),
       ir: serializeIR(ir),
+      springArtifacts: serializeSpringArtifacts(analysis.springArtifacts),
     },
   };
 
@@ -393,6 +440,23 @@ export function buildMigrationContextPrompt(intelligence: CodebaseIntelligence, 
 
   sections.push(`\n## INTERMEDIATE REPRESENTATION (IR)`);
   sections.push(intelligence.serialized.ir);
+
+  if (intelligence.springArtifacts) {
+    const hasArtifacts =
+      (intelligence.springArtifacts.filters.length +
+        intelligence.springArtifacts.interceptors.length +
+        intelligence.springArtifacts.listeners.length +
+        intelligence.springArtifacts.aspects.length +
+        intelligence.springArtifacts.validators.length +
+        intelligence.springArtifacts.converters.length +
+        intelligence.springArtifacts.exceptionHandlers.length +
+        intelligence.springArtifacts.scheduledTasks.length) > 0;
+
+    if (hasArtifacts) {
+      sections.push(`\n## SPRING ARTIFACTS (MUST BE MIGRATED)`);
+      sections.push(intelligence.serialized.springArtifacts);
+    }
+  }
 
   sections.push(`\n## REQUIRED MIGRATION ACTIONS`);
   sections.push(intelligence.serialized.patterns);

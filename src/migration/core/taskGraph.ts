@@ -29,6 +29,51 @@ const STAGE_PRIORITY: Record<MigrationTaskCategory, number> = {
   resource: 3,
 };
 
+const SPRING_TASK_SUB_PRIORITY: Array<{ pattern: RegExp; priority: number }> = [
+  { pattern: /Application\.(java|kt)$/i, priority: 100 },
+  { pattern: /pom\.xml$/i, priority: 99 },
+  { pattern: /build\.gradle(\.kts)?$/i, priority: 99 },
+  { pattern: /SecurityConfig/i, priority: 80 },
+  { pattern: /WebConfig|WebMvcConfig/i, priority: 75 },
+  { pattern: /AppConfig|ApplicationConfig/i, priority: 70 },
+  { pattern: /DataSourceConfig|JpaConfig|PersistenceConfig/i, priority: 65 },
+  { pattern: /FilterRegistration|FilterConfig/i, priority: 60 },
+  { pattern: /InterceptorConfig/i, priority: 55 },
+  { pattern: /AopConfig|AspectConfig/i, priority: 50 },
+  { pattern: /SchedulingConfig|AsyncConfig/i, priority: 45 },
+  { pattern: /application\.(properties|yml|yaml)$/i, priority: 40 },
+];
+
+function getSpringSubPriority(file: string): number {
+  const name = file.split("/").pop() ?? file;
+  for (const { pattern, priority } of SPRING_TASK_SUB_PRIORITY) {
+    if (pattern.test(name) || pattern.test(file)) return priority;
+  }
+  return 0;
+}
+
+const SPRING_TASK_SUB_PRIORITY: Array<{ pattern: RegExp; priority: number }> = [
+  { pattern: /application\.(java|kt)$/i, priority: 100 },
+  { pattern: /pom\.xml$/i, priority: 99 },
+  { pattern: /build\.gradle(\.kts)?$/i, priority: 99 },
+  { pattern: /SecurityConfig/i, priority: 80 },
+  { pattern: /WebConfig|WebMvcConfig/i, priority: 75 },
+  { pattern: /AppConfig|ApplicationConfig/i, priority: 70 },
+  { pattern: /DataSourceConfig|JpaConfig|PersistenceConfig/i, priority: 65 },
+  { pattern: /FilterRegistration|FilterConfig/i, priority: 60 },
+  { pattern: /InterceptorConfig/i, priority: 55 },
+  { pattern: /AopConfig|AspectConfig/i, priority: 50 },
+  { pattern: /SchedulingConfig|AsyncConfig/i, priority: 45 },
+  { pattern: /application\.(properties|yml|yaml)$/i, priority: 40 },
+];
+
+function getSpringSubPriority(file: string): number {
+  for (const { pattern, priority } of SPRING_TASK_SUB_PRIORITY) {
+    if (pattern.test(file)) return priority;
+  }
+  return 0;
+}
+
 export function buildTaskGraph(tasks: MigrationTask[]): TaskGraph {
   const nodes = new Map<string, TaskNode>();
 
@@ -88,6 +133,9 @@ function topoSortIntoWaves(nodes: Map<string, TaskNode>): ExecutionWave[] {
       .map((id) => nodes.get(id)!.task)
       .sort(byStageAndPriority);
 
+  const subA = getSpringSubPriority(a.file);
+  const subB = getSpringSubPriority(b.file);
+  if (subA !== subB) return subB - subA;
     waves.push({
       wave: waveIndex++,
       tasks: waveTasks,
@@ -110,6 +158,11 @@ function byStageAndPriority(a: MigrationTask, b: MigrationTask): number {
   const stageA = STAGE_PRIORITY[a.type ?? "code"];
   const stageB = STAGE_PRIORITY[b.type ?? "code"];
   if (stageA !== stageB) return stageA - stageB;
+
+  const subA = getSpringSubPriority(a.file);
+  const subB = getSpringSubPriority(b.file);
+  if (subA !== subB) return subB - subA;
+
   return (b.priority ?? 5) - (a.priority ?? 5);
 }
 

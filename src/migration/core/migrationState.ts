@@ -18,6 +18,26 @@ export interface GlobalDecisions {
   mainClass: string | null;
   configClasses: string[];
   removedXmlFiles: string[];
+  filterChainBeans: string[];
+  interceptorRegistryClass: string | null;
+  webMvcConfigurerClass: string | null;
+  securityFilterChainBean: string | null;
+  aopEnabled: boolean;
+  schedulingEnabled: boolean;
+  asyncEnabled: boolean;
+  migratedFilters: string[];
+  migratedInterceptors: string[];
+  migratedAspects: string[];
+  filterChainBeans: string[];
+  interceptorRegistryClass: string | null;
+  webMvcConfigurerClass: string | null;
+  securityFilterChainBean: string | null;
+  aopEnabled: boolean;
+  schedulingEnabled: boolean;
+  asyncEnabled: boolean;
+  migratedFilters: string[];
+  migratedInterceptors: string[];
+  migratedAspects: string[];
 }
 
 export interface MigrationState {
@@ -42,6 +62,16 @@ export function createMigrationState(sourceFiles: Map<string, string>): Migratio
   return {
     completedTasks: new Set(),
     failedTasks: new Map(),
+      filterChainBeans: [],
+      interceptorRegistryClass: null,
+      webMvcConfigurerClass: null,
+      securityFilterChainBean: null,
+      aopEnabled: false,
+      schedulingEnabled: false,
+      asyncEnabled: false,
+      migratedFilters: [],
+      migratedInterceptors: [],
+      migratedAspects: [],
     fileMap,
     operations: [],
     errors: [],
@@ -52,6 +82,16 @@ export function createMigrationState(sourceFiles: Map<string, string>): Migratio
       mainClass: null,
       configClasses: [],
       removedXmlFiles: [],
+      filterChainBeans: [],
+      interceptorRegistryClass: null,
+      webMvcConfigurerClass: null,
+      securityFilterChainBean: null,
+      aopEnabled: false,
+      schedulingEnabled: false,
+      asyncEnabled: false,
+      migratedFilters: [],
+      migratedInterceptors: [],
+      migratedAspects: [],
     },
   };
 }
@@ -98,6 +138,28 @@ export function registerBean(state: MigrationState, beanName: string, sourceFile
     state.globalDecisions.beanNames.set(beanName, sourceFile);
   }
 }
+  if (state.globalDecisions.securityFilterChainBean) {
+    lines.push(`Security FilterChain: ${state.globalDecisions.securityFilterChainBean.split("/").pop()} — DO NOT duplicate`);
+  }
+  if (state.globalDecisions.webMvcConfigurerClass) {
+    lines.push(`WebMvcConfigurer: ${state.globalDecisions.webMvcConfigurerClass.split("/").pop()} — add interceptors/formatters HERE`);
+  }
+  if (state.globalDecisions.filterChainBeans.length > 0) {
+    lines.push(`Registered FilterChain Beans: ${state.globalDecisions.filterChainBeans.map((f) => f.split("/").pop()).join(", ")} — DO NOT duplicate`);
+  }
+  if (state.globalDecisions.migratedFilters.length > 0) {
+    lines.push(`Migrated Filters: ${state.globalDecisions.migratedFilters.join(", ")}`);
+  }
+  if (state.globalDecisions.migratedInterceptors.length > 0) {
+    lines.push(`Migrated Interceptors: ${state.globalDecisions.migratedInterceptors.join(", ")}`);
+  }
+  if (state.globalDecisions.migratedAspects.length > 0) {
+    lines.push(`Migrated AOP Aspects: ${state.globalDecisions.migratedAspects.join(", ")}`);
+  }
+  if (state.globalDecisions.aopEnabled) lines.push(`@EnableAspectJAutoProxy: ADDED — do not duplicate`);
+  if (state.globalDecisions.schedulingEnabled) lines.push(`@EnableScheduling: ADDED — do not duplicate`);
+  if (state.globalDecisions.asyncEnabled) lines.push(`@EnableAsync: ADDED — do not duplicate`);
+
 
 export function serializeGlobalDecisions(state: MigrationState): string {
   const lines: string[] = [];
@@ -116,6 +178,34 @@ export function serializeGlobalDecisions(state: MigrationState): string {
 
   if (state.globalDecisions.removedXmlFiles.length > 0) {
     lines.push(`Removed XML Files: ${state.globalDecisions.removedXmlFiles.join(", ")}`);
+  }
+
+  if (state.globalDecisions.securityFilterChainBean) {
+    lines.push(`Security FilterChain Bean: ${state.globalDecisions.securityFilterChainBean} — DO NOT duplicate`);
+  }
+  if (state.globalDecisions.webMvcConfigurerClass) {
+    lines.push(`WebMvcConfigurer: ${state.globalDecisions.webMvcConfigurerClass.split("/").pop()} — add interceptors/formatters HERE`);
+  }
+  if (state.globalDecisions.filterChainBeans.length > 0) {
+    lines.push(`Registered FilterChain Beans: ${state.globalDecisions.filterChainBeans.join(", ")} — DO NOT duplicate`);
+  }
+  if (state.globalDecisions.migratedFilters.length > 0) {
+    lines.push(`Migrated Filters: ${state.globalDecisions.migratedFilters.map((f) => f.split("/").pop()).join(", ")}`);
+  }
+  if (state.globalDecisions.migratedInterceptors.length > 0) {
+    lines.push(`Migrated Interceptors: ${state.globalDecisions.migratedInterceptors.map((f) => f.split("/").pop()).join(", ")}`);
+  }
+  if (state.globalDecisions.migratedAspects.length > 0) {
+    lines.push(`Migrated AOP Aspects: ${state.globalDecisions.migratedAspects.map((f) => f.split("/").pop()).join(", ")}`);
+  }
+  if (state.globalDecisions.aopEnabled) {
+    lines.push(`@EnableAspectJAutoProxy: ALREADY ADDED — do not duplicate`);
+  }
+  if (state.globalDecisions.schedulingEnabled) {
+    lines.push(`@EnableScheduling: ALREADY ADDED — do not duplicate`);
+  }
+  if (state.globalDecisions.asyncEnabled) {
+    lines.push(`@EnableAsync: ALREADY ADDED — do not duplicate`);
   }
 
   lines.push(`Completed Tasks: ${state.completedTasks.size}`);

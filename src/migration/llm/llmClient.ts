@@ -55,12 +55,24 @@ export class LLMClient {
             content: prompt,
           });
 
-          const response = await generateText({
-            model: getTachyonModel(),
-            messages,
-            maxTokens: this.config.maxTokens,
-            temperature: this.config.temperature,
-          });
+          const abortController = new AbortController();
+          const timeoutHandle = setTimeout(
+            () => abortController.abort(new Error(`LLM request timed out after ${this.config.timeout}ms`)),
+            this.config.timeout
+          );
+
+          let response: Awaited<ReturnType<typeof generateText>>;
+          try {
+            response = await generateText({
+              model: getTachyonModel(),
+              messages,
+              maxTokens: this.config.maxTokens,
+              temperature: this.config.temperature,
+              abortSignal: abortController.signal,
+            });
+          } finally {
+            clearTimeout(timeoutHandle);
+          }
 
           const parsedData = parser(response.text);
 

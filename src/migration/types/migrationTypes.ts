@@ -88,6 +88,29 @@ export interface MigrationPlan {
   estimatedComplexity?: "low" | "medium" | "high";
 }
 
+export interface SpringArtifacts {
+  filters: string[];
+  interceptors: string[];
+  listeners: string[];
+  aspects: string[];
+  validators: string[];
+  converters: string[];
+  exceptionHandlers: string[];
+  scheduledTasks: string[];
+}
+
+export interface SpringArtifacts {
+  filters: string[];
+  interceptors: string[];
+  listeners: string[];
+  aspects: string[];
+  validators: string[];
+  converters: string[];
+  exceptionHandlers: string[];
+  scheduledTasks: string[];
+}
+
+  springArtifacts?: SpringArtifacts;
 export interface ProjectAnalysis {
   framework: Framework;
   buildTool: BuildTool;
@@ -99,6 +122,7 @@ export interface ProjectAnalysis {
   dependencies: string[];
   entryPoints: string[];
   testFiles: string[];
+  springArtifacts?: SpringArtifacts;
 }
 
 export interface FileOperation {

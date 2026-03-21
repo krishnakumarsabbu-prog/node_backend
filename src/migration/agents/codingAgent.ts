@@ -172,6 +172,20 @@ export class CodingAgent {
         sections.push(`- Replace context:component-scan with @SpringBootApplication or @ComponentScan`);
         sections.push(`- Replace property-placeholder with @Value or @ConfigurationProperties`);
         sections.push(`- If this replaces web.xml: create @SpringBootApplication main class instead`);
+        sections.push(`- NEVER add @EnableWebMvc to the @SpringBootApplication class — use a separate @Configuration`);
+        sections.push(`- Servlet Filters → @Bean FilterRegistrationBean<YourFilter>; set order with setOrder()`);
+        sections.push(`- HandlerInterceptors → implement WebMvcConfigurer, override addInterceptors(); NEVER register as standalone @Bean`);
+        sections.push(`- AOP @Aspect → keep @Component @Aspect; add @EnableAspectJAutoProxy to a @Configuration class`);
+        sections.push(`- Scheduling → add @EnableScheduling to @Configuration; keep @Scheduled methods on the bean`);
+        sections.push(`- Async → add @EnableAsync to @Configuration; keep @Async methods on the bean`);
+        sections.push(`- Security → SecurityFilterChain @Bean inside @Configuration @EnableWebSecurity class`);
+        sections.push(`- NEVER add @EnableWebMvc to the @SpringBootApplication class — use a separate @Configuration`);
+        sections.push(`- Servlet Filters → @Bean FilterRegistrationBean<YourFilter>; set order explicitly`);
+        sections.push(`- HandlerInterceptors → implement WebMvcConfigurer, override addInterceptors(); NEVER register as a standalone @Bean`);
+        sections.push(`- AOP @Aspect classes → keep as @Component @Aspect; add @EnableAspectJAutoProxy to a @Configuration class`);
+        sections.push(`- Scheduling → add @EnableScheduling to a @Configuration class; keep @Scheduled methods on the bean`);
+        sections.push(`- Async → add @EnableAsync to a @Configuration class; keep @Async methods on the bean`);
+        sections.push(`- Security → declare SecurityFilterChain @Bean in a class annotated with @Configuration @EnableWebSecurity`);
         break;
 
       case "code":
