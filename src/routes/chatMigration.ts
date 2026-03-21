@@ -19,9 +19,22 @@ export interface MigrationRequest {
   migrationAction?: "plan" | "implement";
 }
 
+function computeFileMapHash(files: FileMap): string {
+  const paths = Object.keys(files).sort();
+  let hash = 0;
+  for (const p of paths) {
+    const content = (files[p] as any)?.content ?? "";
+    for (let i = 0; i < Math.min(content.length, 512); i++) {
+      hash = ((hash << 5) - hash + content.charCodeAt(i)) | 0;
+    }
+  }
+  return `${paths.length}:${hash >>> 0}`;
+}
+
 export class ChatMigrationHandler {
   private runner: MigrationRunner;
   private cachedIntelligence: CodebaseIntelligence | null = null;
+  private cachedFilesHash: string | null = null;
 
   constructor(workDir: string, enableVerification = false) {
     this.runner = new MigrationRunner({
@@ -75,6 +88,7 @@ export class ChatMigrationHandler {
 
       const intelligence = buildCodebaseIntelligence(request.files, analysis);
       this.cachedIntelligence = intelligence;
+      this.cachedFilesHash = computeFileMapHash(request.files);
 
       const patternList = intelligence.migrationPatterns.length > 0
         ? intelligence.migrationPatterns.join(", ")
@@ -260,28 +274,41 @@ ${tasksJson}
 
     if (apiKeys && streamingOptions) {
       let intelligence = this.cachedIntelligence;
+      const currentHash = computeFileMapHash(request.files);
+      const cacheValid = intelligence !== null && this.cachedFilesHash === currentHash;
 
-      if (intelligence) {
+      if (cacheValid && intelligence) {
         writeDataPart(res, {
           type: "progress",
           label: "migration-intelligence",
           status: "complete",
           order: progressCounter++,
-          message: `Using cached codebase intelligence: ${intelligence.fileSummaries.length} files, ${intelligence.xmlConfigs.length} XML configs, patterns=[${intelligence.migrationPatterns.join(", ")}]`,
+          message: `Using cached codebase intelligence (hash match): ${intelligence.fileSummaries.length} files, ${intelligence.xmlConfigs.length} XML configs, patterns=[${intelligence.migrationPatterns.join(", ")}]`,
         } satisfies ProgressAnnotation);
       } else {
-        writeDataPart(res, {
-          type: "progress",
-          label: "migration-intelligence",
-          status: "in-progress",
-          order: progressCounter++,
-          message: "Rebuilding codebase intelligence (no cache from plan phase)...",
-        } satisfies ProgressAnnotation);
+        if (intelligence && !cacheValid) {
+          writeDataPart(res, {
+            type: "progress",
+            label: "migration-intelligence",
+            status: "in-progress",
+            order: progressCounter++,
+            message: "File set changed since plan phase — rebuilding codebase intelligence to stay in sync...",
+          } satisfies ProgressAnnotation);
+        } else {
+          writeDataPart(res, {
+            type: "progress",
+            label: "migration-intelligence",
+            status: "in-progress",
+            order: progressCounter++,
+            message: "Rebuilding codebase intelligence (no cache from plan phase)...",
+          } satisfies ProgressAnnotation);
+        }
 
         const analyzerAgent = new AnalyzerAgent();
         const analysis = await analyzerAgent.analyze(request.files);
         intelligence = buildCodebaseIntelligence(request.files, analysis);
         this.cachedIntelligence = intelligence;
+        this.cachedFilesHash = currentHash;
 
         writeDataPart(res, {
           type: "progress",

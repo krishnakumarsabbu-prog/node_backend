@@ -2,6 +2,17 @@ import type { ProjectAnalysis, Framework, BuildTool } from "../types/migrationTy
 import type { FileMap } from "../../llm/constants";
 import { createScopedLogger } from "../../utils/logger";
 
+export interface SpringArtifacts {
+  filters: string[];
+  interceptors: string[];
+  listeners: string[];
+  aspects: string[];
+  validators: string[];
+  converters: string[];
+  exceptionHandlers: string[];
+  scheduledTasks: string[];
+}
+
 const logger = createScopedLogger("analyzer-agent");
 
 export class AnalyzerAgent {
@@ -29,11 +40,123 @@ export class AnalyzerAgent {
     this.detectEntryPoints(filePaths, files, analysis);
     this.detectDependencies(filePaths, files, analysis);
 
+    const isSpring = analysis.framework === "spring-mvc" || analysis.framework === "spring-boot";
+    if (isSpring) {
+      const artifacts = this.detectSpringArtifacts(filePaths, files);
+      logger.info(
+        `Spring artifacts: filters=${artifacts.filters.length}, interceptors=${artifacts.interceptors.length}, ` +
+        `listeners=${artifacts.listeners.length}, aspects=${artifacts.aspects.length}, ` +
+        `exceptionHandlers=${artifacts.exceptionHandlers.length}, scheduledTasks=${artifacts.scheduledTasks.length}`
+      );
+      (analysis as any).springArtifacts = artifacts;
+    }
+
     logger.info(
       `Analysis complete: framework=${analysis.framework}, buildTool=${analysis.buildTool}, files=${filePaths.length}`
     );
 
     return analysis;
+  }
+
+  detectSpringArtifacts(filePaths: string[], files: FileMap): SpringArtifacts {
+    const artifacts: SpringArtifacts = {
+      filters: [],
+      interceptors: [],
+      listeners: [],
+      aspects: [],
+      validators: [],
+      converters: [],
+      exceptionHandlers: [],
+      scheduledTasks: [],
+    };
+
+    for (const path of filePaths) {
+      if (!path.endsWith(".java")) continue;
+      const content = this.getFileContent(files, path);
+      if (!content) continue;
+
+      if (
+        content.includes("implements Filter") ||
+        content.includes("implements javax.servlet.Filter") ||
+        content.includes("implements jakarta.servlet.Filter") ||
+        content.includes("extends OncePerRequestFilter") ||
+        content.includes("extends GenericFilterBean") ||
+        content.includes("@WebFilter") ||
+        (path.match(/Filter\.(java)$/) && content.includes("doFilter"))
+      ) {
+        artifacts.filters.push(path);
+        continue;
+      }
+
+      if (
+        content.includes("implements HandlerInterceptor") ||
+        content.includes("extends HandlerInterceptorAdapter") ||
+        content.includes("implements WebRequestInterceptor") ||
+        path.match(/Interceptor\.(java)$/)
+      ) {
+        artifacts.interceptors.push(path);
+        continue;
+      }
+
+      if (
+        content.includes("implements ApplicationListener") ||
+        content.includes("implements ServletContextListener") ||
+        content.includes("implements HttpSessionListener") ||
+        content.includes("@EventListener") ||
+        path.match(/Listener\.(java)$/)
+      ) {
+        artifacts.listeners.push(path);
+        continue;
+      }
+
+      if (
+        content.includes("@Aspect") ||
+        content.includes("@Before(") ||
+        content.includes("@After(") ||
+        content.includes("@Around(") ||
+        content.includes("@AfterReturning(") ||
+        content.includes("@AfterThrowing(")
+      ) {
+        artifacts.aspects.push(path);
+        continue;
+      }
+
+      if (
+        content.includes("implements Validator") ||
+        content.includes("implements ConstraintValidator")
+      ) {
+        artifacts.validators.push(path);
+        continue;
+      }
+
+      if (
+        content.includes("implements Converter<") ||
+        content.includes("implements GenericConverter") ||
+        content.includes("implements HttpMessageConverter")
+      ) {
+        artifacts.converters.push(path);
+        continue;
+      }
+
+      if (
+        content.includes("@ControllerAdvice") ||
+        content.includes("@RestControllerAdvice") ||
+        content.includes("@ExceptionHandler")
+      ) {
+        artifacts.exceptionHandlers.push(path);
+        continue;
+      }
+
+      if (
+        content.includes("@Scheduled(") ||
+        content.includes("@Async") ||
+        content.includes("implements Job")
+      ) {
+        artifacts.scheduledTasks.push(path);
+      }
+    }
+
+    return artifacts;
   }
 
   private getFileContent(files: FileMap, path: string): string {

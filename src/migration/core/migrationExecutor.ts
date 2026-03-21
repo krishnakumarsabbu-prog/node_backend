@@ -18,6 +18,8 @@ const logger = createScopedLogger("migration-executor");
 const MAX_PARALLEL = 4;
 
 export class MigrationExecutor {
+  private fileLocks = new Map<string, Promise<void>>();
+
   constructor(private codingAgent: CodingAgent) {}
 
   async execute(
@@ -79,21 +81,49 @@ export class MigrationExecutor {
     }
   }
 
+  private async acquireFileLock(file: string): Promise<() => void> {
+    const existing = this.fileLocks.get(file) ?? Promise.resolve();
+    let releaseFn!: () => void;
+    const next = new Promise<void>((resolve) => { releaseFn = resolve; });
+    this.fileLocks.set(file, existing.then(() => next));
+    await existing;
+    return releaseFn;
+  }
+
   private async executeParallel(
     tasks: MigrationTask[],
     state: MigrationState,
     intelligence: CodebaseIntelligence | undefined,
     markdownContent: string | undefined
   ): Promise<void> {
+    const fileTargets = new Set<string>();
+    const serialTasks: MigrationTask[] = [];
+    const parallelTasks: MigrationTask[] = [];
+
+    for (const task of tasks) {
+      const targetFiles = [task.file, ...(task.files ?? [])];
+      const hasConflict = targetFiles.some((f) => fileTargets.has(f));
+      if (hasConflict) {
+        serialTasks.push(task);
+      } else {
+        parallelTasks.push(task);
+        targetFiles.forEach((f) => fileTargets.add(f));
+      }
+    }
+
     const chunks: MigrationTask[][] = [];
-    for (let i = 0; i < tasks.length; i += MAX_PARALLEL) {
-      chunks.push(tasks.slice(i, i + MAX_PARALLEL));
+    for (let i = 0; i < parallelTasks.length; i += MAX_PARALLEL) {
+      chunks.push(parallelTasks.slice(i, i + MAX_PARALLEL));
     }
 
     for (const chunk of chunks) {
       await Promise.all(
         chunk.map((task) => this.executeTask(task, state, intelligence, markdownContent))
       );
+    }
+
+    for (const task of serialTasks) {
+      await this.executeTask(task, state, intelligence, markdownContent);
     }
   }
 
@@ -107,6 +137,9 @@ export class MigrationExecutor {
 
     logger.info(`Executing task ${task.id}: ${task.type ?? "code"} — ${task.file}`);
 
+    const targetFiles = [task.file, ...(task.files ?? [])];
+    const releases = await Promise.all(targetFiles.map((f) => this.acquireFileLock(f)));
+
     try {
       const ctx = this.buildTaskContext(task, state, markdownContent);
       const operation = await this.codingAgent.processTaskWithContext(task, ctx);
@@ -119,6 +152,8 @@ export class MigrationExecutor {
       const msg = (error as Error).message;
       logger.error(`Task ${task.id} failed: ${msg}`);
       markTaskFailed(state, task.id, msg);
+    } finally {
+      releases.forEach((release) => release());
     }
   }
 

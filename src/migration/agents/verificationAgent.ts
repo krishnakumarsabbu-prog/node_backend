@@ -66,11 +66,11 @@ export class VerificationAgent {
   private getBuildCommand(buildTool: BuildTool): string | null {
     switch (buildTool) {
       case "maven":
-        return "mvn -q -DskipTests clean package";
+        return "mvn -B -DskipTests clean package 2>&1";
       case "gradle":
-        return "./gradlew build -x test";
+        return "./gradlew --no-daemon build -x test 2>&1";
       case "npm":
-        return "npm run build";
+        return "npm run build 2>&1";
       default:
         return null;
     }
@@ -91,7 +91,17 @@ export class VerificationAgent {
         break;
     }
 
-    return errors;
+    return this.deduplicateErrors(errors);
+  }
+
+  private deduplicateErrors(errors: BuildError[]): BuildError[] {
+    const seen = new Set<string>();
+    return errors.filter((e) => {
+      const key = `${e.file ?? ""}:${e.line ?? ""}:${e.message.slice(0, 80)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   private parseMavenErrors(logs: string): BuildError[] {
@@ -101,27 +111,64 @@ export class VerificationAgent {
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
 
-      const errorMatch = line.match(/\[ERROR\]\s+(.+?):(\d+):\s*(.+)/);
-      if (errorMatch) {
+      const compilationMatch = line.match(/\[ERROR\]\s+(.+?\.java):\[(\d+),\d+\]\s+(.+)/);
+      if (compilationMatch) {
         errors.push({
-          file: errorMatch[1],
-          line: parseInt(errorMatch[2], 10),
-          message: errorMatch[3],
+          file: compilationMatch[1].trim(),
+          line: parseInt(compilationMatch[2], 10),
+          message: compilationMatch[3].trim(),
+          type: "compilation",
+        });
+        continue;
+      }
+
+      const oldFormatMatch = line.match(/\[ERROR\]\s+(.+?\.java):(\d+):\s*(.+)/);
+      if (oldFormatMatch) {
+        errors.push({
+          file: oldFormatMatch[1].trim(),
+          line: parseInt(oldFormatMatch[2], 10),
+          message: oldFormatMatch[3].trim(),
           type: "compilation",
         });
         continue;
       }
 
       if (line.includes("[ERROR]") && line.includes("Failed to execute goal")) {
+        const multiLine: string[] = [line.replace(/\[ERROR\]\s*/, "").trim()];
+        let j = i + 1;
+        while (j < lines.length && lines[j].trim().startsWith("->")) {
+          multiLine.push(lines[j].trim());
+          j++;
+        }
         errors.push({
-          message: line.replace(/\[ERROR\]\s*/, ""),
+          message: multiLine.join(" "),
           type: "configuration",
         });
+        continue;
       }
 
-      if (line.includes("cannot find symbol") || line.includes("package does not exist")) {
+      if (line.includes("[ERROR]") && (
+        line.includes("BeanCreationException") ||
+        line.includes("NoSuchBeanDefinitionException") ||
+        line.includes("UnsatisfiedDependencyException") ||
+        line.includes("CircularReferenceException")
+      )) {
         errors.push({
-          message: line,
+          message: line.replace(/\[ERROR\]\s*/, "").trim(),
+          type: "configuration",
+        });
+        continue;
+      }
+
+      if (line.includes("[ERROR]") && (
+        line.includes("cannot find symbol") ||
+        line.includes("package does not exist") ||
+        line.includes("is not abstract") ||
+        line.includes("incompatible types") ||
+        line.includes("method") && line.includes("not found")
+      )) {
+        errors.push({
+          message: line.replace(/\[ERROR\]\s*/, "").trim(),
           type: "compilation",
         });
       }
@@ -134,20 +181,49 @@ export class VerificationAgent {
     const errors: BuildError[] = [];
     const lines = logs.split("\n");
 
-    for (const line of lines) {
-      const errorMatch = line.match(/(.+?\.java):(\d+):\s*error:\s*(.+)/);
-      if (errorMatch) {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      const javaCompileError = line.match(/^(.+?\.java):(\d+):\s*error:\s*(.+)/);
+      if (javaCompileError) {
         errors.push({
-          file: errorMatch[1],
-          line: parseInt(errorMatch[2], 10),
-          message: errorMatch[3],
+          file: javaCompileError[1].trim(),
+          line: parseInt(javaCompileError[2], 10),
+          message: javaCompileError[3].trim(),
           type: "compilation",
+        });
+        continue;
+      }
+
+      const taskErrorMatch = line.match(/^> Task :(.+) FAILED/);
+      if (taskErrorMatch) {
+        const taskName = taskErrorMatch[1];
+        errors.push({
+          message: `Gradle task '${taskName}' failed`,
+          type: "configuration",
+        });
+        continue;
+      }
+
+      if (line.startsWith("> ") && lines[i + 1]?.trim().startsWith("Could not resolve")) {
+        errors.push({
+          message: `${line.trim()} ${lines[i + 1].trim()}`,
+          type: "dependency",
+        });
+        i++;
+        continue;
+      }
+
+      if (line.includes("FAILURE:") && i + 1 < lines.length) {
+        errors.push({
+          message: `${line.trim()} ${(lines[i + 1] || "").trim()}`,
+          type: "configuration",
         });
       }
 
-      if (line.includes("FAILURE:") || line.includes("BUILD FAILED")) {
+      if (line.includes("Caused by:") && line.includes("Exception")) {
         errors.push({
-          message: line,
+          message: line.trim(),
           type: "configuration",
         });
       }
@@ -169,11 +245,12 @@ export class VerificationAgent {
           message: tsError[3],
           type: "compilation",
         });
+        continue;
       }
 
       if (line.includes("Module not found") || line.includes("Cannot find module")) {
         errors.push({
-          message: line,
+          message: line.replace(/^error\s+/i, "").trim(),
           type: "dependency",
         });
       }
@@ -187,11 +264,12 @@ export class VerificationAgent {
     const lines = logs.split("\n");
 
     for (const line of lines) {
-      if (line.includes("[WARNING]") || line.includes("warning:")) {
-        warnings.push(line);
+      if (line.includes("[WARNING]") || line.match(/^\s*warning:/i)) {
+        const trimmed = line.replace(/\[WARNING\]\s*/, "").trim();
+        if (trimmed) warnings.push(trimmed);
       }
     }
 
-    return warnings.slice(0, 20);
+    return warnings.slice(0, 30);
   }
 }

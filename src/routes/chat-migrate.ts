@@ -35,7 +35,8 @@ export async function handleMigrate(
 
   logger.info(`[${requestId}] Migration mode: action=${migrationAction || "plan"}`);
 
-  const migrationHandler = new ChatMigrationHandler(WORK_DIR, false);
+  const enableVerification = process.env.MIGRATION_ENABLE_VERIFICATION === "true";
+  const migrationHandler = new ChatMigrationHandler(WORK_DIR, enableVerification);
   const migrationMcpService = MCPService.getInstance();
 
   try {

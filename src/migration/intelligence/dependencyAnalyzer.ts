@@ -67,26 +67,67 @@ function categorizeMavenDep(groupId: string, artifactId: string): DependencyCate
   return "other";
 }
 
+function resolveMavenProperties(content: string): Map<string, string> {
+  const props = new Map<string, string>();
+  const propRe = /<properties>([\s\S]*?)<\/properties>/g;
+  let pm: RegExpExecArray | null;
+  while ((pm = propRe.exec(content)) !== null) {
+    const block = pm[1];
+    const entryRe = /<([a-zA-Z0-9.\-_]+)>([^<]+)<\/\1>/g;
+    let em: RegExpExecArray | null;
+    while ((em = entryRe.exec(block)) !== null) {
+      props.set(em[1], em[2].trim());
+    }
+  }
+  return props;
+}
+
+function resolveVersion(raw: string | undefined, props: Map<string, string>): string {
+  if (!raw) return "managed";
+  const trimmed = raw.trim();
+  const match = trimmed.match(/^\$\{([^}]+)\}$/);
+  if (match) return props.get(match[1]) ?? trimmed;
+  return trimmed;
+}
+
 function parseMavenPom(content: string): Partial<BuildFileSummary> {
   const deps: DependencySummary[] = [];
   const plugins: string[] = [];
 
-  const groupIdMatch = content.match(/<groupId>([^<]+)<\/groupId>/);
-  const artifactIdMatch = content.match(/<artifactId>([^<]+)<\/artifactId>/);
-  const versionMatch = content.match(/<version>([^<]+)<\/version>/);
-  const javaVersionMatch = content.match(/<java\.version>([^<]+)<\/java\.version>/) ||
-    content.match(/<maven\.compiler\.source>([^<]+)<\/maven\.compiler\.source>/);
+  const mavenProps = resolveMavenProperties(content);
 
-  const springBootVersionMatch = content.match(/spring-boot[^<]*<version>([^<]+)<\/version>/) ||
-    content.match(/<parent>[\s\S]*?spring-boot[\s\S]*?<version>([^<]+)<\/version>/);
+  const projectGroupIdMatch = content.match(/<project[^>]*>[\s\S]*?<groupId>([^<]+)<\/groupId>/);
+  const projectArtifactIdMatch = content.match(/<project[^>]*>[\s\S]*?<artifactId>([^<]+)<\/artifactId>/);
+  const projectVersionMatch = content.match(/<project[^>]*>[\s\S]*?<version>([^<]+)<\/version>/);
 
-  const depRe = /<dependency>\s*<groupId>([^<]+)<\/groupId>\s*<artifactId>([^<]+)<\/artifactId>(?:\s*<version>([^<]*)<\/version>)?(?:\s*<scope>([^<]*)<\/scope>)?/g;
+  const javaVersionRaw = mavenProps.get("java.version") ??
+    mavenProps.get("maven.compiler.source") ??
+    content.match(/<java\.version>([^<]+)<\/java\.version>/)?.[1] ??
+    content.match(/<maven\.compiler\.source>([^<]+)<\/maven\.compiler\.source>/)?.[1];
+
+  const parentBlockMatch = content.match(/<parent>([\s\S]*?)<\/parent>/);
+  const parentBlock = parentBlockMatch ? parentBlockMatch[1] : "";
+  const parentArtifactId = parentBlock.match(/<artifactId>([^<]+)<\/artifactId>/)?.[1]?.trim() ?? "";
+  const parentVersionRaw = parentBlock.match(/<version>([^<]+)<\/version>/)?.[1]?.trim();
+  const parentVersion = resolveVersion(parentVersionRaw, mavenProps);
+  const hasSpringBootParent = parentArtifactId.includes("spring-boot-starter-parent") ||
+    parentArtifactId.includes("spring-boot-dependencies");
+
+  let springBootVersion: string | undefined;
+  if (hasSpringBootParent && parentVersion !== "managed") {
+    springBootVersion = parentVersion;
+  } else {
+    const sbVersionMatch = content.match(/spring-boot[^<]*[\s\S]{0,100}<version>([^<]+)<\/version>/);
+    if (sbVersionMatch) springBootVersion = resolveVersion(sbVersionMatch[1], mavenProps);
+  }
+
+  const depRe = /<dependency>\s*<groupId>([^<]+)<\/groupId>\s*<artifactId>([^<]+)<\/artifactId>(?:\s*<version>([^<]*)<\/version>)?(?:[\s\S]*?<scope>([^<]*)<\/scope>)?/g;
   let m: RegExpExecArray | null;
 
   while ((m = depRe.exec(content)) !== null) {
     const groupId = m[1].trim();
     const artifactId = m[2].trim();
-    const version = m[3]?.trim() || "managed";
+    const version = resolveVersion(m[3], mavenProps);
     const scope = m[4]?.trim();
     deps.push({ groupId, artifactId, version, category: categorizeMavenDep(groupId, artifactId), scope });
   }
@@ -97,32 +138,59 @@ function parseMavenPom(content: string): Partial<BuildFileSummary> {
   }
 
   const migrationRequirements: string[] = [];
-  const hasWebXmlDep = deps.some((d) => d.artifactId.includes("spring-webmvc"));
-  const hasBootDep = deps.some((d) => d.category === "spring-boot");
+  const hasWebMvcDep = deps.some((d) => d.artifactId.includes("spring-webmvc"));
+  const hasBootDep = deps.some((d) => d.category === "spring-boot") || hasSpringBootParent;
+  const hasServletApiDep = deps.some((d) =>
+    (d.artifactId.includes("servlet-api") || d.artifactId.includes("javax.servlet")) &&
+    d.scope !== "provided"
+  );
+  const hasServletApiProvided = deps.some((d) =>
+    (d.artifactId.includes("servlet-api") || d.artifactId.includes("javax.servlet")) &&
+    d.scope === "provided"
+  );
 
-  if (hasWebXmlDep && !hasBootDep) {
-    migrationRequirements.push("Add spring-boot-starter-parent");
-    migrationRequirements.push("Replace spring-webmvc with spring-boot-starter-web");
+  if (!hasBootDep) {
+    migrationRequirements.push("Add spring-boot-starter-parent as parent POM");
+    if (hasWebMvcDep) {
+      migrationRequirements.push("Replace spring-webmvc with spring-boot-starter-web");
+    }
     migrationRequirements.push("Add spring-boot-maven-plugin");
   }
 
+  if (hasServletApiDep || hasServletApiProvided) {
+    migrationRequirements.push("Remove servlet-api dependency (embedded Tomcat provides it via spring-boot-starter-web)");
+  }
+
   if (deps.some((d) => d.category === "hibernate" || d.category === "jpa")) {
-    migrationRequirements.push("Add spring-boot-starter-data-jpa");
+    migrationRequirements.push("Add spring-boot-starter-data-jpa (replaces hibernate-core + javax.persistence)");
   }
 
   if (deps.some((d) => d.category === "spring-security")) {
     migrationRequirements.push("Add spring-boot-starter-security");
   }
 
+  if (deps.some((d) => d.groupId === "javax.validation" || d.groupId === "jakarta.validation")) {
+    migrationRequirements.push("Add spring-boot-starter-validation (includes jakarta.validation)");
+  }
+
+  if (deps.some((d) => d.groupId.startsWith("javax.") && !d.groupId.startsWith("javax.persistence"))) {
+    migrationRequirements.push("Check javax.* → jakarta.* namespace migration (Spring Boot 3.x requires jakarta)");
+  }
+
+  const javaVer = javaVersionRaw ? parseInt(javaVersionRaw.replace(/[^0-9]/g, ""), 10) : 0;
+  if (javaVer > 0 && javaVer < 17) {
+    migrationRequirements.push(`Upgrade Java from ${javaVersionRaw} to Java 17+ (required for Spring Boot 3.x)`);
+  }
+
   return {
     jvmDependencies: deps,
     plugins,
-    groupId: groupIdMatch ? groupIdMatch[1].trim() : undefined,
-    artifactId: artifactIdMatch ? artifactIdMatch[1].trim() : undefined,
-    projectVersion: versionMatch ? versionMatch[1].trim() : undefined,
-    javaVersion: javaVersionMatch ? javaVersionMatch[1].trim() : undefined,
-    springBootVersion: springBootVersionMatch ? springBootVersionMatch[1].trim() : undefined,
-    hasSpringBootParent: content.includes("spring-boot-starter-parent"),
+    groupId: projectGroupIdMatch ? projectGroupIdMatch[1].trim() : undefined,
+    artifactId: projectArtifactIdMatch ? projectArtifactIdMatch[1].trim() : undefined,
+    projectVersion: projectVersionMatch ? resolveVersion(projectVersionMatch[1], mavenProps) : undefined,
+    javaVersion: javaVersionRaw ?? undefined,
+    springBootVersion,
+    hasSpringBootParent,
     hasSpringBootPlugin: content.includes("spring-boot-maven-plugin"),
     migrationRequirements,
   };

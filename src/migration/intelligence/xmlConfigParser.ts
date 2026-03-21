@@ -27,6 +27,27 @@ export interface XmlBeanDefinition {
   primary?: boolean;
 }
 
+export interface ServletDefinition {
+  servletName: string;
+  servletClass: string;
+  urlPatterns: string[];
+  loadOnStartup?: number;
+  initParams: Record<string, string>;
+  asyncSupported?: boolean;
+}
+
+export interface FilterDefinition {
+  filterName: string;
+  filterClass: string;
+  urlPatterns: string[];
+  dispatcherTypes: string[];
+  initParams: Record<string, string>;
+}
+
+export interface ListenerDefinition {
+  listenerClass: string;
+}
+
 export interface XmlFileSummary {
   file: string;
   xmlType: "web-xml" | "application-context" | "dispatcher-servlet" | "security" | "persistence" | "generic";
@@ -38,8 +59,17 @@ export interface XmlFileSummary {
   dataSource: boolean;
   transactionManager: boolean;
   propertyPlaceholder: boolean;
+  hasInterceptors: boolean;
+  hasCorsConfig: boolean;
+  hasAopConfig: boolean;
+  hasScheduling: boolean;
+  hasAsyncConfig: boolean;
+  hasMvcNamespace: boolean;
   beans: XmlBeanDefinition[];
   servletMappings: string[];
+  servletDefinitions: ServletDefinition[];
+  filterDefinitions: FilterDefinition[];
+  listenerDefinitions: ListenerDefinition[];
   contextParams: Record<string, string>;
   rawSnippet: string;
 }
@@ -197,6 +227,124 @@ function extractServletMappings(content: string): string[] {
   return mappings;
 }
 
+function extractInitParams(block: string): Record<string, string> {
+  const params: Record<string, string> = {};
+  const re = /<init-param>[\s\S]*?<param-name>([^<]+)<\/param-name>[\s\S]*?<param-value>([^<]+)<\/param-value>[\s\S]*?<\/init-param>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(block)) !== null) {
+    params[m[1].trim()] = m[2].trim();
+  }
+  return params;
+}
+
+function extractServletDefinitions(content: string): ServletDefinition[] {
+  const servlets: ServletDefinition[] = [];
+  const servletDefRe = /<servlet>([\s\S]*?)<\/servlet>/g;
+  const servletMapRe = /<servlet-mapping>([\s\S]*?)<\/servlet-mapping>/g;
+
+  const nameToServlet = new Map<string, Partial<ServletDefinition>>();
+
+  let m: RegExpExecArray | null;
+  while ((m = servletDefRe.exec(content)) !== null) {
+    const block = m[1];
+    const nameMatch = block.match(/<servlet-name>([^<]+)<\/servlet-name>/);
+    const classMatch = block.match(/<servlet-class>([^<]+)<\/servlet-class>/);
+    const loadMatch = block.match(/<load-on-startup>([^<]+)<\/load-on-startup>/);
+    const asyncMatch = block.match(/<async-supported>([^<]+)<\/async-supported>/);
+    if (nameMatch) {
+      nameToServlet.set(nameMatch[1].trim(), {
+        servletName: nameMatch[1].trim(),
+        servletClass: classMatch ? classMatch[1].trim() : "unknown",
+        loadOnStartup: loadMatch ? parseInt(loadMatch[1].trim(), 10) : undefined,
+        asyncSupported: asyncMatch ? asyncMatch[1].trim() === "true" : undefined,
+        initParams: extractInitParams(block),
+        urlPatterns: [],
+      });
+    }
+  }
+
+  while ((m = servletMapRe.exec(content)) !== null) {
+    const block = m[1];
+    const nameMatch = block.match(/<servlet-name>([^<]+)<\/servlet-name>/);
+    if (!nameMatch) continue;
+    const servletName = nameMatch[1].trim();
+    const servlet = nameToServlet.get(servletName);
+    if (servlet) {
+      const urlRe = /<url-pattern>([^<]+)<\/url-pattern>/g;
+      let um: RegExpExecArray | null;
+      while ((um = urlRe.exec(block)) !== null) {
+        (servlet.urlPatterns = servlet.urlPatterns ?? []).push(um[1].trim());
+      }
+    }
+  }
+
+  for (const servlet of nameToServlet.values()) {
+    if (servlet.servletName && servlet.servletClass) {
+      servlets.push(servlet as ServletDefinition);
+    }
+  }
+  return servlets;
+}
+
+function extractFilterDefinitions(content: string): FilterDefinition[] {
+  const filters: FilterDefinition[] = [];
+  const filterDefRe = /<filter>([\s\S]*?)<\/filter>/g;
+  const filterMapRe = /<filter-mapping>([\s\S]*?)<\/filter-mapping>/g;
+
+  const nameToFilter = new Map<string, Partial<FilterDefinition>>();
+
+  let m: RegExpExecArray | null;
+  while ((m = filterDefRe.exec(content)) !== null) {
+    const block = m[1];
+    const nameMatch = block.match(/<filter-name>([^<]+)<\/filter-name>/);
+    const classMatch = block.match(/<filter-class>([^<]+)<\/filter-class>/);
+    if (nameMatch) {
+      nameToFilter.set(nameMatch[1].trim(), {
+        filterName: nameMatch[1].trim(),
+        filterClass: classMatch ? classMatch[1].trim() : "unknown",
+        initParams: extractInitParams(block),
+        urlPatterns: [],
+        dispatcherTypes: [],
+      });
+    }
+  }
+
+  while ((m = filterMapRe.exec(content)) !== null) {
+    const block = m[1];
+    const nameMatch = block.match(/<filter-name>([^<]+)<\/filter-name>/);
+    if (!nameMatch) continue;
+    const filter = nameToFilter.get(nameMatch[1].trim());
+    if (filter) {
+      const urlRe = /<url-pattern>([^<]+)<\/url-pattern>/g;
+      const dispRe = /<dispatcher>([^<]+)<\/dispatcher>/g;
+      let um: RegExpExecArray | null;
+      while ((um = urlRe.exec(block)) !== null) {
+        (filter.urlPatterns = filter.urlPatterns ?? []).push(um[1].trim());
+      }
+      while ((um = dispRe.exec(block)) !== null) {
+        (filter.dispatcherTypes = filter.dispatcherTypes ?? []).push(um[1].trim());
+      }
+    }
+  }
+
+  for (const filter of nameToFilter.values()) {
+    if (filter.filterName && filter.filterClass) {
+      filters.push(filter as FilterDefinition);
+    }
+  }
+  return filters;
+}
+
+function extractListenerDefinitions(content: string): ListenerDefinition[] {
+  const listeners: ListenerDefinition[] = [];
+  const re = /<listener>[\s\S]*?<listener-class>([^<]+)<\/listener-class>[\s\S]*?<\/listener>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    listeners.push({ listenerClass: m[1].trim() });
+  }
+  return listeners;
+}
+
 function extractContextParams(content: string): Record<string, string> {
   const params: Record<string, string> = {};
   const re = /<context-param>[\s\S]*?<param-name>([^<]+)<\/param-name>[\s\S]*?<param-value>([^<]+)<\/param-value>[\s\S]*?<\/context-param>/g;
@@ -227,6 +375,9 @@ export function parseXmlConfigs(files: FileMap): XmlFileSummary[] {
     const beans = extractBeans(content);
     const servletMappings = extractServletMappings(content);
     const contextParams = extractContextParams(content);
+    const servletDefinitions = extractServletDefinitions(content);
+    const filterDefinitions = extractFilterDefinitions(content);
+    const listenerDefinitions = extractListenerDefinitions(content);
 
     summaries.push({
       file: path,
@@ -239,8 +390,17 @@ export function parseXmlConfigs(files: FileMap): XmlFileSummary[] {
       dataSource: content.includes("DataSource") || content.includes("dataSource") || content.includes("jdbc:"),
       transactionManager: content.includes("TransactionManager") || content.includes("transactionManager"),
       propertyPlaceholder: extractPropertyPlaceholders(content),
+      hasInterceptors: content.includes("<mvc:interceptors") || content.includes("HandlerInterceptor") || content.includes("mvc:interceptor"),
+      hasCorsConfig: content.includes("<mvc:cors") || content.includes("CorsFilter") || content.includes("cors-configuration"),
+      hasAopConfig: content.includes("<aop:config") || content.includes("<aop:aspectj-autoproxy") || content.includes("EnableAspectJAutoProxy"),
+      hasScheduling: content.includes("<task:annotation-driven") || content.includes("TaskScheduler") || content.includes("EnableScheduling"),
+      hasAsyncConfig: content.includes("<task:executor") || content.includes("EnableAsync") || content.includes("AsyncConfigurer"),
+      hasMvcNamespace: content.includes("mvc:annotation-driven") || content.includes("xmlns:mvc="),
       beans,
       servletMappings,
+      servletDefinitions,
+      filterDefinitions,
+      listenerDefinitions,
       contextParams,
       rawSnippet: content.slice(0, 600),
     });
@@ -287,9 +447,37 @@ export function serializeXmlSummary(xml: XmlFileSummary): string {
     }
   }
 
-  if (xml.servletMappings.length > 0) {
+  if (xml.servletDefinitions.length > 0) {
+    lines.push(`  Servlets (${xml.servletDefinitions.length}):`);
+    for (const s of xml.servletDefinitions) {
+      const patterns = s.urlPatterns.length > 0 ? ` → [${s.urlPatterns.join(", ")}]` : "";
+      const initP = Object.keys(s.initParams).length > 0 ? ` initParams={${Object.entries(s.initParams).map(([k, v]) => `${k}:${v}`).join(", ")}}` : "";
+      lines.push(`    • ${s.servletName}: ${s.servletClass}${patterns}${initP}${s.loadOnStartup != null ? ` loadOnStartup=${s.loadOnStartup}` : ""}`);
+    }
+  } else if (xml.servletMappings.length > 0) {
     lines.push(`  Servlet Mappings: ${xml.servletMappings.join(", ")}`);
   }
+
+  if (xml.filterDefinitions.length > 0) {
+    lines.push(`  Filters (${xml.filterDefinitions.length}):`);
+    for (const f of xml.filterDefinitions) {
+      const patterns = f.urlPatterns.length > 0 ? ` → [${f.urlPatterns.join(", ")}]` : "";
+      lines.push(`    • ${f.filterName}: ${f.filterClass}${patterns}`);
+    }
+  }
+
+  if (xml.listenerDefinitions.length > 0) {
+    lines.push(`  Listeners: ${xml.listenerDefinitions.map((l) => l.listenerClass.split(".").pop()).join(", ")}`);
+  }
+
+  const advancedFlags: string[] = [];
+  if (xml.hasInterceptors) advancedFlags.push("interceptors");
+  if (xml.hasCorsConfig) advancedFlags.push("CORS");
+  if (xml.hasAopConfig) advancedFlags.push("AOP");
+  if (xml.hasScheduling) advancedFlags.push("scheduling");
+  if (xml.hasAsyncConfig) advancedFlags.push("async");
+  if (xml.hasMvcNamespace) advancedFlags.push("mvc-namespace");
+  if (advancedFlags.length > 0) lines.push(`  Advanced: ${advancedFlags.join(", ")}`);
 
   const transformHint = getTransformHint(xml);
   if (transformHint) lines.push(`  Boot Replacement: ${transformHint}`);
@@ -298,20 +486,45 @@ export function serializeXmlSummary(xml: XmlFileSummary): string {
 }
 
 function getTransformHint(xml: XmlFileSummary): string {
+  const extras: string[] = [];
+  if (xml.filterDefinitions.length > 0) {
+    const securityFilters = xml.filterDefinitions.filter((f) =>
+      f.filterClass.toLowerCase().includes("security") ||
+      f.filterClass.toLowerCase().includes("delegating") ||
+      f.filterClass.toLowerCase().includes("spring")
+    );
+    if (securityFilters.length > 0) extras.push("migrate filters to SecurityFilterChain @Bean");
+    else extras.push(`register ${xml.filterDefinitions.length} filter(s) as @Bean with FilterRegistrationBean`);
+  }
+  if (xml.hasInterceptors) extras.push("register interceptors via WebMvcConfigurer.addInterceptors()");
+  if (xml.hasCorsConfig) extras.push("configure CORS via WebMvcConfigurer.addCorsMappings() or @CrossOrigin");
+  if (xml.hasAopConfig) extras.push("enable AOP via @EnableAspectJAutoProxy");
+  if (xml.hasScheduling) extras.push("enable scheduling via @EnableScheduling");
+  if (xml.hasAsyncConfig) extras.push("enable async via @EnableAsync + ThreadPoolTaskExecutor @Bean");
+  if (xml.listenerDefinitions.length > 0) extras.push("replace ContextLoaderListener with @SpringBootApplication");
+
   switch (xml.xmlType) {
-    case "web-xml":
-      return "@SpringBootApplication main class + embedded Tomcat (remove web.xml)";
-    case "dispatcher-servlet":
-      return "@Configuration with @EnableWebMvc or Spring Boot auto-config (remove dispatcher-servlet.xml)";
-    case "application-context":
-      return "@Configuration class(es) with @Bean methods (remove applicationContext.xml)";
+    case "web-xml": {
+      const base = "@SpringBootApplication main class + embedded Tomcat (remove web.xml)";
+      return extras.length > 0 ? `${base}; also: ${extras.join("; ")}` : base;
+    }
+    case "dispatcher-servlet": {
+      const base = xml.hasMvcNamespace
+        ? "@EnableWebMvc @Configuration or Spring Boot auto-config (remove dispatcher-servlet.xml)"
+        : "@Configuration with @Bean methods (remove dispatcher-servlet.xml)";
+      return extras.length > 0 ? `${base}; also: ${extras.join("; ")}` : base;
+    }
+    case "application-context": {
+      const base = "@Configuration class(es) with @Bean methods (remove applicationContext.xml)";
+      return extras.length > 0 ? `${base}; also: ${extras.join("; ")}` : base;
+    }
     case "security":
       return "SecurityFilterChain @Bean in @Configuration (remove security XML)";
     case "persistence":
-      return "application.properties datasource config + @EnableTransactionManagement";
+      return "application.properties datasource config + @EnableJpaRepositories + @EnableTransactionManagement";
     default:
       if (xml.dataSource) return "application.properties spring.datasource.* properties";
-      if (xml.viewResolver) return "Spring Boot auto-configured InternalResourceViewResolver";
+      if (xml.viewResolver) return "Spring Boot auto-configured view resolver or Thymeleaf starter";
       return "@Configuration class with equivalent @Bean definitions";
   }
 }

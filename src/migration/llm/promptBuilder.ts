@@ -473,44 +473,96 @@ Generate the updated file:`;
     return "";
   }
 
+  static categorizeSpringBuildError(message: string): string {
+    const msg = message.toLowerCase();
+    if (msg.includes("cannot find symbol") || msg.includes("symbol not found") || msg.includes("does not exist")) return "MISSING_IMPORT_OR_SYMBOL";
+    if (msg.includes("duplicate bean") || msg.includes("expected single matching bean") || msg.includes("no qualifying bean")) return "SPRING_BEAN_ERROR";
+    if (msg.includes("circular") && msg.includes("dependency")) return "CIRCULAR_DEPENDENCY";
+    if (msg.includes("unsatisfied dependency") || msg.includes("no bean named")) return "MISSING_BEAN_DEFINITION";
+    if (msg.includes("javax") && (msg.includes("jakarta") || msg.includes("class not found"))) return "JAVAX_JAKARTA_MIGRATION";
+    if (msg.includes("is not abstract and does not override abstract method")) return "INTERFACE_MISSING_METHOD";
+    if (msg.includes("@enablewebmvc") || msg.includes("conflicting") && msg.includes("mvc")) return "ENABLE_WEB_MVC_CONFLICT";
+    if (msg.includes("datasource") || msg.includes("connection refused") || msg.includes("jdbcurl")) return "DATASOURCE_CONFIG";
+    if (msg.includes("deprecated") || msg.includes("has been removed")) return "DEPRECATED_API";
+    if (msg.includes("nullpointerexception") || msg.includes("application context")) return "CONTEXT_INITIALIZATION";
+    return "COMPILATION_ERROR";
+  }
+
   static buildRepairPrompt(
     buildErrors: BuildError[],
     affectedFiles: string[],
     attemptNumber: number
   ): string {
-    const errorSummary = buildErrors
-      .map((err) => `- [${err.type}] ${err.file || "unknown"}:${err.line || "?"} - ${err.message}`)
+    const categorized = buildErrors.map((err) => ({
+      ...err,
+      category: PromptBuilder.categorizeSpringBuildError(err.message),
+    }));
+
+    const errorSummary = categorized
+      .map((err) => `- [${err.category}] ${err.file || "unknown"}:${err.line || "?"} — ${err.message}`)
       .join("\n");
 
-    return `You are a senior engineer fixing build errors after a migration.
+    const uniqueCategories = [...new Set(categorized.map((e) => e.category))];
+
+    const repairHints: string[] = [];
+    if (uniqueCategories.includes("JAVAX_JAKARTA_MIGRATION")) {
+      repairHints.push("JAVAX→JAKARTA: Replace all 'javax.servlet.*' with 'jakarta.servlet.*', 'javax.persistence.*' with 'jakarta.persistence.*', 'javax.validation.*' with 'jakarta.validation.*'");
+    }
+    if (uniqueCategories.includes("SPRING_BEAN_ERROR")) {
+      repairHints.push("BEAN ERROR: Check for duplicate @Bean method names across @Configuration classes. Use @Primary to disambiguate. Check @Qualifier usages match bean names.");
+    }
+    if (uniqueCategories.includes("MISSING_BEAN_DEFINITION")) {
+      repairHints.push("MISSING BEAN: Add missing @Component/@Service/@Repository stereotype or @Bean method in a @Configuration class. Verify @ComponentScan covers the package.");
+    }
+    if (uniqueCategories.includes("CIRCULAR_DEPENDENCY")) {
+      repairHints.push("CIRCULAR DEP: Break the cycle by introducing @Lazy on one injection point, or extract a shared interface/service.");
+    }
+    if (uniqueCategories.includes("ENABLE_WEB_MVC_CONFLICT")) {
+      repairHints.push("MVC CONFLICT: Remove @EnableWebMvc from @SpringBootApplication class — it disables Boot auto-config. Move any WebMvcConfigurer to a separate @Configuration class without @EnableWebMvc.");
+    }
+    if (uniqueCategories.includes("DATASOURCE_CONFIG")) {
+      repairHints.push("DATASOURCE: Ensure application.properties has spring.datasource.url, spring.datasource.username, spring.datasource.password. Remove manual DataSource @Bean if using auto-config.");
+    }
+    if (uniqueCategories.includes("DEPRECATED_API")) {
+      repairHints.push("DEPRECATED API: WebMvcConfigurerAdapter → implement WebMvcConfigurer. SimpleFormController → @Controller. XmlBeanFactory → removed, use AnnotationConfigApplicationContext.");
+    }
+    if (uniqueCategories.includes("INTERFACE_MISSING_METHOD")) {
+      repairHints.push("MISSING METHOD: Implement all abstract methods from implemented interfaces. Check if Spring interface changed between versions.");
+    }
+
+    return `You are a senior Spring Boot engineer fixing build errors after a Spring MVC → Spring Boot migration.
 
 ATTEMPT: ${attemptNumber}/5
+ERROR CATEGORIES: ${uniqueCategories.join(", ")}
 
-BUILD ERRORS:
+BUILD ERRORS (categorized):
 ${errorSummary}
 
 AFFECTED FILES:
 ${affectedFiles.join("\n")}
 
-Analyze the errors and generate fixes.
-
+${repairHints.length > 0 ? `SPRING-SPECIFIC REPAIR GUIDANCE:\n${repairHints.map((h) => `  → ${h}`).join("\n")}\n` : ""}
 RULES:
-1. Return ONLY valid JSON
+1. Return ONLY valid JSON — no markdown, no explanation
 2. Each fix must specify: file, action, content, reasoning
-3. Focus on compilation errors first
-4. Provide complete file content, not diffs
+3. Fix COMPILATION errors first, then CONTEXT initialization errors
+4. Provide COMPLETE file content, never partial diffs
+5. NEVER use field injection — always constructor injection
+6. NEVER reference XML config files in Java code
+7. NEVER add @EnableWebMvc to @SpringBootApplication class
+8. ALWAYS use jakarta.* imports for Spring Boot 3.x
 
 Return JSON in this format:
 {
   "success": true,
   "fixes": [
     {
-      "file": "path/to/file",
+      "file": "migrate/path/to/File.java",
       "action": "modify",
-      "content": "complete file content"
+      "content": "complete corrected file content"
     }
   ],
-  "reasoning": "explanation of fixes"
+  "reasoning": "explanation of what was wrong and how it was fixed"
 }`;
   }
 

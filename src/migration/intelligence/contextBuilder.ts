@@ -18,7 +18,18 @@ export type MigrationPattern =
   | "add-application-properties"
   | "update-build-file"
   | "convert-security-xml"
-  | "convert-persistence-xml";
+  | "convert-persistence-xml"
+  | "convert-dispatcher-servlet"
+  | "migrate-servlet-filters"
+  | "migrate-interceptors"
+  | "convert-mvc-namespace"
+  | "convert-datasource-jndi"
+  | "convert-transaction-managers"
+  | "migrate-view-resolvers"
+  | "migrate-aop-config"
+  | "convert-cors-config"
+  | "migrate-scheduling"
+  | "javax-to-jakarta";
 
 export interface ProjectStats {
   totalFiles: number;
@@ -134,6 +145,53 @@ function detectMigrationPatterns(
     result.push("convert-persistence-xml");
   }
 
+  if (xmlConfigs.some((x) => x.xmlType === "dispatcher-servlet" || x.dispatcherServlet)) {
+    result.push("convert-dispatcher-servlet");
+  }
+
+  if (xmlConfigs.some((x) => (x.filterDefinitions?.length ?? 0) > 0)) {
+    result.push("migrate-servlet-filters");
+  }
+
+  if (xmlConfigs.some((x) => x.hasInterceptors)) {
+    result.push("migrate-interceptors");
+  }
+
+  if (xmlConfigs.some((x) => x.hasMvcNamespace)) {
+    result.push("convert-mvc-namespace");
+  }
+
+  if (xmlConfigs.some((x) => x.dataSource) &&
+    xmlConfigs.some((x) => x.contextParams["contextConfigLocation"] || Object.values(x.contextParams).some((v) => v.includes("jndi")))) {
+    result.push("convert-datasource-jndi");
+  }
+
+  if (xmlConfigs.some((x) => x.transactionManager)) {
+    result.push("convert-transaction-managers");
+  }
+
+  if (xmlConfigs.some((x) => x.viewResolver)) {
+    result.push("migrate-view-resolvers");
+  }
+
+  if (xmlConfigs.some((x) => x.hasAopConfig) ||
+    fileSummaries.some((f) => f.annotations.some((a) => a.includes("Aspect")))) {
+    result.push("migrate-aop-config");
+  }
+
+  if (xmlConfigs.some((x) => x.hasCorsConfig)) {
+    result.push("convert-cors-config");
+  }
+
+  if (xmlConfigs.some((x) => x.hasScheduling)) {
+    result.push("migrate-scheduling");
+  }
+
+  const jvmDeps = buildSummary.jvmDependencies ?? [];
+  if (jvmDeps.some((d) => d.groupId.startsWith("javax.") || d.artifactId.includes("javax"))) {
+    result.push("javax-to-jakarta");
+  }
+
   return result;
 }
 
@@ -142,13 +200,24 @@ function serializeMigrationPatterns(patterns: MigrationPattern[]): string {
 
   const descriptions: Record<MigrationPattern, string> = {
     "xml-to-annotation": "Convert XML-based configuration to Java @Configuration annotations",
-    "add-spring-boot-main": "Create @SpringBootApplication main class",
-    "remove-web-xml": "Remove web.xml → replace with embedded Tomcat via Spring Boot",
+    "add-spring-boot-main": "Create @SpringBootApplication main class with SpringApplication.run()",
+    "remove-web-xml": "Remove web.xml — replace with embedded Tomcat via Spring Boot",
     "convert-xml-beans": "Convert <bean> definitions to @Component / @Service / @Repository / @Bean",
     "add-application-properties": "Create application.properties with Spring Boot config keys",
-    "update-build-file": "Update pom.xml/build.gradle to use spring-boot-starter-parent + plugins",
-    "convert-security-xml": "Convert Spring Security XML to SecurityFilterChain @Bean",
+    "update-build-file": "Update pom.xml to use spring-boot-starter-parent + spring-boot-maven-plugin",
+    "convert-security-xml": "Convert Spring Security XML (<security:http>) to SecurityFilterChain @Bean",
     "convert-persistence-xml": "Convert persistence/datasource XML to application.properties + @EnableJpaRepositories",
+    "convert-dispatcher-servlet": "Convert dispatcher-servlet.xml to @Configuration with @EnableWebMvc or Spring Boot auto-config",
+    "migrate-servlet-filters": "Migrate Servlet Filters to FilterRegistrationBean @Bean or Spring Security FilterChain",
+    "migrate-interceptors": "Migrate HandlerInterceptors to WebMvcConfigurer.addInterceptors() registry",
+    "convert-mvc-namespace": "Convert <mvc:annotation-driven>, <mvc:resources> to WebMvcConfigurer @Bean",
+    "convert-datasource-jndi": "Replace JNDI DataSource lookup with HikariCP via spring.datasource.* in application.properties",
+    "convert-transaction-managers": "Convert <tx:annotation-driven> to @EnableTransactionManagement on @Configuration class",
+    "migrate-view-resolvers": "Migrate ViewResolver XML config to Spring Boot auto-configured Thymeleaf/JSP view resolver",
+    "migrate-aop-config": "Migrate <aop:config> / <aop:aspectj-autoproxy> to @EnableAspectJAutoProxy + @Aspect classes",
+    "convert-cors-config": "Convert <mvc:cors> to WebMvcConfigurer.addCorsMappings() or @CrossOrigin annotations",
+    "migrate-scheduling": "Migrate <task:annotation-driven> to @EnableScheduling + @Scheduled methods",
+    "javax-to-jakarta": "Migrate javax.* imports to jakarta.* (required for Spring Boot 3.x / Jakarta EE 9+)",
   };
 
   return patterns.map((p) => `  → [${p}] ${descriptions[p]}`).join("\n");
