@@ -365,7 +365,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
   writeProgress(
     res,
     progressCounter,
-    `migration-task-${task.id}`,
+    `plan-step${taskIndex}`,
     "in-progress",
     `Task ${taskIndex}/${totalTasks} [${task.type ?? "code"}]: ${task.action} ${task.file}`,
   );
@@ -378,7 +378,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
     writeProgress(
       res,
       progressCounter,
-      `migration-task-${task.id}`,
+      `plan-step${taskIndex}`,
       "complete",
       `Task ${taskIndex}/${totalTasks} done: delete ${task.file}`,
     );
@@ -395,7 +395,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
       writeProgress(
         res,
         progressCounter,
-        `migration-task-${task.id}`,
+        `plan-step${taskIndex}`,
         "in-progress",
         `Task ${taskIndex}/${totalTasks} retry ${attempt}/${MAX_TASK_RETRIES}: ${task.file}${lastError ? ` (prev: ${lastError.slice(0, 80)})` : ""}`,
       );
@@ -473,7 +473,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
           writeProgress(
             res,
             progressCounter,
-            `migration-task-${task.id}`,
+            `plan-step${taskIndex}`,
             "in-progress",
             `Task ${taskIndex}/${totalTasks} WARNING: no output files — retrying (attempt ${attempt + 1}/${MAX_TASK_RETRIES})`,
           );
@@ -482,7 +482,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
         writeProgress(
           res,
           progressCounter,
-          `migration-task-${task.id}`,
+          `plan-step${taskIndex}`,
           "complete",
           `Task ${taskIndex}/${totalTasks} FAILED: no cortexAction blocks extracted after ${MAX_TASK_RETRIES + 1} attempts — ${task.file} was not generated`,
         );
@@ -498,7 +498,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
       writeProgress(
         res,
         progressCounter,
-        `migration-task-${task.id}`,
+        `plan-step${taskIndex}`,
         "complete",
         `Task ${taskIndex}/${totalTasks} done [${task.type ?? "code"}]: ${task.file} (${outputFiles.length} file${outputFiles.length !== 1 ? "s" : ""})`,
       );
@@ -517,7 +517,7 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
         writeProgress(
           res,
           progressCounter,
-          `migration-task-${task.id}`,
+          `plan-step${taskIndex}`,
           "complete",
           `Task ${taskIndex}/${totalTasks} FAILED: ${task.file} — ${lastError}`,
         );

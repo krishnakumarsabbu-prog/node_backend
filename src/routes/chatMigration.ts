@@ -130,11 +130,12 @@ export class ChatMigrationHandler {
         message: "Step 3/4 — Generating migration plan (LLM call: document + task graph)...",
       } satisfies ProgressAnnotation);
 
-      const { markdownContent, plan } = await this.runner.generateMigrationDocument(
+      const { markdownContent: rawMarkdown, plan } = await this.runner.generateMigrationDocument(
         request.files,
         userRequest,
         analysis,
       );
+      const markdownContent = rawMarkdown.replace(/\n{3,}/g, "\n\n").trim();
 
       writeDataPart(res, {
         type: "progress",
