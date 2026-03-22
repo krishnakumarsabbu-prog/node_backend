@@ -417,7 +417,6 @@ async function executeTaskStreaming(opts: TaskStreamingOpts): Promise<{
         promptId: "migration",
         chatMode: "build",
         contextOptimization: false,
-        contextFiles: opts.files,
         messageSliceId: undefined,
         clientAbortSignal: opts.clientAbortSignal,
       });

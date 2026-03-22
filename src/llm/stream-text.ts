@@ -163,8 +163,7 @@ export async function streamText(props: {
 
   const shouldInjectContext = contextFiles && (
     (chatMode === "build" && contextOptimization) ||
-    isPlanMode ||
-    isMigrationMode
+    isPlanMode
   );
 
   if (shouldInjectContext) {
