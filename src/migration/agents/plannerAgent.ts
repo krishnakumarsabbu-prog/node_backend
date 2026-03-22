@@ -282,7 +282,40 @@ export class PlannerAgent {
   }
 
   private convertAndValidateTasks(dualTasks: DualOutputTask[]): MigrationTask[] {
-    const idSet = new Set(dualTasks.map((t) => t.id));
+    const VALID_ACTIONS = new Set(["create", "modify", "delete"]);
+    const VALID_TYPES = new Set(["build", "config", "code", "resource"]);
+
+    const sanitized = dualTasks
+      .filter((t, i) => {
+        if (!t || typeof t !== "object") {
+          logger.warn(`Skipping non-object task at index ${i}`);
+          return false;
+        }
+        if (!t.id || typeof t.id !== "string" || !t.id.trim()) {
+          const fallbackId = `task-${String(i + 1).padStart(3, "0")}`;
+          t.id = fallbackId;
+        }
+        if (!t.files || !Array.isArray(t.files) || t.files.filter(Boolean).length === 0) {
+          logger.warn(`Skipping task ${t.id} — no valid files array`);
+          return false;
+        }
+        t.files = t.files.filter((f): f is string => typeof f === "string" && f.trim().length > 0);
+        if (t.files.length === 0) {
+          logger.warn(`Skipping task ${t.id} — all file paths were empty`);
+          return false;
+        }
+        if (t.action && !VALID_ACTIONS.has(t.action)) {
+          logger.warn(`Task ${t.id} has invalid action "${t.action}", defaulting to "create"`);
+          t.action = "create";
+        }
+        if (t.type && !VALID_TYPES.has(t.type as string)) {
+          logger.warn(`Task ${t.id} has unknown type "${t.type}", clearing`);
+          t.type = undefined;
+        }
+        return true;
+      });
+
+    const idSet = new Set(sanitized.map((t) => t.id));
 
     const validDependsOn = (deps: string[]): string[] => {
       return deps.filter((dep) => {
@@ -294,17 +327,17 @@ export class PlannerAgent {
       });
     };
 
-    const tasks: MigrationTask[] = dualTasks.map((t, i) => {
-      const primaryFile = t.files && t.files.length > 0 ? t.files[0] : `migrate/task-${t.id}`;
+    const tasks: MigrationTask[] = sanitized.map((t, i) => {
+      const primaryFile = t.files![0];
       return {
         id: t.id || `task-${String(i + 1).padStart(3, "0")}`,
         file: primaryFile,
         action: (t.action ?? "create") as MigrationAction,
-        description: t.description || t.title,
-        type: t.type,
+        description: (t.description || t.title || `Migrate ${primaryFile}`).trim(),
+        type: t.type as MigrationTaskCategory | undefined,
         files: t.files || [],
         dependsOn: validDependsOn(t.dependsOn || []),
-        priority: this.taskTypeToPriority(t.type),
+        priority: this.taskTypeToPriority(t.type as MigrationTaskCategory | undefined),
       };
     });
 

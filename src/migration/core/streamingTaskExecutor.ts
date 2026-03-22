@@ -725,12 +725,14 @@ function appendXmlBeanWiringContext(
 
   const relevantXmlConfigs = intelligence.xmlConfigs.filter((xml) => {
     if (task.type === "config") return true;
+    if (!task.file || typeof task.file !== "string") return false;
     const taskFileBase = task.file.split("/").pop()?.replace(/\.[^.]+$/, "")?.toLowerCase() ?? "";
+    if (!taskFileBase) return false;
     return xml.beans.some((b) =>
-      b.id.toLowerCase().includes(taskFileBase) ||
-      b.className.toLowerCase().includes(taskFileBase) ||
-      b.propertyRefs.some((p) => p.ref.toLowerCase().includes(taskFileBase)) ||
-      b.constructorArgs.some((c) => c.ref?.toLowerCase().includes(taskFileBase)),
+      (b.id && typeof b.id === "string" && b.id.toLowerCase().includes(taskFileBase)) ||
+      (b.className && typeof b.className === "string" && b.className.toLowerCase().includes(taskFileBase)) ||
+      (b.propertyRefs ?? []).some((p) => p.ref && typeof p.ref === "string" && p.ref.toLowerCase().includes(taskFileBase)) ||
+      (b.constructorArgs ?? []).some((c) => c.ref && typeof c.ref === "string" && c.ref.toLowerCase().includes(taskFileBase)),
     );
   });
 
@@ -747,7 +749,7 @@ function appendXmlBeanWiringContext(
     if (xml.beans.length > 0) {
       sections.push(`Bean Definitions:`);
       for (const b of xml.beans.slice(0, 20)) {
-        const shortClass = b.className.split(".").pop() ?? b.className;
+        const shortClass = b.className ? (b.className.split(".").pop() ?? b.className) : "unknown";
         sections.push(`  @Bean ${b.id}: ${b.className}`);
         if (b.scope && b.scope !== "singleton") {
           sections.push(`    scope: ${b.scope}`);
@@ -875,7 +877,7 @@ function extractMarkdownGuidanceForTask(task: MigrationTask, markdown: string): 
 function updateGlobalStateFromContent(state: MigrationState, filePath: string, content: string): void {
   if (!content) return;
 
-  const beanMatches = content.matchAll(/@Bean\s*\n[^@]*?\s+(\w+)\s*\(/g);
+  const beanMatches = content.matchAll(/@Bean\b[^;{]*?\n\s*(?:public\s+|protected\s+|private\s+)?(?:[\w<>\[\],\s]+?\s+)([\w]+)\s*\(/g);
 
   if (content.includes("SecurityFilterChain") && content.includes("@Bean")) {
     if (!state.globalDecisions.securityFilterChainBean) {
@@ -915,7 +917,11 @@ function updateGlobalStateFromContent(state: MigrationState, filePath: string, c
   if (content.includes("@EnableScheduling")) state.globalDecisions.schedulingEnabled = true;
   if (content.includes("@EnableAsync")) state.globalDecisions.asyncEnabled = true;
   for (const match of beanMatches) {
-    registerBean(state, match[1], filePath);
+    const beanName = match[1];
+    if (!beanName || beanName === "class" || beanName === "new" || beanName === "return") continue;
+    if (state.globalDecisions.beanNames.get(beanName) !== filePath) {
+      registerBean(state, beanName, filePath);
+    }
   }
 
   const stereotypeMatch = content.match(

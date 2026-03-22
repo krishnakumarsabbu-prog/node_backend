@@ -186,14 +186,17 @@ function collectBeans(
   content: string,
   beanRegistry: Map<string, string[]>
 ): void {
-  const beanMethodPattern = /@Bean\s*\n?\s*(?:public\s+)?(?:\w+\s+)?(\w+)\s*\(/g;
+  const beanMethodPattern = /@Bean\b[^;{]*?\n\s*(?:public\s+|protected\s+|private\s+)?(?:[\w<>\[\],\s]+?\s+)([\w]+)\s*\(/g;
   let match: RegExpExecArray | null;
 
   while ((match = beanMethodPattern.exec(content)) !== null) {
     const beanName = match[1];
+    if (!beanName || beanName === "class" || beanName === "new" || beanName === "return") continue;
     const existing = beanRegistry.get(beanName) ?? [];
-    existing.push(path);
-    beanRegistry.set(beanName, existing);
+    if (!existing.includes(path)) {
+      existing.push(path);
+      beanRegistry.set(beanName, existing);
+    }
   }
 
   const stereotypePattern = /@(?:Service|Repository|Component|Controller|RestController)\s*(?:\([^)]*\))?\s*(?:public\s+)?class\s+(\w+)/;
